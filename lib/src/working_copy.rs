@@ -28,6 +28,7 @@ use tracing::instrument;
 
 use crate::backend::BackendError;
 use crate::commit::Commit;
+pub use crate::filter::IgnoreReason as FilterIgnoreReason;
 use crate::gitignore::GitIgnoreError;
 use crate::gitignore::GitIgnoreFile;
 use crate::matchers::Matcher;
@@ -238,6 +239,8 @@ pub struct SnapshotStats {
     /// as (directory, file name) pairs. These paths cannot be represented as
     /// `RepoPath`s.
     pub invalid_utf8_paths: BTreeSet<(RepoPathBuf, OsString)>,
+    /// List of files not converted by the filter.
+    pub unconverted_paths: BTreeMap<RepoPathBuf, FilterIgnoreReason>,
 }
 
 /// Reason why the new path isn't tracked.
@@ -269,6 +272,8 @@ pub struct CheckoutStats {
     /// working copy but were skipped because there was an untracked (probably
     /// ignored) file in its place.
     pub skipped_files: u32,
+    /// List of files not converted by the filter.
+    pub unconverted_paths: BTreeMap<RepoPathBuf, FilterIgnoreReason>,
 }
 
 /// The working-copy checkout failed.
