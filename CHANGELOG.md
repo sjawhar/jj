@@ -690,6 +690,13 @@ None
   revisions by default (defined by `revsets.op-diff-changes-in`). A new flag,
   `--show-changes-in`, can be used to override this. [#6083](https://github.com/jj-vcs/jj/issues/6083)
 
+* Added `git.filter` settings for configuring gitattributes clean/smudge filters.
+  When `git.filter.enabled = true`, jj runs configured filter drivers during
+  snapshot (clean) and working copy update (smudge). The filter driver command
+  supports string, array, and structured `{ env, command }` forms, and
+  interpolates `$path` with the repo-relative file path. This enables Git LFS
+  and other gitattributes filter integrations in colocated repositories.
+  ([Issue #80](https://github.com/jj-vcs/jj/issues/80))
 ### Fixed bugs
 
 * `.gitignore` with UTF-8 BOM can now be parsed correctly.
