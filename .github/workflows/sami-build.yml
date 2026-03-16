@@ -1,0 +1,216 @@
+name: Build sami branch
+
+on:
+  push:
+    branches:
+      - sami
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  version:
+    name: Compute version
+    if: github.repository == 'sjawhar/jj'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      timestamp: ${{ steps.version.outputs.timestamp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sjawhar/.github/.github/actions/sami-version@v1
+        id: version
+        with:
+          source: cargo
+
+  build-linux:
+    name: Build ${{ matrix.build }}
+    if: github.repository == 'sjawhar/jj'
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [linux-x86_64, linux-aarch64]
+        include:
+          - build: linux-x86_64
+            target: x86_64-unknown-linux-musl
+          - build: linux-aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version
+        shell: bash
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SAMI="${VERSION}-sami.${{ needs.version.outputs.timestamp }}"
+          # Patch the workspace package version (start-of-line)
+          sed -i "s/^version = \".*\"/version = \"${SAMI}\"/" Cargo.toml
+          # Patch the inline path-dep version constraints so cargo accepts them
+          sed -i "s/version = \"${VERSION}\"/version = \"${SAMI}\"/g" Cargo.toml
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.14.0"
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Build release binary
+        run: cargo zigbuild --target ${{ matrix.target }} --release -p jj-cli
+
+      - name: Package binary
+        id: package
+        run: |
+          tag="${{ needs.version.outputs.tag }}"
+          staging="jj-${tag}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/jj" "$staging/"
+          tar czf "$staging.tar.gz" -C "$staging" .
+          echo "asset=${staging}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jj-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+
+  build-macos:
+    name: Build ${{ matrix.build }}
+    if: github.repository == 'sjawhar/jj'
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [macos-x86_64, macos-aarch64]
+        include:
+          - build: macos-x86_64
+            target: x86_64-apple-darwin
+          - build: macos-aarch64
+            target: aarch64-apple-darwin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version
+        shell: bash
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SAMI="${VERSION}-sami.${{ needs.version.outputs.timestamp }}"
+          sed -i "s/^version = \".*\"/version = \"${SAMI}\"/" Cargo.toml
+          sed -i "s/version = \"${VERSION}\"/version = \"${SAMI}\"/g" Cargo.toml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.14.0"
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Download macOS SDK
+        run: |
+          curl -sqL https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz | tar -Jx
+          echo "SDKROOT=$PWD/MacOSX11.3.sdk" >> $GITHUB_ENV
+
+      - name: Build release binary
+        run: cargo zigbuild --target ${{ matrix.target }} --release -p jj-cli
+
+      - name: Package binary
+        id: package
+        run: |
+          tag="${{ needs.version.outputs.tag }}"
+          staging="jj-${tag}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/jj" "$staging/"
+          tar czf "$staging.tar.gz" -C "$staging" .
+          echo "asset=${staging}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jj-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+
+  build-windows:
+    name: Build win-x86_64
+    if: github.repository == 'sjawhar/jj'
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch version
+        shell: bash
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SAMI="${VERSION}-sami.${{ needs.version.outputs.timestamp }}"
+          sed -i "s/^version = \".*\"/version = \"${SAMI}\"/" Cargo.toml
+          sed -i "s/version = \"${VERSION}\"/version = \"${SAMI}\"/g" Cargo.toml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --target x86_64-pc-windows-msvc --release -p jj-cli
+
+      - name: Package binary
+        id: package
+        shell: bash
+        run: |
+          tag="${{ needs.version.outputs.tag }}"
+          staging="jj-${tag}-x86_64-pc-windows-msvc"
+          mkdir "$staging"
+          cp "target/x86_64-pc-windows-msvc/release/jj.exe" "$staging/"
+          cd "$staging"
+          7z a "../$staging.zip" .
+          echo "asset=${staging}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jj-x86_64-pc-windows-msvc
+          path: ${{ steps.package.outputs.asset }}
+
+  release:
+    name: Create release
+    if: github.repository == 'sjawhar/jj'
+    needs: [version, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: sjawhar/.github/.github/actions/sami-release@v1
+        with:
+          tag: ${{ needs.version.outputs.tag }}
+          files: artifacts/**/*
