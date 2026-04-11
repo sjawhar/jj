@@ -25,6 +25,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use futures::AsyncReadExt as _;
 use itertools::Itertools as _;
 use jj_lib::backend;
 use jj_lib::backend::Backend;
@@ -75,13 +76,15 @@ use jj_lib::working_copy::SnapshotStats;
 use jj_lib::workspace::Workspace;
 use pollster::FutureExt as _;
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt as _;
 
 use crate::test_backend::TestBackendFactory;
 
 pub mod git;
 pub mod proptest;
 pub mod test_backend;
+
+/// Convenient return type for test functions.
+pub type TestResult<T = ()> = eyre::Result<T>;
 
 pub const HERMETIC_GIT_CONFIGS: &[(&str, &str)] = &[
     // gitoxide uses "main" as the default branch name, whereas git uses "master". This also
@@ -365,7 +368,11 @@ impl TestWorkspace {
         &mut self,
         options: &SnapshotOptions,
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
-        let mut locked_ws = self.workspace.start_working_copy_mutation().unwrap();
+        let mut locked_ws = self
+            .workspace
+            .start_working_copy_mutation()
+            .block_on()
+            .unwrap();
         let (tree, stats) = locked_ws.locked_wc().snapshot(options).block_on()?;
         // arbitrary operation id
         locked_ws

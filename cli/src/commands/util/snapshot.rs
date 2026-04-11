@@ -34,10 +34,10 @@ pub async fn cmd_util_snapshot(
     command: &CommandHelper,
     _args: &UtilSnapshotArgs,
 ) -> Result<(), CommandError> {
-    let mut workspace_command = command.workspace_helper_no_snapshot(ui)?;
+    let mut workspace_command = command.workspace_helper_no_snapshot(ui).await?;
 
     // Trigger the snapshot if needed.
-    let was_snapshot_taken = workspace_command.maybe_snapshot(ui)?;
+    let was_snapshot_taken = workspace_command.maybe_snapshot(ui).await?;
     if was_snapshot_taken {
         writeln!(ui.status(), "Snapshot complete.")?;
     } else {

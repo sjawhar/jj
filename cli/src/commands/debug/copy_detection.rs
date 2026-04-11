@@ -38,10 +38,10 @@ pub async fn cmd_debug_copy_detection(
     command: &CommandHelper,
     args: &CopyDetectionArgs,
 ) -> Result<(), CommandError> {
-    let ws = command.workspace_helper(ui)?;
+    let ws = command.workspace_helper(ui).await?;
     let store = ws.repo().store();
 
-    let commit = ws.resolve_single_rev(ui, &args.revision)?;
+    let commit = ws.resolve_single_rev(ui, &args.revision).await?;
     for parent_id in commit.parent_ids() {
         let mut records = store.get_copy_records(None, parent_id, commit.id())?;
         while let Some(result) = records.next().await {

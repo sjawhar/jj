@@ -44,6 +44,7 @@ use crate::ref_name::RemoteName;
 // * 2.29.0 introduced `git fetch --no-write-fetch-head`
 // * 2.40 still receives security patches (latest one was in Jan/2025)
 // * 2.41.0 introduced `git fetch --porcelain`
+// If bumped, please update ../../docs/install-and-setup.md
 const MINIMUM_GIT_VERSION: &str = "2.41.0";
 
 /// Error originating by a Git subprocess
@@ -66,7 +67,7 @@ pub enum GitSubprocessError {
     #[error("Failed to wait for the git process")]
     Wait(std::io::Error),
     #[error(
-        "Git does not recognize required option: {0} (note: supported version is \
+        "Git does not recognize required option: {0} (note: Jujutsu requires git >= \
          {MINIMUM_GIT_VERSION})"
     )]
     UnsupportedGitOption(String),
@@ -128,9 +129,12 @@ impl GitSubprocessContext {
             .args(["-c", "submodule.recurse=false"])
             .arg("--git-dir")
             .arg(&self.git_dir)
-            // Disable translation and other locale-dependent behavior so we can
-            // parse the output. LC_ALL precedes LC_* and LANG.
-            .env("LC_ALL", "C")
+            // Disable translation so we can parse the output. We don't set
+            // LC_ALL=C because it would change the encoding. Also note that
+            // "C.UTF-8" locale isn't always available.
+            .env_remove("LC_ALL")
+            .env_remove("LANGUAGE")
+            .env("LC_MESSAGES", "C")
             .stdin(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -288,7 +292,6 @@ impl GitSubprocessContext {
                 .iter()
                 .map(|reference| format!("--force-with-lease={}", reference.to_git_lease())),
         );
-        command.args(&options.extra_args);
         command.args(["--", remote_name.as_str()]);
         // with --force-with-lease we cannot have the forced refspec,
         // as it ignores the lease

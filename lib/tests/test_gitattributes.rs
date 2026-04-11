@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Once;
 
 use bstr::ByteSlice as _;
+use futures::AsyncReadExt as _;
 use itertools::Itertools as _;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
@@ -29,7 +30,6 @@ use testutils::create_single_tree;
 use testutils::create_tree;
 use testutils::empty_snapshot_options;
 use testutils::repo_path;
-use tokio::io::AsyncReadExt as _;
 
 #[test_case(|repo, path, contents| {
     vec![create_single_tree(repo, &[(path, contents)])]
@@ -619,6 +619,7 @@ fn test_gitattr_filter_update_required_filter_failed() {
         test_workspace
             .workspace
             .start_working_copy_mutation()
+            .block_on()
             .unwrap()
             .locked_wc(),
         &commit,
@@ -636,6 +637,7 @@ fn test_gitattr_filter_update_required_filter_failed() {
         test_workspace
             .workspace
             .start_working_copy_mutation()
+            .block_on()
             .unwrap()
             .locked_wc(),
         &commit,

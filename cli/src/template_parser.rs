@@ -831,6 +831,7 @@ pub fn lookup_method<'a, V>(
 mod tests {
     use assert_matches::assert_matches;
     use jj_lib::dsl_util::KeywordArgument;
+    use testutils::TestResult;
 
     use super::*;
 
@@ -852,7 +853,7 @@ mod tests {
     ) -> WithTemplateAliasesMap {
         let mut aliases_map = TemplateAliasesMap::new();
         for (decl, defn) in aliases {
-            aliases_map.insert(decl, defn).unwrap();
+            aliases_map.insert(decl, defn, None).unwrap();
         }
         WithTemplateAliasesMap(aliases_map)
     }
@@ -946,19 +947,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tree_eq() {
+    fn test_parse_tree_eq() -> TestResult {
         assert_eq!(
-            normalize_tree(parse_template(r#" commit_id.short(1 )  ++ description"#).unwrap()),
-            normalize_tree(parse_template(r#"commit_id.short( 1 )++(description)"#).unwrap()),
+            normalize_tree(parse_template(r#" commit_id.short(1 )  ++ description"#)?),
+            normalize_tree(parse_template(r#"commit_id.short( 1 )++(description)"#)?),
         );
         assert_ne!(
-            normalize_tree(parse_template(r#" "ab" "#).unwrap()),
-            normalize_tree(parse_template(r#" "a" ++ "b" "#).unwrap()),
+            normalize_tree(parse_template(r#" "ab" "#)?),
+            normalize_tree(parse_template(r#" "a" ++ "b" "#)?),
         );
         assert_ne!(
-            normalize_tree(parse_template(r#" "foo" ++ "0" "#).unwrap()),
-            normalize_tree(parse_template(r#" "foo" ++ 0 "#).unwrap()),
+            normalize_tree(parse_template(r#" "foo" ++ "0" "#)?),
+            normalize_tree(parse_template(r#" "foo" ++ 0 "#)?),
         );
+        Ok(())
     }
 
     #[test]
@@ -974,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_operator_syntax() {
+    fn test_parse_operator_syntax() -> TestResult {
         // Operator precedence
         assert_eq!(parse_normalized("!!x"), parse_normalized("!(!x)"));
         assert_eq!(
@@ -1028,21 +1030,16 @@ mod tests {
         );
 
         // Expression span
-        assert_eq!(parse_template(" ! x ").unwrap().span.as_str(), "! x");
-        assert_eq!(parse_template(" x ||y ").unwrap().span.as_str(), "x ||y");
-        assert_eq!(parse_template(" (x) ").unwrap().span.as_str(), "(x)");
-        assert_eq!(
-            parse_template(" ! (x ||y) ").unwrap().span.as_str(),
-            "! (x ||y)"
-        );
-        assert_eq!(
-            parse_template("(x ++ y ) ").unwrap().span.as_str(),
-            "(x ++ y )"
-        );
+        assert_eq!(parse_template(" ! x ")?.span.as_str(), "! x");
+        assert_eq!(parse_template(" x ||y ")?.span.as_str(), "x ||y");
+        assert_eq!(parse_template(" (x) ")?.span.as_str(), "(x)");
+        assert_eq!(parse_template(" ! (x ||y) ")?.span.as_str(), "! (x ||y)");
+        assert_eq!(parse_template("(x ++ y ) ")?.span.as_str(), "(x ++ y )");
+        Ok(())
     }
 
     #[test]
-    fn test_function_call_syntax() {
+    fn test_function_call_syntax() -> TestResult {
         fn unwrap_function_call(node: ExpressionNode<'_>) -> Box<FunctionCallNode<'_>> {
             match node.kind {
                 ExpressionKind::FunctionCall(function) => function,
@@ -1078,8 +1075,7 @@ mod tests {
         assert!(parse_template("f(false)").is_ok());
 
         // Expression span
-        let function =
-            unwrap_function_call(parse_template("foo( a, (b) , -(c), d = (e) )").unwrap());
+        let function = unwrap_function_call(parse_template("foo( a, (b) , -(c), d = (e) )")?);
         assert_eq!(function.name_span.as_str(), "foo");
         // Because we use the implicit WHITESPACE rule, we have little control
         // over leading/trailing whitespaces.
@@ -1089,25 +1085,24 @@ mod tests {
         assert_eq!(function.args[2].span.as_str(), "-(c)");
         assert_eq!(function.keyword_args[0].name_span.as_str(), "d");
         assert_eq!(function.keyword_args[0].value.span.as_str(), "(e)");
+        Ok(())
     }
 
     #[test]
-    fn test_method_call_syntax() {
+    fn test_method_call_syntax() -> TestResult {
         assert_eq!(
             parse_normalized("x.f().g()"),
             parse_normalized("(x.f()).g()"),
         );
 
         // Expression span
-        assert_eq!(parse_template(" x.f() ").unwrap().span.as_str(), "x.f()");
-        assert_eq!(
-            parse_template(" x.f().g() ").unwrap().span.as_str(),
-            "x.f().g()",
-        );
+        assert_eq!(parse_template(" x.f() ")?.span.as_str(), "x.f()");
+        assert_eq!(parse_template(" x.f().g() ")?.span.as_str(), "x.f().g()",);
+        Ok(())
     }
 
     #[test]
-    fn test_lambda_syntax() {
+    fn test_lambda_syntax() -> TestResult {
         fn unwrap_lambda(node: ExpressionNode<'_>) -> Box<LambdaNode<'_>> {
             match node.kind {
                 ExpressionKind::Lambda(lambda) => lambda,
@@ -1115,12 +1110,12 @@ mod tests {
             }
         }
 
-        let lambda = unwrap_lambda(parse_template("|| a").unwrap());
+        let lambda = unwrap_lambda(parse_template("|| a")?);
         assert_eq!(lambda.params.len(), 0);
         assert_eq!(lambda.body.kind, ExpressionKind::Identifier("a"));
-        let lambda = unwrap_lambda(parse_template("|foo| a").unwrap());
+        let lambda = unwrap_lambda(parse_template("|foo| a")?);
         assert_eq!(lambda.params.len(), 1);
-        let lambda = unwrap_lambda(parse_template("|foo, b| a").unwrap());
+        let lambda = unwrap_lambda(parse_template("|foo, b| a")?);
         assert_eq!(lambda.params.len(), 2);
 
         // No body
@@ -1160,6 +1155,7 @@ mod tests {
 
         // Boolean literal cannot be used as a parameter name
         assert!(parse_template("|false| a").is_err());
+        Ok(())
     }
 
     #[test]
@@ -1252,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern() {
+    fn test_pattern() -> TestResult {
         fn unwrap_pattern(kind: ExpressionKind<'_>) -> (&str, ExpressionKind<'_>) {
             match kind {
                 ExpressionKind::Pattern(pattern) => (pattern.name, pattern.value.kind),
@@ -1261,27 +1257,27 @@ mod tests {
         }
 
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#"regex:"meow""#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#"regex:"meow""#)?),
             ("regex", ExpressionKind::String("meow".to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#"regex:'\r\n'"#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#"regex:'\r\n'"#)?),
             ("regex", ExpressionKind::String(r#"\r\n"#.to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#"regex-i:'\r\n'"#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#"regex-i:'\r\n'"#)?),
             ("regex-i", ExpressionKind::String(r#"\r\n"#.to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind("regex:meow").unwrap()),
+            unwrap_pattern(parse_into_kind("regex:meow")?),
             ("regex", ExpressionKind::Identifier("meow"))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind("regex:false").unwrap()),
+            unwrap_pattern(parse_into_kind("regex:false")?),
             ("regex", ExpressionKind::Boolean(false))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind("regex:0").unwrap()),
+            unwrap_pattern(parse_into_kind("regex:0")?),
             ("regex", ExpressionKind::Integer(0))
         );
 
@@ -1325,7 +1321,7 @@ mod tests {
 
         // Pattern names with dash
         assert_eq!(
-            unwrap_pattern(parse_into_kind("x-y:z").unwrap()),
+            unwrap_pattern(parse_into_kind("x-y:z")?),
             ("x-y", ExpressionKind::Identifier("z"))
         );
         assert_eq!(
@@ -1336,6 +1332,7 @@ mod tests {
             parse_normalized("x-y+z:a"),
             parse_normalized("((x)-(y))+(z:(a))")
         );
+        Ok(())
     }
 
     #[test]
@@ -1358,38 +1355,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_alias_decl() {
+    fn test_parse_alias_decl() -> TestResult {
         let mut aliases_map = TemplateAliasesMap::new();
-        aliases_map.insert("sym", r#""is symbol""#).unwrap();
-        aliases_map.insert("pat:a", r#""is pattern a""#).unwrap();
-        aliases_map.insert("pat:b", r#""is pattern b""#).unwrap();
-        aliases_map.insert("func()", r#""is function 0""#).unwrap();
-        aliases_map
-            .insert("func(a, b)", r#""is function 2""#)
-            .unwrap();
-        aliases_map.insert("func(a)", r#""is function a""#).unwrap();
-        aliases_map.insert("func(b)", r#""is function b""#).unwrap();
+        aliases_map.insert("sym", r#""is symbol""#, Some("symbol doc".to_owned()))?;
+        aliases_map.insert("pat:a", r#""is pattern a""#, Some("pattern doc".to_owned()))?;
+        aliases_map.insert("pat:b", r#""is pattern b""#, None)?;
+        aliases_map.insert("func()", r#""is function 0""#, Some("func doc".to_owned()))?;
+        aliases_map.insert("func(a, b)", r#""is function 2""#, None)?;
+        aliases_map.insert("func(a)", r#""is function a""#, None)?;
+        aliases_map.insert("func(b)", r#""is function b""#, None)?;
 
-        let (id, defn) = aliases_map.get_symbol("sym").unwrap();
+        let (id, defn, doc) = aliases_map.get_symbol("sym").unwrap();
         assert_eq!(id, AliasId::Symbol("sym"));
         assert_eq!(defn, r#""is symbol""#);
+        assert_eq!(doc, Some("symbol doc"));
 
-        let (id, param, defn) = aliases_map.get_pattern("pat").unwrap();
+        let (id, param, defn, _doc) = aliases_map.get_pattern("pat").unwrap();
         assert_eq!(id, AliasId::Pattern("pat", "b"));
         assert_eq!(param, "b");
         assert_eq!(defn, r#""is pattern b""#);
 
-        let (id, params, defn) = aliases_map.get_function("func", 0).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 0).unwrap();
         assert_eq!(id, AliasId::Function("func", &[]));
         assert!(params.is_empty());
         assert_eq!(defn, r#""is function 0""#);
 
-        let (id, params, defn) = aliases_map.get_function("func", 1).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 1).unwrap();
         assert_eq!(id, AliasId::Function("func", &["b".to_owned()]));
         assert_eq!(params, ["b"]);
         assert_eq!(defn, r#""is function b""#);
 
-        let (id, params, defn) = aliases_map.get_function("func", 2).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 2).unwrap();
         assert_eq!(
             id,
             AliasId::Function("func", &["a".to_owned(), "b".to_owned()])
@@ -1401,28 +1397,32 @@ mod tests {
 
         // Formal parameter 'a' can't be redefined
         assert_eq!(
-            aliases_map.insert("f(a, a)", r#""""#).unwrap_err().kind,
+            aliases_map
+                .insert("f(a, a)", r#""""#, None)
+                .unwrap_err()
+                .kind,
             TemplateParseErrorKind::RedefinedFunctionParameter
         );
 
         // Boolean literal cannot be used as a symbol, pattern, function, or
         // parameter name
-        assert!(aliases_map.insert("false", r#"""#).is_err());
-        assert!(aliases_map.insert("false:x", r#"""#).is_err());
-        assert!(aliases_map.insert("p:true", r#"""#).is_err());
-        assert!(aliases_map.insert("true()", r#"""#).is_err());
-        assert!(aliases_map.insert("f(false)", r#"""#).is_err());
+        assert!(aliases_map.insert("false", r#"""#, None).is_err());
+        assert!(aliases_map.insert("false:x", r#"""#, None).is_err());
+        assert!(aliases_map.insert("p:true", r#"""#, None).is_err());
+        assert!(aliases_map.insert("true()", r#"""#, None).is_err());
+        assert!(aliases_map.insert("f(false)", r#"""#, None).is_err());
 
         // Trailing comma isn't allowed for empty parameter
-        assert!(aliases_map.insert("f(,)", r#"""#).is_err());
+        assert!(aliases_map.insert("f(,)", r#"""#, None).is_err());
         // Trailing comma is allowed for the last parameter
-        assert!(aliases_map.insert("g(a,)", r#"""#).is_ok());
-        assert!(aliases_map.insert("h(a ,  )", r#"""#).is_ok());
-        assert!(aliases_map.insert("i(,a)", r#"""#).is_err());
-        assert!(aliases_map.insert("j(a,,)", r#"""#).is_err());
-        assert!(aliases_map.insert("k(a  , , )", r#"""#).is_err());
-        assert!(aliases_map.insert("l(a,b,)", r#"""#).is_ok());
-        assert!(aliases_map.insert("m(a,,b)", r#"""#).is_err());
+        assert!(aliases_map.insert("g(a,)", r#"""#, None).is_ok());
+        assert!(aliases_map.insert("h(a ,  )", r#"""#, None).is_ok());
+        assert!(aliases_map.insert("i(,a)", r#"""#, None).is_err());
+        assert!(aliases_map.insert("j(a,,)", r#"""#, None).is_err());
+        assert!(aliases_map.insert("k(a  , , )", r#"""#, None).is_err());
+        assert!(aliases_map.insert("l(a,b,)", r#"""#, None).is_ok());
+        assert!(aliases_map.insert("m(a,,b)", r#"""#, None).is_err());
+        Ok(())
     }
 
     #[test]

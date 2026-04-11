@@ -173,17 +173,18 @@ pub(crate) struct SplitArgs {
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_mutable))]
     insert_before: Option<Vec<RevisionArg>>,
 
-    /// The change description to use (don't open editor)
+    /// The change description to use for the selected changes (don't open
+    /// editor)
     ///
-    /// Sets the description for the first commit (the one containing the
-    /// selected changes). The second commit keeps the original description.
+    /// Sets the description for the revision containing the selected changes.
+    /// The other revision will keep its original description, if any.
     #[arg(long = "message", short, value_name = "MESSAGE")]
     message_paragraphs: Option<Vec<String>>,
 
-    /// Open an editor to edit the change description
+    /// Open an editor to edit the change description(s)
     ///
-    /// Forces an editor to open when using `--message` to allow the
-    /// message to be edited afterwards.
+    /// Forces an editor to open when using `--message` to allow the message to
+    /// be edited afterward.
     #[arg(long)]
     editor: bool,
 
@@ -206,8 +207,12 @@ impl SplitArgs {
         ui: &Ui,
         workspace_command: &WorkspaceCommandHelper,
     ) -> Result<ResolvedSplitArgs, CommandError> {
-        let target_commit = workspace_command.resolve_single_rev(ui, &self.revision)?;
-        workspace_command.check_rewritable([target_commit.id()])?;
+        let target_commit = workspace_command
+            .resolve_single_rev(ui, &self.revision)
+            .await?;
+        workspace_command
+            .check_rewritable([target_commit.id()])
+            .await?;
         let repo = workspace_command.repo();
         let fileset_expression = workspace_command.parse_file_patterns(ui, &self.paths)?;
         let matcher = fileset_expression.to_matcher();
@@ -226,7 +231,8 @@ impl SplitArgs {
                 self.insert_after.as_deref(),
                 self.insert_before.as_deref(),
                 "split-out commit",
-            )?
+            )
+            .await?
         } else {
             Default::default()
         };
@@ -270,7 +276,7 @@ pub(crate) async fn cmd_split(
     command: &CommandHelper,
     args: &SplitArgs,
 ) -> Result<(), CommandError> {
-    let mut workspace_command = command.workspace_helper(ui)?;
+    let mut workspace_command = command.workspace_helper(ui).await?;
     let ResolvedSplitArgs {
         target_commit,
         matcher,
@@ -411,7 +417,8 @@ pub(crate) async fn cmd_split(
         tx.write_commit_summary(formatter.as_mut(), &second_commit)?;
         writeln!(formatter)?;
     }
-    tx.finish(ui, format!("split commit {}", target.commit.id().hex()))?;
+    tx.finish(ui, format!("split commit {}", target.commit.id().hex()))
+        .await?;
     Ok(())
 }
 

@@ -16,7 +16,6 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::iter;
@@ -375,8 +374,8 @@ pub struct Operation {
     /// `X` was rewritten as `Y`, then rebased as `Z`, these modifications are
     /// recorded as `{Y: [X], Z: [Y]}`.
     ///
-    /// Existing commits (including commits imported from Git) aren't tracked
-    /// even if they became visible at this operation.
+    /// Existing commits (including some commits imported from Git) aren't
+    /// tracked even if they became visible at this operation.
     // BTreeMap for ease of deterministic serialization. If the deserialization
     // cost matters, maybe this can be changed to sorted Vec.
     #[serde(skip)] // TODO: should be exposed?
@@ -398,7 +397,8 @@ impl Operation {
             hostname: "".to_string(),
             username: "".to_string(),
             is_snapshot: false,
-            tags: HashMap::new(),
+            workspace_name: None,
+            attributes: BTreeMap::new(),
         };
         Self {
             view_id: root_view_id,
@@ -423,7 +423,9 @@ pub struct OperationMetadata {
     /// Whether this operation represents a pure snapshotting of the working
     /// copy.
     pub is_snapshot: bool,
-    pub tags: HashMap<String, String>,
+    /// The workspace this operation was performed in, if any
+    pub workspace_name: Option<WorkspaceNameBuf>,
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Data to be loaded into the root operation/view.

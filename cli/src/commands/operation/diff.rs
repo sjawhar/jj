@@ -18,13 +18,15 @@ use std::slice;
 use std::sync::Arc;
 
 use clap_complete::ArgValueCandidates;
+use futures::StreamExt as _;
 use futures::TryStreamExt as _;
+use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::evolution::accumulate_predecessors;
-use jj_lib::graph::TopoGroupedGraphIterator;
+use jj_lib::graph::TopoGroupedGraph;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::op_store::RefTarget;
 use jj_lib::op_store::RemoteRef;
@@ -34,12 +36,23 @@ use jj_lib::refs::diff_named_ref_targets;
 use jj_lib::refs::diff_named_remote_refs;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
+use jj_lib::revset;
+use jj_lib::revset::ResolvedRevsetExpression;
+use jj_lib::revset::RevsetDiagnostics;
 use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::RevsetResolutionError;
+use jj_lib::revset::SymbolResolver;
+use jj_lib::revset::UserRevsetExpression;
+use jj_lib::settings::UserSettings;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::LogContentFormat;
+use crate::cli_util::WorkspaceCommandEnvironment;
 use crate::cli_util::default_ignored_remote_name;
 use crate::command_error::CommandError;
+use crate::command_error::config_error_with_message;
+use crate::command_error::print_parse_diagnostics;
+use crate::command_error::user_error_with_message;
 use crate::complete;
 use crate::diff_util::DiffFormatArgs;
 use crate::diff_util::DiffRenderer;
@@ -83,6 +96,13 @@ pub struct OperationDiffArgs {
 
     #[command(flatten)]
     diff_format: DiffFormatArgs,
+
+    /// Show only changed revisions matching the given revset expression
+    ///
+    /// If no revisions are specified, this defaults to the
+    /// `revsets.op-diff-changes-in` setting.
+    #[arg(long, value_name = "REVSETS")]
+    show_changes_in: Option<String>,
 }
 
 pub async fn cmd_op_diff(
@@ -90,7 +110,7 @@ pub async fn cmd_op_diff(
     command: &CommandHelper,
     args: &OperationDiffArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui)?;
+    let workspace_command = command.workspace_helper(ui).await?;
     let workspace_env = workspace_command.env();
     let repo_loader = workspace_command.workspace().repo_loader();
     let settings = workspace_command.settings();
@@ -101,7 +121,7 @@ pub async fn cmd_op_diff(
         to_op = workspace_command.resolve_single_op(args.to.as_deref().unwrap_or("@"))?;
     } else {
         to_op = workspace_command.resolve_single_op(args.operation.as_deref().unwrap_or("@"))?;
-        from_ops = to_op.parents().try_collect()?;
+        from_ops = to_op.parents().await?;
     }
     let graph_style = GraphStyle::from_settings(settings)?;
     let with_content_format = LogContentFormat::new(ui, settings)?;
@@ -133,6 +153,9 @@ pub async fn cmd_op_diff(
             .labeled(["op_diff", "commit"])
     };
 
+    let op_diff_changes_expr =
+        parse_op_diff_changes_in(ui, settings, workspace_env, args.show_changes_in.as_deref())?;
+
     let op_summary_template = workspace_command
         .operation_summary_template()
         .labeled(["op_diff"]);
@@ -150,6 +173,7 @@ pub async fn cmd_op_diff(
 
     show_op_diff(
         ui,
+        workspace_env,
         formatter.as_mut(),
         merged_repo,
         &from_repo,
@@ -158,8 +182,67 @@ pub async fn cmd_op_diff(
         (!args.no_graph).then_some(graph_style),
         &with_content_format,
         diff_renderer.as_ref(),
+        op_diff_changes_expr,
     )
     .await
+}
+
+/// Parses the revset expression used to filter revisions in operation diffs.
+pub fn parse_op_diff_changes_in(
+    ui: &Ui,
+    settings: &UserSettings,
+    workspace_env: &WorkspaceCommandEnvironment,
+    show_changes_in: Option<&str>,
+) -> Result<Arc<UserRevsetExpression>, CommandError> {
+    let (expression_str, is_config) = if let Some(show_changes_in_expr) = show_changes_in {
+        (show_changes_in_expr.to_string(), false)
+    } else {
+        (settings.get("revsets.op-diff-changes-in")?, true)
+    };
+    let mut diagnostics = RevsetDiagnostics::new();
+    let op_diff_changes_expr = revset::parse(
+        &mut diagnostics,
+        &expression_str,
+        &workspace_env.revset_parse_context(),
+    )
+    .map_err(|err| {
+        if is_config {
+            config_error_with_message("Invalid `revsets.op-diff-changes-in`", err)
+        } else {
+            user_error_with_message(
+                format!("Invalid `--show-changes-in` expression: {expression_str}"),
+                err,
+            )
+        }
+    })?;
+    let context_message = if is_config {
+        "In `revsets.op-diff-changes-in`"
+    } else {
+        "In `--show-changes-in`"
+    };
+    print_parse_diagnostics(ui, context_message, &diagnostics)?;
+    Ok(op_diff_changes_expr)
+}
+
+/// Resolves the `op-diff-changes-in` expression for both the "from" and "to"
+/// repositories.
+fn resolve_op_diff_changes_exprs(
+    workspace_env: &WorkspaceCommandEnvironment,
+    op_diff_changes_expr: &UserRevsetExpression,
+    from_repo: &ReadonlyRepo,
+    to_repo: &ReadonlyRepo,
+) -> Result<(Arc<ResolvedRevsetExpression>, Arc<ResolvedRevsetExpression>), RevsetResolutionError> {
+    let extensions = workspace_env
+        .revset_parse_context()
+        .extensions
+        .symbol_resolvers();
+    let from_repo_symbol_resolver = SymbolResolver::new(from_repo, extensions);
+    let to_repo_symbol_resolver = SymbolResolver::new(to_repo, extensions);
+    let from_op_diff_changes_expr =
+        op_diff_changes_expr.resolve_user_expression(from_repo, &from_repo_symbol_resolver)?;
+    let to_op_diff_changes_expr =
+        op_diff_changes_expr.resolve_user_expression(to_repo, &to_repo_symbol_resolver)?;
+    Ok((from_op_diff_changes_expr, to_op_diff_changes_expr))
 }
 
 /// Computes and shows the differences between two operations, using the given
@@ -169,6 +252,7 @@ pub async fn cmd_op_diff(
 #[expect(clippy::too_many_arguments)]
 pub async fn show_op_diff(
     ui: &Ui,
+    workspace_env: &WorkspaceCommandEnvironment,
     formatter: &mut dyn Formatter,
     current_repo: &dyn Repo,
     from_repo: &Arc<ReadonlyRepo>,
@@ -177,34 +261,76 @@ pub async fn show_op_diff(
     graph_style: Option<GraphStyle>,
     with_content_format: &LogContentFormat,
     diff_renderer: Option<&DiffRenderer<'_>>,
+    op_diff_changes_expr: Arc<UserRevsetExpression>,
 ) -> Result<(), CommandError> {
-    let changes = compute_operation_commits_diff(current_repo, from_repo, to_repo).await?;
-    if !changes.is_empty() {
-        let revset =
-            RevsetExpression::commits(changes.keys().cloned().collect()).evaluate(current_repo)?;
+    let op_commits_diff_result = match resolve_op_diff_changes_exprs(
+        workspace_env,
+        &op_diff_changes_expr,
+        from_repo.as_ref(),
+        to_repo.as_ref(),
+    ) {
+        Ok((from_op_diff_changes_expr, to_op_diff_changes_expr)) => {
+            let op_commits_diff = compute_operation_commits_diff(
+                current_repo,
+                from_repo,
+                to_repo,
+                from_op_diff_changes_expr,
+                to_op_diff_changes_expr,
+            )
+            .await?;
+            Some(op_commits_diff)
+        }
+        Err(err) => {
+            writeln!(formatter)?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    writeln!(
+                        formatter.labeled("warning"),
+                        "Warning: Could not resolve revset expression for elision: {err}"
+                    )?;
+                    writeln!(
+                        formatter,
+                        "   (Use --show-changes-in=all() to see all changes)"
+                    )
+                })
+                .await?;
+            None
+        }
+    };
+
+    if let Some(op_commits_diff) = op_commits_diff_result
+        && op_commits_diff.has_changes()
+    {
+        let revset = RevsetExpression::commits(op_commits_diff.changes.keys().cloned().collect())
+            .evaluate(current_repo)?;
         writeln!(formatter)?;
-        with_content_format.write(formatter, |formatter| {
-            writeln!(formatter, "Changed commits:")
-        })?;
+        with_content_format
+            .write(formatter, async |formatter| {
+                writeln!(formatter, "Changed commits:")
+            })
+            .await?;
         if let Some(graph_style) = graph_style {
             let mut raw_output = formatter.raw()?;
             let mut graph = get_graphlog(graph_style, raw_output.as_mut());
-            let graph_iter = TopoGroupedGraphIterator::new(revset.iter_graph(), |id| id);
-            for node in graph_iter {
-                let (commit_id, mut edges) = node?;
-                let modified_change = changes.get(&commit_id).unwrap();
+            let mut graph_stream = TopoGroupedGraph::new(revset.stream_graph(), |id| id)
+                .stream()
+                .boxed_local();
+            while let Some((commit_id, mut edges)) = graph_stream.try_next().await? {
+                let modified_change = op_commits_diff.changes.get(&commit_id).unwrap();
                 // Omit "missing" edge to keep the graph concise.
                 edges.retain(|edge| !edge.is_missing());
 
                 let mut buffer = vec![];
                 let within_graph = with_content_format.sub_width(graph.width(&commit_id, &edges));
-                within_graph.write(ui.new_formatter(&mut buffer).as_mut(), |formatter| {
-                    write_modified_change_summary(
-                        formatter,
-                        commit_summary_template,
-                        modified_change,
-                    )
-                })?;
+                within_graph
+                    .write(ui.new_formatter(&mut buffer).as_mut(), async |formatter| {
+                        write_modified_change_summary(
+                            formatter,
+                            commit_summary_template,
+                            modified_change,
+                        )
+                    })
+                    .await?;
                 if let Some(diff_renderer) = diff_renderer {
                     let mut formatter = ui.new_formatter(&mut buffer);
                     show_change_diff(
@@ -229,20 +355,23 @@ pub async fn show_op_diff(
         } else {
             let mut commit_ids = revset.stream();
             while let Some(commit_id) = commit_ids.try_next().await? {
-                let modified_change = changes.get(&commit_id).unwrap();
-                with_content_format.write(formatter, |formatter| {
-                    write_modified_change_summary(
-                        formatter,
-                        commit_summary_template,
-                        modified_change,
-                    )
-                })?;
+                let modified_change = op_commits_diff.changes.get(&commit_id).unwrap();
+                with_content_format
+                    .write(formatter, async |formatter| {
+                        write_modified_change_summary(
+                            formatter,
+                            commit_summary_template,
+                            modified_change,
+                        )
+                    })
+                    .await?;
                 if let Some(diff_renderer) = diff_renderer {
                     let width = with_content_format.width();
                     show_change_diff(ui, formatter, diff_renderer, modified_change, width).await?;
                 }
             }
         }
+        write_elided_commit_counts(formatter, with_content_format, &op_commits_diff).await?;
     }
 
     let changed_working_copies = diff_named_commit_ids(
@@ -253,29 +382,33 @@ pub async fn show_op_diff(
     if !changed_working_copies.is_empty() {
         writeln!(formatter)?;
         for (name, (from_commit, to_commit)) in changed_working_copies {
-            with_content_format.write(formatter, |formatter| {
-                // Usually, there is at most one working copy changed per operation, so we put
-                // the working copy name in the heading.
-                write!(formatter, "Changed working copy ")?;
-                write!(formatter.labeled("working_copies"), "{}@", name.as_symbol())?;
-                writeln!(formatter, ":")?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &RefTarget::resolved(to_commit.cloned()),
-                    true,
-                    None,
-                )?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &RefTarget::resolved(from_commit.cloned()),
-                    false,
-                    None,
-                )
-            })?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    // Usually, there is at most one working copy changed per operation, so we put
+                    // the working copy name in the heading.
+                    write!(formatter, "Changed working copy ")?;
+                    write!(formatter.labeled("working_copies"), "{}@", name.as_symbol())?;
+                    writeln!(formatter, ":")?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &RefTarget::resolved(to_commit.cloned()),
+                        true,
+                        None,
+                    )
+                    .await?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &RefTarget::resolved(from_commit.cloned()),
+                        false,
+                        None,
+                    )
+                    .await
+                })
+                .await?;
         }
     }
 
@@ -286,29 +419,35 @@ pub async fn show_op_diff(
     .collect_vec();
     if !changed_local_bookmarks.is_empty() {
         writeln!(formatter)?;
-        with_content_format.write(formatter, |formatter| {
-            writeln!(formatter, "Changed local bookmarks:")
-        })?;
+        with_content_format
+            .write(formatter, async |formatter| {
+                writeln!(formatter, "Changed local bookmarks:")
+            })
+            .await?;
         for (name, (from_target, to_target)) in changed_local_bookmarks {
-            with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{name}:", name = name.as_symbol())?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    to_target,
-                    true,
-                    None,
-                )?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    from_target,
-                    false,
-                    None,
-                )
-            })?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    writeln!(formatter, "{name}:", name = name.as_symbol())?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        to_target,
+                        true,
+                        None,
+                    )
+                    .await?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        from_target,
+                        false,
+                        None,
+                    )
+                    .await
+                })
+                .await?;
         }
     }
 
@@ -317,29 +456,35 @@ pub async fn show_op_diff(
             .collect_vec();
     if !changed_local_tags.is_empty() {
         writeln!(formatter)?;
-        with_content_format.write(formatter, |formatter| {
-            writeln!(formatter, "Changed local tags:")
-        })?;
+        with_content_format
+            .write(formatter, async |formatter| {
+                writeln!(formatter, "Changed local tags:")
+            })
+            .await?;
         for (name, (from_target, to_target)) in changed_local_tags {
-            with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{name}:", name = name.as_symbol())?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    to_target,
-                    true,
-                    None,
-                )?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    from_target,
-                    false,
-                    None,
-                )
-            })?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    writeln!(formatter, "{name}:", name = name.as_symbol())?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        to_target,
+                        true,
+                        None,
+                    )
+                    .await?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        from_target,
+                        false,
+                        None,
+                    )
+                    .await
+                })
+                .await?;
         }
     }
 
@@ -359,29 +504,35 @@ pub async fn show_op_diff(
     .collect_vec();
     if !changed_remote_bookmarks.is_empty() {
         writeln!(formatter)?;
-        with_content_format.write(formatter, |formatter| {
-            writeln!(formatter, "Changed remote bookmarks:")
-        })?;
+        with_content_format
+            .write(formatter, async |formatter| {
+                writeln!(formatter, "Changed remote bookmarks:")
+            })
+            .await?;
         for (symbol, (from_ref, to_ref)) in changed_remote_bookmarks {
-            with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{symbol}:")?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &to_ref.target,
-                    true,
-                    Some(get_remote_ref_prefix(to_ref)),
-                )?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &from_ref.target,
-                    false,
-                    Some(get_remote_ref_prefix(from_ref)),
-                )
-            })?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    writeln!(formatter, "{symbol}:")?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &to_ref.target,
+                        true,
+                        Some(get_remote_ref_prefix(to_ref)),
+                    )
+                    .await?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &from_ref.target,
+                        false,
+                        Some(get_remote_ref_prefix(from_ref)),
+                    )
+                    .await
+                })
+                .await?;
         }
     }
 
@@ -395,32 +546,73 @@ pub async fn show_op_diff(
     .collect_vec();
     if !changed_remote_tags.is_empty() {
         writeln!(formatter)?;
-        with_content_format.write(formatter, |formatter| {
-            writeln!(formatter, "Changed remote tags:")
-        })?;
+        with_content_format
+            .write(formatter, async |formatter| {
+                writeln!(formatter, "Changed remote tags:")
+            })
+            .await?;
         for (symbol, (from_ref, to_ref)) in changed_remote_tags {
-            with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{symbol}:")?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &to_ref.target,
-                    true,
-                    Some(get_remote_ref_prefix(to_ref)),
-                )?;
-                write_ref_target_summary(
-                    formatter,
-                    current_repo,
-                    commit_summary_template,
-                    &from_ref.target,
-                    false,
-                    Some(get_remote_ref_prefix(from_ref)),
-                )
-            })?;
+            with_content_format
+                .write(formatter, async |formatter| {
+                    writeln!(formatter, "{symbol}:")?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &to_ref.target,
+                        true,
+                        Some(get_remote_ref_prefix(to_ref)),
+                    )
+                    .await?;
+                    write_ref_target_summary(
+                        formatter,
+                        current_repo,
+                        commit_summary_template,
+                        &from_ref.target,
+                        false,
+                        Some(get_remote_ref_prefix(from_ref)),
+                    )
+                    .await
+                })
+                .await?;
         }
     }
 
+    Ok(())
+}
+
+async fn write_elided_commit_counts(
+    formatter: &mut dyn Formatter,
+    with_content_format: &LogContentFormat,
+    op_commits_diff: &OperationCommitsDiff,
+) -> Result<(), std::io::Error> {
+    let newly_visible = op_commits_diff.elided_newly_visible_estimate;
+    let newly_hidden = op_commits_diff.elided_newly_hidden_estimate;
+
+    let format_count = |(lower, maybe_upper): (usize, Option<usize>)| match (lower, maybe_upper) {
+        (0, Some(0)) => None,
+        (0, _) => Some("some".to_string()),
+        (lower, Some(upper)) if upper == lower => Some(format!("{lower}")),
+        _ => Some(format!("{lower}+")),
+    };
+
+    let parts: Vec<String> = [
+        (format_count(newly_visible), "added"),
+        (format_count(newly_hidden), "removed"),
+    ]
+    .into_iter()
+    .filter_map(|(count, label)| count.map(|c| format!("{c} newly {label}")))
+    .collect();
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    with_content_format
+        .write(formatter, async |formatter| {
+            writeln!(formatter, "   (Elided {} revisions)", parts.join(" and "))
+        })
+        .await?;
     Ok(())
 }
 
@@ -446,10 +638,10 @@ fn write_modified_change_summary(
 }
 
 /// Writes a summary for the given `RefTarget`.
-fn write_ref_target_summary(
+async fn write_ref_target_summary(
     formatter: &mut dyn Formatter,
     repo: &dyn Repo,
-    commit_summary_template: &TemplateRenderer<Commit>,
+    commit_summary_template: &TemplateRenderer<'_, Commit>,
     ref_target: &RefTarget,
     added: bool,
     prefix: Option<&str>,
@@ -476,21 +668,21 @@ fn write_ref_target_summary(
         for commit_id in ref_target.added_ids() {
             write_prefix(formatter, added, prefix)?;
             write!(formatter, "(added) ")?;
-            let commit = repo.store().get_commit(commit_id)?;
+            let commit = repo.store().get_commit_async(commit_id).await?;
             commit_summary_template.format(&commit, formatter)?;
             writeln!(formatter)?;
         }
         for commit_id in ref_target.removed_ids() {
             write_prefix(formatter, added, prefix)?;
             write!(formatter, "(removed) ")?;
-            let commit = repo.store().get_commit(commit_id)?;
+            let commit = repo.store().get_commit_async(commit_id).await?;
             commit_summary_template.format(&commit, formatter)?;
             writeln!(formatter)?;
         }
     } else {
         write_prefix(formatter, added, prefix)?;
         let commit_id = ref_target.as_normal().unwrap();
-        let commit = repo.store().get_commit(commit_id)?;
+        let commit = repo.store().get_commit_async(commit_id).await?;
         commit_summary_template.format(&commit, formatter)?;
         writeln!(formatter)?;
     }
@@ -524,6 +716,21 @@ impl ModifiedChange {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperationCommitsDiff {
+    changes: HashMap<CommitId, ModifiedChange>,
+    elided_newly_visible_estimate: (usize, Option<usize>),
+    elided_newly_hidden_estimate: (usize, Option<usize>),
+}
+
+impl OperationCommitsDiff {
+    fn has_changes(&self) -> bool {
+        !self.changes.is_empty()
+            || self.elided_newly_visible_estimate != (0, Some(0))
+            || self.elided_newly_hidden_estimate != (0, Some(0))
+    }
+}
+
 /// Computes created/rewritten/abandoned commits between two operations.
 ///
 /// Returns a map of [`ModifiedChange`]s containing the new and old commits. For
@@ -533,12 +740,16 @@ async fn compute_operation_commits_diff(
     repo: &dyn Repo,
     from_repo: &ReadonlyRepo,
     to_repo: &ReadonlyRepo,
-) -> Result<HashMap<CommitId, ModifiedChange>, CommandError> {
+    from_op_diff_changes_expr: Arc<ResolvedRevsetExpression>,
+    to_op_diff_changes_expr: Arc<ResolvedRevsetExpression>,
+) -> Result<OperationCommitsDiff, CommandError> {
     let store = repo.store();
     let from_heads = from_repo.view().heads().iter().cloned().collect_vec();
     let to_heads = to_repo.view().heads().iter().cloned().collect_vec();
     let from_expr = RevsetExpression::commits(from_heads);
     let to_expr = RevsetExpression::commits(to_heads);
+    let newly_hidden_expr = to_expr.range(&from_expr);
+    let newly_visible_expr = from_expr.range(&to_expr);
 
     let predecessor_commits = accumulate_predecessors(
         slice::from_ref(to_repo.operation()),
@@ -546,12 +757,23 @@ async fn compute_operation_commits_diff(
     )
     .await?;
 
+    let elided_newly_visible_estimate = newly_visible_expr
+        .minus(&to_op_diff_changes_expr)
+        .evaluate(repo)?
+        .count_estimate()?;
+    let elided_newly_hidden_estimate = newly_hidden_expr
+        .minus(&from_op_diff_changes_expr)
+        .evaluate(repo)?
+        .count_estimate()?;
+
     // Collect hidden commits to find abandoned/rewritten changes.
     let mut hidden_commits_by_change: HashMap<ChangeId, CommitId> = HashMap::new();
     let mut abandoned_commits: HashSet<CommitId> = HashSet::new();
-    let newly_hidden = to_expr.range(&from_expr).evaluate(repo)?;
-    for item in newly_hidden.commit_change_ids() {
-        let (commit_id, change_id) = item?;
+    let newly_hidden = newly_hidden_expr
+        .intersection(&from_op_diff_changes_expr)
+        .evaluate(repo)?;
+    let mut newly_hidden_stream = newly_hidden.commit_change_ids();
+    while let Some((commit_id, change_id)) = newly_hidden_stream.try_next().await? {
         // Just pick one if diverged. Divergent commits shouldn't be considered
         // "squashed" into the new commit.
         hidden_commits_by_change
@@ -562,9 +784,11 @@ async fn compute_operation_commits_diff(
 
     // For each new commit, copy/deduce predecessors based on change id.
     let mut changes: HashMap<CommitId, ModifiedChange> = HashMap::new();
-    let newly_visible = from_expr.range(&to_expr).evaluate(repo)?;
-    for item in newly_visible.commit_change_ids() {
-        let (commit_id, change_id) = item?;
+    let newly_visible = newly_visible_expr
+        .intersection(&to_op_diff_changes_expr)
+        .evaluate(repo)?;
+    let mut newly_visible_stream = newly_visible.commit_change_ids();
+    while let Some((commit_id, change_id)) = newly_visible_stream.try_next().await? {
         let predecessor_ids = if let Some(ids) = predecessor_commits.get(&commit_id) {
             ids // including visible predecessors
         } else if let Some(id) = hidden_commits_by_change.get(&change_id) {
@@ -576,11 +800,9 @@ async fn compute_operation_commits_diff(
             abandoned_commits.remove(id);
         }
         let change = ModifiedChange::Existing {
-            commit: store.get_commit(&commit_id)?,
-            predecessors: predecessor_ids
-                .iter()
-                .map(|id| store.get_commit(id))
-                .try_collect()?,
+            commit: store.get_commit_async(&commit_id).await?,
+            predecessors: try_join_all(predecessor_ids.iter().map(|id| store.get_commit_async(id)))
+                .await?,
         };
         changes.insert(commit_id, change);
     }
@@ -588,12 +810,16 @@ async fn compute_operation_commits_diff(
     // Record remainders as abandoned.
     for commit_id in abandoned_commits {
         let change = ModifiedChange::Abandoned {
-            commit: store.get_commit(&commit_id)?,
+            commit: store.get_commit_async(&commit_id).await?,
         };
         changes.insert(commit_id, change);
     }
 
-    Ok(changes)
+    Ok(OperationCommitsDiff {
+        changes,
+        elided_newly_visible_estimate,
+        elided_newly_hidden_estimate,
+    })
 }
 
 /// Displays the diffs of a modified change.

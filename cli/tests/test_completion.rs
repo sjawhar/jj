@@ -228,6 +228,7 @@ fn test_bookmark_names() {
     --help	Print help (see more with '--help')
     --repository	Path to repository to operate on
     --ignore-working-copy	Don't snapshot the working copy, and don't update it
+    --no-integrate-operation	Run the command as usual but don't integrate any operations
     --ignore-immutable	Allow rewriting immutable commits
     --at-operation	Operation to load the repo at
     --debug	Enable debug logging
@@ -430,19 +431,19 @@ fn test_aliases_are_resolved(shell: Shell) {
     match shell {
         Shell::Bash => {
             insta::assert_snapshot!(output, @"
-            --revisions
+            --revision
             --reversed[EOF]
             ");
         }
         Shell::Zsh => {
             insta::assert_snapshot!(output, @"
-            --revisions:Which revisions to show
+            --revision:Which revisions to show
             --reversed:Show revisions in the opposite order (older revisions first)[EOF]
             ");
         }
         Shell::Fish => {
             insta::assert_snapshot!(output, @"
-            --revisions	Which revisions to show
+            --revision	Which revisions to show
             --reversed	Show revisions in the opposite order (older revisions first)
             [EOF]
             ");
@@ -519,21 +520,21 @@ fn test_default_command_is_resolved(shell: Shell) {
     match shell {
         Shell::Bash => {
             insta::assert_snapshot!(output, @"
-            --revisions
+            --revision
             --limit
             [EOF]
             ");
         }
         Shell::Zsh => {
             insta::assert_snapshot!(output, @"
-            --revisions:Which revisions to show
+            --revision:Which revisions to show
             --limit:Limit number of revisions to show
             [EOF]
             ");
         }
         Shell::Fish => {
             insta::assert_snapshot!(output, @"
-            --revisions	Which revisions to show
+            --revision	Which revisions to show
             --limit	Limit number of revisions to show
             [EOF]
             ");
@@ -719,6 +720,7 @@ fn test_command_completion_short_name() {
     unset	Update a config file to unset the given option
     --repository	Path to repository to operate on
     --ignore-working-copy	Don't snapshot the working copy, and don't update it
+    --no-integrate-operation	Run the command as usual but don't integrate any operations
     --ignore-immutable	Allow rewriting immutable commits
     --at-operation	Operation to load the repo at
     --debug	Enable debug logging
@@ -917,6 +919,88 @@ fn test_aliases_are_completed(shell: Shell) {
         output.status.success() && output.stdout.is_empty(),
         "completion expected to come back empty, but got: {output}"
     );
+}
+
+#[test]
+fn test_alias_descriptions_in_completions() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // alias with a description
+    test_env.add_config(indoc! {r#"
+        [aliases]
+        'compact-log'.doc = 'Show the log in a compact format'
+        'compact-log'.definition = ["log", "--no-graph"]
+    "#});
+
+    // fish displays help text after a tab
+    let output = work_dir.complete_fish(["compact-l"]);
+    insta::assert_snapshot!(output, @"
+    compact-log	Show the log in a compact format
+    [EOF]
+    ");
+
+    // alias with multi-line string description
+    test_env.add_config(indoc! {r#"
+        [aliases]
+        'status-short'.doc = 'Show the status of the working copy in short format'
+        'status-short'.definition = ["status", "--format=summary"]
+    "#});
+
+    let output = work_dir.complete_fish(["status-shor"]);
+    insta::assert_snapshot!(output, @"
+    status-short	Show the status of the working copy in short format
+    [EOF]
+    ");
+
+    // alias without a .doc property should have no description
+    test_env.add_config(indoc! {r#"
+        [aliases]
+        plain-alias = ["status"]
+    "#});
+
+    let output = work_dir.complete_fish(["plain-alia"]);
+    insta::assert_snapshot!(output, @"
+    plain-alias
+    [EOF]
+    ");
+
+    // revset alias with doc
+    test_env.add_config(indoc! {r#"
+        [revset-aliases]
+        'mine'.doc = 'All my work'
+        'mine'.definition = "author(foo)"
+    "#});
+
+    let output = work_dir.complete_fish(["log", "-r", "min"]);
+    insta::assert_snapshot!(output, @"
+    mine	All my work
+    [EOF]
+    ");
+
+    // template alias with doc
+    test_env.add_config(indoc! {r#"
+        [template-aliases]
+        'sh'.doc = 'Short hash'
+        'sh'.definition = "commit_id.short()"
+    "#});
+
+    let output = work_dir.complete_fish(["log", "-T", "s"]);
+    insta::assert_snapshot!(output, @"
+    sh	Short hash
+    [EOF]
+    ");
+
+    // fileset alias with doc
+    test_env.add_config(indoc! {r#"
+        [fileset-aliases]
+        'LOCK'.doc = 'Lockfiles'
+        'LOCK'.definition = '**/Cargo.lock'
+    "#});
+
+    let output = work_dir.complete_fish(["log", "-r", "all()", "L"]);
+    insta::assert_snapshot!(output, @"");
 }
 
 #[test]
@@ -1179,90 +1263,82 @@ fn test_operations() {
 
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-    work_dir
-        .run_jj(["describe", "-m", "description 0"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-m", "description 1"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-m", "description 2"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-m", "description 3"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-m", "description 4"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-m", "description 5"])
-        .success();
+    let num_ops = 9;
+    for i in 0..num_ops {
+        work_dir
+            .run_jj(["describe", "-m", &format!("description {i}")])
+            .success();
+    }
 
     let work_dir = test_env.work_dir("repo");
 
     let output = work_dir.complete_fish(["op", "show", ""]).success();
-    let add_workspace_id = output
-        .stdout
-        .raw()
-        .lines()
-        .nth(5)
-        .unwrap()
-        .split('\t')
-        .next()
-        .unwrap();
-    insta::assert_snapshot!(add_workspace_id, @"12f7cbba4278");
-
-    let output = work_dir.complete_fish(["op", "show", "8"]);
-    insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
-    8f47435a3990	(2001-02-03 08:05:07) add workspace 'default'
-    [EOF]
-    ");
-    // make sure global --at-op flag is respected
-    let output = work_dir.complete_fish(["--at-op", "8ed8c16786e6", "op", "show", "8"]);
-    insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
-    8f47435a3990	(2001-02-03 08:05:07) add workspace 'default'
+    insta::assert_snapshot!(output.take_stdout_n_lines(num_ops + 2), @"
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
+    2424cbddf672	(2001-02-03 08:05:15) describe commit 37df8a6c1874ff45621dee0f2b7a77169b65d257
+    b95dea46e909	(2001-02-03 08:05:14) describe commit c3588cff852e44b68297f51705d6e61888806ddd
+    006433125524	(2001-02-03 08:05:13) describe commit aa0b3230e3787076f232a08c8b1c7f54948a2d7a
+    4e01f7335c34	(2001-02-03 08:05:12) describe commit 96157804fd41363cb2ff8ff957ff1df1a2a1109a
+    d9412c797d9b	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    6ead3248a7c8	(2001-02-03 08:05:10) describe commit dd7390802e3ca4467ffa43f2e0c0374463d056f3
+    3274622dfd8b	(2001-02-03 08:05:09) describe commit 3ae22e7f50a15d393e412cca72d09a61165d0c84
+    8501e29d2d94	(2001-02-03 08:05:08) describe commit e8849ae12c709f2321908879bc724fdb2ab8a781
+    90267f31f904	(2001-02-03 08:05:07) add workspace 'default'
+    000000000000	(1970-01-01 11:00:00)
     [EOF]
     ");
 
-    let output = work_dir.complete_fish(["--at-op", "8e"]);
+    let output = work_dir.complete_fish(["op", "show", "9"]);
     insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
+    90267f31f904	(2001-02-03 08:05:07) add workspace 'default'
+    [EOF]
+    ");
+    // make sure global --at-op flag is respected (should not include later
+    // operations)
+    let output = work_dir.complete_fish(["--at-op", "90267f31f904", "op", "show", "9"]);
+    insta::assert_snapshot!(output, @"
+    90267f31f904	(2001-02-03 08:05:07) add workspace 'default'
     [EOF]
     ");
 
-    let output = work_dir.complete_fish(["op", "abandon", "8e"]);
+    let output = work_dir.complete_fish(["--at-op", "9b"]);
     insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
     [EOF]
     ");
 
-    let output = work_dir.complete_fish(["op", "diff", "--op", "8e"]);
+    let output = work_dir.complete_fish(["op", "abandon", "9b"]);
     insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
-    [EOF]
-    ");
-    let output = work_dir.complete_fish(["op", "diff", "--from", "8e"]);
-    insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
-    [EOF]
-    ");
-    let output = work_dir.complete_fish(["op", "diff", "--to", "8e"]);
-    insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
     [EOF]
     ");
 
-    let output = work_dir.complete_fish(["op", "restore", "8e"]);
+    let output = work_dir.complete_fish(["op", "diff", "--op", "9b"]);
     insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
+    [EOF]
+    ");
+    let output = work_dir.complete_fish(["op", "diff", "--from", "9b"]);
+    insta::assert_snapshot!(output, @"
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
+    [EOF]
+    ");
+    let output = work_dir.complete_fish(["op", "diff", "--to", "9b"]);
+    insta::assert_snapshot!(output, @"
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
     [EOF]
     ");
 
-    let output = work_dir.complete_fish(["op", "revert", "8e"]);
+    let output = work_dir.complete_fish(["op", "restore", "9b"]);
     insta::assert_snapshot!(output, @"
-    8ed8c16786e6	(2001-02-03 08:05:11) describe commit 3725536d0ae06d69e46911258cee591dbdb66478
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
+    [EOF]
+    ");
+
+    let output = work_dir.complete_fish(["op", "revert", "9b"]);
+    insta::assert_snapshot!(output, @"
+    9b559ee756d7	(2001-02-03 08:05:16) describe commit e0e6c0a964c024a49605805925672044dfae4181
     [EOF]
     ");
 }

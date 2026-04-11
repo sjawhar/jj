@@ -20,20 +20,16 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::ErrorKind;
-use std::io::Read;
 use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::Poll;
 
+use futures::AsyncRead;
+use futures::AsyncReadExt as _;
 use tempfile::NamedTempFile;
 use tempfile::PersistError;
 use thiserror::Error;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt as _;
-use tokio::io::ReadBuf;
 
 #[cfg(unix)]
 pub use self::platform::check_executable_bit_support;
@@ -301,32 +297,6 @@ pub async fn copy_async_to_sync<R: AsyncRead, W: Write + ?Sized>(
     }
 }
 
-/// `AsyncRead` implementation backed by a `Read`. It is not actually async;
-/// the goal is simply to avoid reading the full contents from the `Read` into
-/// memory.
-pub struct BlockingAsyncReader<R> {
-    reader: R,
-}
-
-impl<R: Read + Unpin> BlockingAsyncReader<R> {
-    /// Creates a new `BlockingAsyncReader`
-    pub fn new(reader: R) -> Self {
-        Self { reader }
-    }
-}
-
-impl<R: Read + Unpin> AsyncRead for BlockingAsyncReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let num_bytes_read = self.reader.read(buf.initialize_unfilled())?;
-        buf.advance(num_bytes_read);
-        Poll::Ready(Ok(()))
-    }
-}
-
 #[cfg(unix)]
 mod platform {
     use std::convert::Infallible;
@@ -481,44 +451,47 @@ mod fallback {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
     use std::io::Write as _;
 
+    use futures::io::Cursor;
     use itertools::Itertools as _;
     use pollster::FutureExt as _;
     use test_case::test_case;
 
     use super::*;
+    use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
 
     #[test]
     #[cfg(unix)]
-    fn exec_bit_support_in_temp_dir() {
+    fn exec_bit_support_in_temp_dir() -> TestResult {
         // Temporary directories on Unix should always have executable support.
         // Note that it would be problematic to test in a non-temp directory, as
         // a developer's filesystem may or may not have executable bit support.
         let dir = new_temp_dir();
-        let supported = check_executable_bit_support(dir.path()).unwrap();
+        let supported = check_executable_bit_support(dir.path())?;
         assert!(supported);
+        Ok(())
     }
 
     #[test]
-    fn test_path_bytes_roundtrip() {
+    fn test_path_bytes_roundtrip() -> TestResult {
         let bytes = b"ascii";
-        let path = path_from_bytes(bytes).unwrap();
-        assert_eq!(path_to_bytes(path).unwrap(), bytes);
+        let path = path_from_bytes(bytes)?;
+        assert_eq!(path_to_bytes(path)?, bytes);
 
         let bytes = b"utf-8.\xc3\xa0";
-        let path = path_from_bytes(bytes).unwrap();
-        assert_eq!(path_to_bytes(path).unwrap(), bytes);
+        let path = path_from_bytes(bytes)?;
+        assert_eq!(path_to_bytes(path)?, bytes);
 
         let bytes = b"latin1.\xe0";
         if cfg!(unix) {
-            let path = path_from_bytes(bytes).unwrap();
-            assert_eq!(path_to_bytes(path).unwrap(), bytes);
+            let path = path_from_bytes(bytes)?;
+            assert_eq!(path_to_bytes(path)?, bytes);
         } else {
             assert!(path_from_bytes(bytes).is_err());
         }
+        Ok(())
     }
 
     #[test]
@@ -560,161 +533,140 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_no_existing_file() {
+    fn test_persist_no_existing_file() -> TestResult {
         let temp_dir = new_temp_dir();
         let target = temp_dir.path().join("file");
-        let mut temp_file = NamedTempFile::new_in(&temp_dir).unwrap();
-        temp_file.write_all(b"contents").unwrap();
+        let mut temp_file = NamedTempFile::new_in(&temp_dir)?;
+        temp_file.write_all(b"contents")?;
         assert!(persist_content_addressed_temp_file(temp_file, target).is_ok());
+        Ok(())
     }
 
     #[test_case(false ; "existing file open")]
     #[test_case(true ; "existing file closed")]
-    fn test_persist_target_exists(existing_file_closed: bool) {
+    fn test_persist_target_exists(existing_file_closed: bool) -> TestResult {
         let temp_dir = new_temp_dir();
         let target = temp_dir.path().join("file");
-        let mut temp_file = NamedTempFile::new_in(&temp_dir).unwrap();
-        temp_file.write_all(b"contents").unwrap();
+        let mut temp_file = NamedTempFile::new_in(&temp_dir)?;
+        temp_file.write_all(b"contents")?;
 
-        let mut file = File::create(&target).unwrap();
-        file.write_all(b"contents").unwrap();
+        let mut file = File::create(&target)?;
+        file.write_all(b"contents")?;
         if existing_file_closed {
             drop(file);
         }
 
         assert!(persist_content_addressed_temp_file(temp_file, &target).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_file_identity_hard_link() {
+    fn test_file_identity_hard_link() -> TestResult {
         let temp_dir = new_temp_dir();
         let file_path = temp_dir.path().join("file");
         let other_file_path = temp_dir.path().join("other_file");
         let link_path = temp_dir.path().join("link");
-        fs::write(&file_path, "").unwrap();
-        fs::write(&other_file_path, "").unwrap();
-        fs::hard_link(&file_path, &link_path).unwrap();
+        fs::write(&file_path, "")?;
+        fs::write(&other_file_path, "")?;
+        fs::hard_link(&file_path, &link_path)?;
         assert_eq!(
-            FileIdentity::from_symlink_path(&file_path).unwrap(),
-            FileIdentity::from_symlink_path(&link_path).unwrap()
+            FileIdentity::from_symlink_path(&file_path)?,
+            FileIdentity::from_symlink_path(&link_path)?
         );
         assert_ne!(
-            FileIdentity::from_symlink_path(&other_file_path).unwrap(),
-            FileIdentity::from_symlink_path(&link_path).unwrap()
+            FileIdentity::from_symlink_path(&other_file_path)?,
+            FileIdentity::from_symlink_path(&link_path)?
         );
         assert_eq!(
-            FileIdentity::from_symlink_path(&file_path).unwrap(),
-            FileIdentity::from_file(File::open(&link_path).unwrap()).unwrap()
+            FileIdentity::from_symlink_path(&file_path)?,
+            FileIdentity::from_file(File::open(&link_path)?)?
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_file_identity_unix_symlink_dir() {
+    fn test_file_identity_unix_symlink_dir() -> TestResult {
         let temp_dir = new_temp_dir();
         let dir_path = temp_dir.path().join("dir");
         let symlink_path = temp_dir.path().join("symlink");
-        fs::create_dir(&dir_path).unwrap();
-        std::os::unix::fs::symlink("dir", &symlink_path).unwrap();
+        fs::create_dir(&dir_path)?;
+        std::os::unix::fs::symlink("dir", &symlink_path)?;
         // symlink should be identical to itself
         assert_eq!(
-            FileIdentity::from_symlink_path(&symlink_path).unwrap(),
-            FileIdentity::from_symlink_path(&symlink_path).unwrap()
+            FileIdentity::from_symlink_path(&symlink_path)?,
+            FileIdentity::from_symlink_path(&symlink_path)?
         );
         // symlink should be different from the target directory
         assert_ne!(
-            FileIdentity::from_symlink_path(&dir_path).unwrap(),
-            FileIdentity::from_symlink_path(&symlink_path).unwrap()
+            FileIdentity::from_symlink_path(&dir_path)?,
+            FileIdentity::from_symlink_path(&symlink_path)?
         );
         // File::open() follows symlinks
         assert_eq!(
-            FileIdentity::from_symlink_path(&dir_path).unwrap(),
-            FileIdentity::from_file(File::open(&symlink_path).unwrap()).unwrap()
+            FileIdentity::from_symlink_path(&dir_path)?,
+            FileIdentity::from_file(File::open(&symlink_path)?)?
         );
         assert_ne!(
-            FileIdentity::from_symlink_path(&symlink_path).unwrap(),
-            FileIdentity::from_file(File::open(&symlink_path).unwrap()).unwrap()
+            FileIdentity::from_symlink_path(&symlink_path)?,
+            FileIdentity::from_file(File::open(&symlink_path)?)?
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_file_identity_unix_symlink_loop() {
+    fn test_file_identity_unix_symlink_loop() -> TestResult {
         let temp_dir = new_temp_dir();
         let lower_file_path = temp_dir.path().join("file");
         let upper_file_path = temp_dir.path().join("FILE");
         let lower_symlink_path = temp_dir.path().join("symlink");
         let upper_symlink_path = temp_dir.path().join("SYMLINK");
-        fs::write(&lower_file_path, "").unwrap();
-        std::os::unix::fs::symlink("symlink", &lower_symlink_path).unwrap();
-        let is_icase_fs = upper_file_path.try_exists().unwrap();
+        fs::write(&lower_file_path, "")?;
+        std::os::unix::fs::symlink("symlink", &lower_symlink_path)?;
+        let is_icase_fs = upper_file_path.try_exists()?;
         // symlink should be identical to itself
         assert_eq!(
-            FileIdentity::from_symlink_path(&lower_symlink_path).unwrap(),
-            FileIdentity::from_symlink_path(&lower_symlink_path).unwrap()
+            FileIdentity::from_symlink_path(&lower_symlink_path)?,
+            FileIdentity::from_symlink_path(&lower_symlink_path)?
         );
         assert_ne!(
-            FileIdentity::from_symlink_path(&lower_symlink_path).unwrap(),
-            FileIdentity::from_symlink_path(&lower_file_path).unwrap()
+            FileIdentity::from_symlink_path(&lower_symlink_path)?,
+            FileIdentity::from_symlink_path(&lower_file_path)?
         );
         if is_icase_fs {
             assert_eq!(
-                FileIdentity::from_symlink_path(&lower_symlink_path).unwrap(),
-                FileIdentity::from_symlink_path(&upper_symlink_path).unwrap()
+                FileIdentity::from_symlink_path(&lower_symlink_path)?,
+                FileIdentity::from_symlink_path(&upper_symlink_path)?
             );
         } else {
             assert!(FileIdentity::from_symlink_path(&upper_symlink_path).is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn test_copy_async_to_sync_small() {
+    fn test_copy_async_to_sync_small() -> TestResult {
         let input = b"hello";
         let mut output = vec![];
 
         let result = copy_async_to_sync(Cursor::new(&input), &mut output).block_on();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 5);
+        assert_eq!(result?, 5);
         assert_eq!(output, input);
+        Ok(())
     }
 
     #[test]
-    fn test_copy_async_to_sync_large() {
+    fn test_copy_async_to_sync_large() -> TestResult {
         // More than 1 buffer worth of data
         let input = (0..100u8).cycle().take(40000).collect_vec();
         let mut output = vec![];
 
         let result = copy_async_to_sync(Cursor::new(&input), &mut output).block_on();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 40000);
+        assert_eq!(result?, 40000);
         assert_eq!(output, input);
-    }
-
-    #[test]
-    fn test_blocking_async_reader() {
-        let input = b"hello";
-        let sync_reader = Cursor::new(&input);
-        let mut async_reader = BlockingAsyncReader::new(sync_reader);
-
-        let mut buf = [0u8; 3];
-        let num_bytes_read = async_reader.read(&mut buf).block_on().unwrap();
-        assert_eq!(num_bytes_read, 3);
-        assert_eq!(&buf, &input[0..3]);
-
-        let num_bytes_read = async_reader.read(&mut buf).block_on().unwrap();
-        assert_eq!(num_bytes_read, 2);
-        assert_eq!(&buf[0..2], &input[3..5]);
-    }
-
-    #[test]
-    fn test_blocking_async_reader_read_to_end() {
-        let input = b"hello";
-        let sync_reader = Cursor::new(&input);
-        let mut async_reader = BlockingAsyncReader::new(sync_reader);
-
-        let mut buf = vec![];
-        let num_bytes_read = async_reader.read_to_end(&mut buf).block_on().unwrap();
-        assert_eq!(num_bytes_read, input.len());
-        assert_eq!(&buf, &input);
+        Ok(())
     }
 }

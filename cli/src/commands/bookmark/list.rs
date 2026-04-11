@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use clap_complete::ArgValueCandidates;
-use itertools::Itertools as _;
+use futures::TryStreamExt as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::str_util::StringExpression;
@@ -92,7 +92,7 @@ pub struct BookmarkListArgs {
     ///
     /// Note that `-r deleted_bookmark` will not work since `deleted_bookmark`
     /// wouldn't have a local target.
-    #[arg(long, short, value_name = "REVSETS")]
+    #[arg(long = "revision", short, value_name = "REVSETS", alias = "revisions")]
     revisions: Option<Vec<RevisionArg>>,
 
     /// Render each bookmark using the given template
@@ -126,7 +126,7 @@ pub async fn cmd_bookmark_list(
     command: &CommandHelper,
     args: &BookmarkListArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui)?;
+    let workspace_command = command.workspace_helper(ui).await?;
     let repo = workspace_command.repo();
     let view = repo.view();
 
@@ -142,7 +142,7 @@ pub async fn cmd_bookmark_list(
         // Intersects with the set of local bookmark targets to minimize the lookup
         // space.
         expression.intersect_with(&RevsetExpression::bookmarks(StringExpression::all()));
-        expression.evaluate_to_commit_ids()?.try_collect()?
+        expression.evaluate_to_commit_ids()?.try_collect().await?
     } else {
         HashSet::new()
     };

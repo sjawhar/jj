@@ -27,13 +27,13 @@ use futures::future::ready;
 use futures::future::try_join_all;
 use futures::stream;
 use itertools::Itertools as _;
+use pollster::FutureExt as _;
 use thiserror::Error;
 
-use crate::dag_walk;
+use crate::dag_walk_async;
 use crate::object_id::HexPrefix;
 use crate::object_id::PrefixResolution;
 use crate::op_heads_store;
-use crate::op_heads_store::OpHeadResolutionError;
 use crate::op_heads_store::OpHeadsStore;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OpStore;
@@ -54,9 +54,6 @@ pub enum OpsetEvaluationError {
     /// Failed to read op heads.
     #[error(transparent)]
     OpHeadsStore(#[from] OpHeadsStoreError),
-    /// Failed to resolve the current operation heads.
-    #[error(transparent)]
-    OpHeadResolution(#[from] OpHeadResolutionError),
     /// Failed to access operation object.
     #[error(transparent)]
     OpStore(#[from] OpStoreError),
@@ -161,7 +158,7 @@ async fn resolve_single_op(
     }?;
     for (i, c) in op_postfix.chars().enumerate() {
         let mut neighbor_ops = match c {
-            '-' => operation.parents().try_collect()?,
+            '-' => operation.parents().await?,
             '+' => find_child_ops(head_ops.as_ref().unwrap(), operation.id()).await?,
             _ => unreachable!(),
         };
@@ -273,12 +270,18 @@ pub fn walk_ancestors(
         .collect_vec();
     // Lazily load operations based on timestamp-based heuristic. This works so long
     // as the operation history is mostly linear.
-    stream::iter(dag_walk::topo_order_reverse_lazy_ok(
+    dag_walk_async::topo_order_reverse_lazy(
         head_ops.into_iter().map(Ok),
         |OperationByEndTime(op)| op.id().clone(),
-        |OperationByEndTime(op)| op.parents().map_ok(OperationByEndTime).collect_vec(),
+        async |OperationByEndTime(op)| match op.parents().await {
+            Ok(parents) => parents
+                .into_iter()
+                .map(|parent| Ok(OperationByEndTime(parent)))
+                .collect_vec(),
+            Err(err) => vec![Err(err)],
+        },
         |_| panic!("graph has cycle"),
-    ))
+    )
     .map_ok(|OperationByEndTime(op)| op)
 }
 
@@ -303,26 +306,40 @@ pub fn walk_ancestors_range(
 
     // Lazily load operations based on timestamp-based heuristic. This works so long
     // as the operation history is mostly linear.
-    let trailing_iter = dag_walk::topo_order_reverse_lazy_ok(
+    let trailing_stream = dag_walk_async::topo_order_reverse_lazy(
         start_ops.into_iter().map(Ok),
         |OperationByEndTime(op)| op.id().clone(),
-        |OperationByEndTime(op)| op.parents().map_ok(OperationByEndTime).collect_vec(),
+        async |OperationByEndTime(op)| match op.parents().await {
+            Ok(parents) => parents
+                .into_iter()
+                .map(|op| Ok(OperationByEndTime(op)))
+                .collect_vec(),
+            Err(err) => vec![Err(err)],
+        },
         |_| panic!("graph has cycle"),
     )
     .map_ok(|OperationByEndTime(op)| op);
-    stream::iter(leading_items).chain(stream::iter(trailing_iter))
+    stream::iter(leading_items).chain(trailing_stream)
 }
 
 fn collect_ancestors_until_roots(
     start_ops: &mut Vec<OperationByEndTime>,
     mut unwanted_ids: HashSet<OperationId>,
 ) -> Vec<OpStoreResult<Operation>> {
-    let sorted_ops = match dag_walk::topo_order_reverse_chunked(
+    let sorted_ops = match dag_walk_async::topo_order_reverse_chunked(
         start_ops,
         |OperationByEndTime(op)| op.id().clone(),
-        |OperationByEndTime(op)| op.parents().map_ok(OperationByEndTime).collect_vec(),
+        async |OperationByEndTime(op)| match op.parents().await {
+            Ok(parents) => parents
+                .into_iter()
+                .map(|op| Ok(OperationByEndTime(op)))
+                .collect_vec(),
+            Err(err) => vec![Err(err)],
+        },
         |_| panic!("graph has cycle"),
-    ) {
+    )
+    .block_on()
+    {
         Ok(sorted_ops) => sorted_ops,
         Err(err) => return vec![Err(err)],
     };
@@ -337,6 +354,29 @@ fn collect_ancestors_until_roots(
     // Don't visit ancestors of unwanted ops further.
     start_ops.retain(|OperationByEndTime(op)| !unwanted_ids.contains(op.id()));
     items
+}
+
+/// Finds the closest common ancestor of `set1` and `set2`. Uses the end
+/// timestamp as a heuristic.
+// TODO: We should probably make this a function on `OpStore` instead of
+// relying on heuristics (even if the implementation of the trait might rely on
+// the same heuristic initially).
+pub async fn closest_common_ancestors(
+    set1: impl IntoIterator<Item = Operation>,
+    set2: impl IntoIterator<Item = Operation>,
+) -> OpStoreResult<Vec<Operation>> {
+    let ancestor_ops = dag_walk_async::closest_common_nodes(
+        set1.into_iter().map(OperationByEndTime),
+        set2.into_iter().map(OperationByEndTime),
+        |op: &OperationByEndTime| op.0.id().clone(),
+        async |op: &OperationByEndTime| {
+            op.0.parents()
+                .await
+                .map(|parents| parents.into_iter().map(OperationByEndTime))
+        },
+    )
+    .await?;
+    Ok(ancestor_ops.into_iter().map(|op| op.0).collect())
 }
 
 /// Stats about `reparent_range()`.

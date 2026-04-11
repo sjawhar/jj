@@ -21,12 +21,12 @@ use std::convert::Infallible;
 use std::fmt;
 use std::ops::ControlFlow;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
 use futures::Stream;
 use futures::StreamExt as _;
+use futures::stream::LocalBoxStream;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
 use thiserror::Error;
@@ -1865,11 +1865,8 @@ where
         }
         RevsetExpression::HasSize { candidates, count } => {
             let candidates = folder.fold_expression(candidates)?;
-            RevsetExpression::HasSize {
-                candidates,
-                count: *count,
-            }
-            .into()
+            let count = *count;
+            RevsetExpression::HasSize { candidates, count }.into()
         }
         RevsetExpression::Latest { candidates, count } => {
             let candidates = folder.fold_expression(candidates)?;
@@ -2631,7 +2628,6 @@ fn reload_repo_at_operation(
             RepoLoaderError::Backend(err) => RevsetResolutionError::Backend(err),
             RepoLoaderError::Index(_)
             | RepoLoaderError::IndexStore(_)
-            | RepoLoaderError::OpHeadResolution(_)
             | RepoLoaderError::OpHeadsStoreError(_)
             | RepoLoaderError::OpStore(_)
             | RepoLoaderError::TransactionCommit(_) => RevsetResolutionError::Other(err.into()),
@@ -3423,30 +3419,16 @@ impl VisibilityResolutionContext<'_> {
 }
 
 pub trait Revset: fmt::Debug {
-    /// Iterate in topological order with children before parents.
-    fn iter<'a>(&self) -> Box<dyn Iterator<Item = Result<CommitId, RevsetEvaluationError>> + 'a>
-    where
-        Self: 'a;
-
     /// Streams in topological order with children before parents.
-    fn stream<'a>(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<CommitId, RevsetEvaluationError>> + 'a>>
+    // TODO: Relax to BoxStream?
+    fn stream<'a>(&self) -> LocalBoxStream<'a, Result<CommitId, RevsetEvaluationError>>
     where
         Self: 'a;
 
     /// Iterates commit/change id pairs in topological order.
     fn commit_change_ids<'a>(
         &self,
-    ) -> Box<dyn Iterator<Item = Result<(CommitId, ChangeId), RevsetEvaluationError>> + 'a>
-    where
-        Self: 'a;
-
-    /// Iterates graphs nodes (commit ID and edges) in topological order with
-    /// children before parents.
-    fn iter_graph<'a>(
-        &self,
-    ) -> Box<dyn Iterator<Item = Result<GraphNode<CommitId>, RevsetEvaluationError>> + 'a>
+    ) -> LocalBoxStream<'a, Result<(CommitId, ChangeId), RevsetEvaluationError>>
     where
         Self: 'a;
 
@@ -3454,7 +3436,7 @@ pub trait Revset: fmt::Debug {
     /// children before parents.
     fn stream_graph<'a>(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<GraphNode<CommitId>, RevsetEvaluationError>> + 'a>>
+    ) -> LocalBoxStream<'a, Result<GraphNode<CommitId>, RevsetEvaluationError>>
     where
         Self: 'a;
 
@@ -3480,30 +3462,6 @@ pub trait Revset: fmt::Debug {
 /// Function that checks if a commit is contained within the revset.
 pub type RevsetContainingFn<'a> = dyn Fn(&CommitId) -> Result<bool, RevsetEvaluationError> + 'a;
 
-pub trait RevsetIteratorExt {
-    fn commits(
-        self,
-        store: &Arc<Store>,
-    ) -> impl Iterator<Item = Result<Commit, RevsetEvaluationError>> + use<'_, Self>;
-}
-
-impl<I: Iterator<Item = Result<CommitId, RevsetEvaluationError>>> RevsetIteratorExt for I {
-    fn commits(
-        self,
-        store: &Arc<Store>,
-    ) -> impl Iterator<Item = Result<Commit, RevsetEvaluationError>> + use<'_, I> {
-        let store = store.clone();
-        self.map(move |result| {
-            let commit_id = result?;
-            let commit = store
-                .clone()
-                .get_commit(&commit_id)
-                .map_err(RevsetEvaluationError::Backend)?;
-            Ok(commit)
-        })
-    }
-}
-
 pub trait RevsetStreamExt {
     fn commits(
         self,
@@ -3516,7 +3474,7 @@ impl<S: Stream<Item = Result<CommitId, RevsetEvaluationError>>> RevsetStreamExt 
         self,
         store: &Arc<Store>,
     ) -> impl Stream<Item = Result<Commit, RevsetEvaluationError>> + use<'_, S> {
-        self.then(async move |result| {
+        self.map(async move |result| {
             let commit_id = result?;
             let commit = store
                 .get_commit_async(&commit_id)
@@ -3524,6 +3482,7 @@ impl<S: Stream<Item = Result<CommitId, RevsetEvaluationError>>> RevsetStreamExt 
                 .map_err(RevsetEvaluationError::Backend)?;
             Ok(commit)
         })
+        .buffered(store.concurrency())
     }
 }
 
@@ -3681,6 +3640,7 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+    use crate::tests::TestResult;
 
     fn parse(revset_str: &str) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
         parse_with_aliases(revset_str, [] as [(&str, &str); 0])
@@ -3699,7 +3659,7 @@ mod tests {
     ) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
         let mut aliases_map = RevsetAliasesMap::new();
         for (decl, defn) in aliases {
-            aliases_map.insert(decl, defn).unwrap();
+            aliases_map.insert(decl, defn, None)?;
         }
         let context = RevsetParseContext {
             aliases_map: &aliases_map,
@@ -3731,7 +3691,7 @@ mod tests {
         };
         let mut aliases_map = RevsetAliasesMap::new();
         for (decl, defn) in aliases {
-            aliases_map.insert(decl, defn).unwrap();
+            aliases_map.insert(decl, defn, None)?;
         }
         let context = RevsetParseContext {
             aliases_map: &aliases_map,
@@ -3939,7 +3899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_revset() {
+    fn test_parse_revset() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
         let main_workspace_name = WorkspaceNameBuf::from("main");
@@ -3950,34 +3910,34 @@ mod tests {
             parse("@").unwrap_err().kind(),
             @"WorkingCopyWithoutWorkspace");
         insta::assert_debug_snapshot!(
-            parse("main@").unwrap(),
+            parse("main@")?,
             @r#"CommitRef(WorkingCopy(WorkspaceNameBuf("main")))"#);
         insta::assert_debug_snapshot!(
-            parse_with_workspace("@", &main_workspace_name).unwrap(),
+            parse_with_workspace("@", &main_workspace_name)?,
             @r#"CommitRef(WorkingCopy(WorkspaceNameBuf("main")))"#);
         insta::assert_debug_snapshot!(
-            parse_with_workspace("main@", &other_workspace_name).unwrap(),
+            parse_with_workspace("main@", &other_workspace_name)?,
             @r#"CommitRef(WorkingCopy(WorkspaceNameBuf("main")))"#);
         // "@" in function argument must be quoted
         insta::assert_debug_snapshot!(
             parse("author_name(foo@)").unwrap_err().kind(),
             @r#"Expression("Invalid string expression")"#);
         insta::assert_debug_snapshot!(
-            parse(r#"author_name("foo@")"#).unwrap(),
+            parse(r#"author_name("foo@")"#)?,
             @r#"Filter(AuthorName(Pattern(Exact("foo@"))))"#);
         // Parse a single symbol
         insta::assert_debug_snapshot!(
-            parse("foo").unwrap(),
+            parse("foo")?,
             @r#"CommitRef(Symbol("foo"))"#);
         // Default arguments for *bookmarks() are all ""
         insta::assert_debug_snapshot!(
-            parse("bookmarks()").unwrap(),
+            parse("bookmarks()")?,
             @r#"CommitRef(Bookmarks(Pattern(Substring(""))))"#);
         // Default argument for tags() is ""
         insta::assert_debug_snapshot!(
-            parse("tags()").unwrap(),
+            parse("tags()")?,
             @r#"CommitRef(Tags(Pattern(Substring(""))))"#);
-        insta::assert_debug_snapshot!(parse("remote_bookmarks()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("remote_bookmarks()")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -3988,7 +3948,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("tracked_remote_bookmarks()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("tracked_remote_bookmarks()")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -3999,7 +3959,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("untracked_remote_bookmarks()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("untracked_remote_bookmarks()")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -4010,7 +3970,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("remote_tags()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("remote_tags()")?, @r#"
         CommitRef(
             RemoteTags {
                 symbol: RemoteRefSymbolExpression {
@@ -4021,7 +3981,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("tracked_remote_tags()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("tracked_remote_tags()")?, @r#"
         CommitRef(
             RemoteTags {
                 symbol: RemoteRefSymbolExpression {
@@ -4032,7 +3992,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("untracked_remote_tags()").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("untracked_remote_tags()")?, @r#"
         CommitRef(
             RemoteTags {
                 symbol: RemoteRefSymbolExpression {
@@ -4045,10 +4005,10 @@ mod tests {
         "#);
         // Parse a quoted symbol
         insta::assert_debug_snapshot!(
-            parse("'foo'").unwrap(),
+            parse("'foo'")?,
             @r#"CommitRef(Symbol("foo"))"#);
         // Parse the "parents" operator
-        insta::assert_debug_snapshot!(parse("foo-").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo-")?, @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 1..2,
@@ -4056,14 +4016,14 @@ mod tests {
         }
         "#);
         // Parse the "children" operator
-        insta::assert_debug_snapshot!(parse("foo+").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo+")?, @r#"
         Descendants {
             roots: CommitRef(Symbol("foo")),
             generation: 1..2,
         }
         "#);
         // Parse the "ancestors" operator
-        insta::assert_debug_snapshot!(parse("::foo").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("::foo")?, @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 0..18446744073709551615,
@@ -4071,23 +4031,23 @@ mod tests {
         }
         "#);
         // Parse the "descendants" operator
-        insta::assert_debug_snapshot!(parse("foo::").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo::")?, @r#"
         Descendants {
             roots: CommitRef(Symbol("foo")),
             generation: 0..18446744073709551615,
         }
         "#);
         // Parse the "dag range" operator
-        insta::assert_debug_snapshot!(parse("foo::bar").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo::bar")?, @r#"
         DagRange {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
         }
         "#);
         // Parse the nullary "dag range" operator
-        insta::assert_debug_snapshot!(parse("::").unwrap(), @"All");
+        insta::assert_debug_snapshot!(parse("::")?, @"All");
         // Parse the "range" prefix operator
-        insta::assert_debug_snapshot!(parse("..foo").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("..foo")?, @r#"
         Range {
             roots: Root,
             heads: CommitRef(Symbol("foo")),
@@ -4095,7 +4055,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(parse("foo..").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo..")?, @r#"
         NotIn(
             Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -4104,7 +4064,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(parse("foo..bar").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo..bar")?, @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -4113,47 +4073,48 @@ mod tests {
         }
         "#);
         // Parse the nullary "range" operator
-        insta::assert_debug_snapshot!(parse("..").unwrap(), @"NotIn(Root)");
+        insta::assert_debug_snapshot!(parse("..")?, @"NotIn(Root)");
         // Parse the "negate" operator
         insta::assert_debug_snapshot!(
-            parse("~ foo").unwrap(),
+            parse("~ foo")?,
             @r#"NotIn(CommitRef(Symbol("foo")))"#);
         // Parse the "intersection" operator
-        insta::assert_debug_snapshot!(parse("foo & bar").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo & bar")?, @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
         // Parse the "union" operator
-        insta::assert_debug_snapshot!(parse("foo | bar").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo | bar")?, @r#"
         Union(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
         // Parse the "difference" operator
-        insta::assert_debug_snapshot!(parse("foo ~ bar").unwrap(), @r#"
+        insta::assert_debug_snapshot!(parse("foo ~ bar")?, @r#"
         Difference(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_string_pattern() {
+    fn test_parse_string_pattern() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse(r#"bookmarks("foo")"#).unwrap(),
+            parse(r#"bookmarks("foo")"#)?,
             @r#"CommitRef(Bookmarks(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse(r#"bookmarks(exact:"foo")"#).unwrap(),
+            parse(r#"bookmarks(exact:"foo")"#)?,
             @r#"CommitRef(Bookmarks(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse(r#"bookmarks(substring:"foo")"#).unwrap(),
+            parse(r#"bookmarks(substring:"foo")"#)?,
             @r#"CommitRef(Bookmarks(Pattern(Substring("foo"))))"#);
         insta::assert_debug_snapshot!(
             parse(r#"bookmarks(bad:"foo")"#).unwrap_err().kind(),
@@ -4166,13 +4127,13 @@ mod tests {
             @r#"Expression("Expected string")"#);
 
         insta::assert_debug_snapshot!(
-            parse(r#"tags("foo")"#).unwrap(),
+            parse(r#"tags("foo")"#)?,
             @r#"CommitRef(Tags(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse(r#"tags(exact:"foo")"#).unwrap(),
+            parse(r#"tags(exact:"foo")"#)?,
             @r#"CommitRef(Tags(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse(r#"tags(substring:"foo")"#).unwrap(),
+            parse(r#"tags(substring:"foo")"#)?,
             @r#"CommitRef(Tags(Pattern(Substring("foo"))))"#);
         insta::assert_debug_snapshot!(
             parse(r#"tags(bad:"foo")"#).unwrap_err().kind(),
@@ -4189,22 +4150,23 @@ mod tests {
             parse(r#"(exact:"foo")"#).unwrap_err().kind(),
             RevsetParseErrorKind::NotInfixOperator { .. }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_compound_string_expression() {
+    fn test_parse_compound_string_expression() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse(r#"tags(~a)"#).unwrap(),
+            parse(r#"tags(~a)"#)?,
             @r#"
         CommitRef(
             Tags(NotIn(Pattern(Exact("a")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse(r#"tags(a|b&c)"#).unwrap(),
+            parse(r#"tags(a|b&c)"#)?,
             @r#"
         CommitRef(
             Tags(
@@ -4219,7 +4181,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse(r#"tags(a|b|c)"#).unwrap(),
+            parse(r#"tags(a|b|c)"#)?,
             @r#"
         CommitRef(
             Tags(
@@ -4234,7 +4196,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse(r#"tags(a~(b|c))"#).unwrap(),
+            parse(r#"tags(a~(b|c))"#)?,
             @r#"
         CommitRef(
             Tags(
@@ -4250,15 +4212,16 @@ mod tests {
             ),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_revset_function() {
+    fn test_parse_revset_function() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse("parents(foo)").unwrap(), @r#"
+            parse("parents(foo)")?, @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 1..2,
@@ -4266,7 +4229,7 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            parse("parents(\"foo\")").unwrap(), @r#"
+            parse("parents(\"foo\")")?, @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 1..2,
@@ -4274,7 +4237,7 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            parse("ancestors(parents(foo))").unwrap(), @r#"
+            parse("ancestors(parents(foo))")?, @r#"
         Ancestors {
             heads: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -4293,7 +4256,7 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            parse("parents(foo, 2)").unwrap(), @r#"
+            parse("parents(foo, 2)")?, @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 2..3,
@@ -4301,38 +4264,38 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            parse("root()").unwrap(),
+            parse("root()")?,
             @"Root");
         assert!(parse("root(a)").is_err());
         insta::assert_debug_snapshot!(
-            parse(r#"description("")"#).unwrap(),
+            parse(r#"description("")"#)?,
             @r#"Filter(Description(Pattern(Exact(""))))"#);
         insta::assert_debug_snapshot!(
-            parse("description(foo)").unwrap(),
+            parse("description(foo)")?,
             @r#"Filter(Description(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
             parse("description(visible_heads())").unwrap_err().kind(),
             @r#"Expression("Invalid string expression")"#);
         insta::assert_debug_snapshot!(
-            parse("description(\"(foo)\")").unwrap(),
+            parse("description(\"(foo)\")")?,
             @r#"Filter(Description(Pattern(Exact("(foo)"))))"#);
         assert!(parse("mine(foo)").is_err());
         insta::assert_debug_snapshot!(
-            parse_with_workspace("empty()", WorkspaceName::DEFAULT).unwrap(),
+            parse_with_workspace("empty()", WorkspaceName::DEFAULT)?,
             @"NotIn(Filter(File(All)))");
         assert!(parse_with_workspace("empty(foo)", WorkspaceName::DEFAULT).is_err());
         assert!(parse_with_workspace("file()", WorkspaceName::DEFAULT).is_err());
         insta::assert_debug_snapshot!(
-            parse_with_workspace("files(foo)", WorkspaceName::DEFAULT).unwrap(),
+            parse_with_workspace("files(foo)", WorkspaceName::DEFAULT)?,
             @r#"Filter(File(Pattern(PrefixPath("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse_with_workspace("files(all())", WorkspaceName::DEFAULT).unwrap(),
+            parse_with_workspace("files(all())", WorkspaceName::DEFAULT)?,
             @"Filter(File(All))");
         insta::assert_debug_snapshot!(
-            parse_with_workspace(r#"files(file:"foo")"#, WorkspaceName::DEFAULT).unwrap(),
+            parse_with_workspace(r#"files(file:"foo")"#, WorkspaceName::DEFAULT)?,
             @r#"Filter(File(Pattern(FilePath("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse_with_workspace("files(foo|bar&baz)", WorkspaceName::DEFAULT).unwrap(), @r#"
+            parse_with_workspace("files(foo|bar&baz)", WorkspaceName::DEFAULT)?, @r#"
         Filter(
             File(
                 UnionAll(
@@ -4348,7 +4311,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse_with_workspace(r#"files(~(foo))"#, WorkspaceName::DEFAULT).unwrap(),
+            parse_with_workspace(r#"files(~(foo))"#, WorkspaceName::DEFAULT)?,
             @r#"
         Filter(
             File(
@@ -4359,80 +4322,83 @@ mod tests {
             ),
         )
         "#);
-        insta::assert_debug_snapshot!(parse("signed()").unwrap(), @"Filter(Signed)");
+        insta::assert_debug_snapshot!(parse("signed()")?, @"Filter(Signed)");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_revset_change_commit_id_functions() {
+    fn test_parse_revset_change_commit_id_functions() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse("change_id(z)").unwrap(),
+            parse("change_id(z)")?,
             @r#"CommitRef(ChangeId(HexPrefix("0")))"#);
         insta::assert_debug_snapshot!(
-            parse("change_id('zk')").unwrap(),
+            parse("change_id('zk')")?,
             @r#"CommitRef(ChangeId(HexPrefix("0f")))"#);
         insta::assert_debug_snapshot!(
             parse("change_id(01234)").unwrap_err().kind(),
             @r#"Expression("Invalid change ID prefix")"#);
 
         insta::assert_debug_snapshot!(
-            parse("commit_id(0)").unwrap(),
+            parse("commit_id(0)")?,
             @r#"CommitRef(CommitId(HexPrefix("0")))"#);
         insta::assert_debug_snapshot!(
-            parse("commit_id('0f')").unwrap(),
+            parse("commit_id('0f')")?,
             @r#"CommitRef(CommitId(HexPrefix("0f")))"#);
         insta::assert_debug_snapshot!(
             parse("commit_id(xyzzy)").unwrap_err().kind(),
             @r#"Expression("Invalid commit ID prefix")"#);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_revset_author_committer_functions() {
+    fn test_parse_revset_author_committer_functions() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse("author(foo)").unwrap(), @r#"
+            parse("author(foo)")?, @r#"
         Union(
             Filter(AuthorName(Pattern(Exact("foo")))),
             Filter(AuthorEmail(Pattern(Exact("foo")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse("author_name(foo)").unwrap(),
+            parse("author_name(foo)")?,
             @r#"Filter(AuthorName(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse("author_email(foo)").unwrap(),
+            parse("author_email(foo)")?,
             @r#"Filter(AuthorEmail(Pattern(Exact("foo"))))"#);
 
         insta::assert_debug_snapshot!(
-            parse("committer(foo)").unwrap(), @r#"
+            parse("committer(foo)")?, @r#"
         Union(
             Filter(CommitterName(Pattern(Exact("foo")))),
             Filter(CommitterEmail(Pattern(Exact("foo")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse("committer_name(foo)").unwrap(),
+            parse("committer_name(foo)")?,
             @r#"Filter(CommitterName(Pattern(Exact("foo"))))"#);
         insta::assert_debug_snapshot!(
-            parse("committer_email(foo)").unwrap(),
+            parse("committer_email(foo)")?,
             @r#"Filter(CommitterEmail(Pattern(Exact("foo"))))"#);
 
         insta::assert_debug_snapshot!(
-            parse("mine()").unwrap(),
+            parse("mine()")?,
             @r#"Filter(AuthorEmail(Pattern(ExactI("test.user@example.com"))))"#);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_revset_keyword_arguments() {
+    fn test_parse_revset_keyword_arguments() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse("remote_bookmarks(remote=foo)").unwrap(), @r#"
+            parse("remote_bookmarks(remote=foo)")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -4444,7 +4410,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse("remote_bookmarks(foo, remote=bar)").unwrap(), @r#"
+            parse("remote_bookmarks(foo, remote=bar)")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -4456,7 +4422,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse("tracked_remote_bookmarks(foo, remote=bar)").unwrap(), @r#"
+            parse("tracked_remote_bookmarks(foo, remote=bar)")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -4468,7 +4434,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            parse("untracked_remote_bookmarks(foo, remote=bar)").unwrap(), @r#"
+            parse("untracked_remote_bookmarks(foo, remote=bar)")?, @r#"
         CommitRef(
             RemoteBookmarks {
                 symbol: RemoteRefSymbolExpression {
@@ -4511,15 +4477,16 @@ mod tests {
             message: "Unexpected keyword argument \"unknown\"",
         }
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_expand_symbol_alias() {
+    fn test_expand_symbol_alias() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            parse_with_aliases("AB|c", [("AB", "a|b")]).unwrap(), @r#"
+            parse_with_aliases("AB|c", [("AB", "a|b")])?, @r#"
         Union(
             Union(
                 CommitRef(Symbol("a")),
@@ -4532,32 +4499,34 @@ mod tests {
         // Alias can be substituted to string literal.
         insta::assert_debug_snapshot!(
             parse_with_aliases_and_workspace("files(A)", [("A", "a")], WorkspaceName::DEFAULT)
-                .unwrap(),
+                ?,
             @r#"Filter(File(Pattern(PrefixPath("a"))))"#);
 
         // Alias can be substituted to string pattern.
         insta::assert_debug_snapshot!(
-            parse_with_aliases("author_name(A)", [("A", "a")]).unwrap(),
+            parse_with_aliases("author_name(A)", [("A", "a")])?,
             @r#"Filter(AuthorName(Pattern(Exact("a"))))"#);
         insta::assert_debug_snapshot!(
-            parse_with_aliases("author_name(A)", [("A", "exact:a")]).unwrap(),
+            parse_with_aliases("author_name(A)", [("A", "exact:a")])?,
             @r#"Filter(AuthorName(Pattern(Exact("a"))))"#);
+        Ok(())
     }
 
     #[test]
-    fn test_expand_function_alias() {
+    fn test_expand_function_alias() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Pass string literal as parameter.
         insta::assert_debug_snapshot!(
-            parse_with_aliases("F(a)", [("F(x)", "author_name(x)|committer_name(x)")]).unwrap(),
+            parse_with_aliases("F(a)", [("F(x)", "author_name(x)|committer_name(x)")])?,
             @r#"
         Union(
             Filter(AuthorName(Pattern(Exact("a")))),
             Filter(CommitterName(Pattern(Exact("a")))),
         )
         "#);
+        Ok(())
     }
 
     #[test]
@@ -4836,7 +4805,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_subtree() {
+    fn test_optimize_subtree() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
@@ -4844,7 +4813,7 @@ mod tests {
         // (e.g. Range -> DagRange) nor reorders arguments unintentionally.
 
         insta::assert_debug_snapshot!(
-            optimize(parse("parents(bookmarks() & all())").unwrap()), @r#"
+            optimize(parse("parents(bookmarks() & all())")?), @r#"
         Ancestors {
             heads: CommitRef(Bookmarks(Pattern(Substring("")))),
             generation: 1..2,
@@ -4852,14 +4821,14 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("children(bookmarks() & all())").unwrap()), @r#"
+            optimize(parse("children(bookmarks() & all())")?), @r#"
         Descendants {
             roots: CommitRef(Bookmarks(Pattern(Substring("")))),
             generation: 1..2,
         }
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("ancestors(bookmarks() & all())").unwrap()), @r#"
+            optimize(parse("ancestors(bookmarks() & all())")?), @r#"
         Ancestors {
             heads: CommitRef(Bookmarks(Pattern(Substring("")))),
             generation: 0..18446744073709551615,
@@ -4867,7 +4836,7 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("descendants(bookmarks() & all())").unwrap()), @r#"
+            optimize(parse("descendants(bookmarks() & all())")?), @r#"
         Descendants {
             roots: CommitRef(Bookmarks(Pattern(Substring("")))),
             generation: 0..18446744073709551615,
@@ -4875,7 +4844,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("(bookmarks() & all())..(all() & tags())").unwrap()), @r#"
+            optimize(parse("(bookmarks() & all())..(all() & tags())")?), @r#"
         Range {
             roots: CommitRef(Bookmarks(Pattern(Substring("")))),
             heads: CommitRef(Tags(Pattern(Substring("")))),
@@ -4884,7 +4853,7 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(bookmarks() & all())::(all() & tags())").unwrap()), @r#"
+            optimize(parse("(bookmarks() & all())::(all() & tags())")?), @r#"
         DagRange {
             roots: CommitRef(Bookmarks(Pattern(Substring("")))),
             heads: CommitRef(Tags(Pattern(Substring("")))),
@@ -4892,14 +4861,14 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("heads(bookmarks() & all())").unwrap()),
+            optimize(parse("heads(bookmarks() & all())")?),
             @r#"
         Heads(
             CommitRef(Bookmarks(Pattern(Substring("")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("roots(bookmarks() & all())").unwrap()),
+            optimize(parse("roots(bookmarks() & all())")?),
             @r#"
         Roots(
             CommitRef(Bookmarks(Pattern(Substring("")))),
@@ -4907,7 +4876,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("latest(bookmarks() & all(), 2)").unwrap()), @r#"
+            optimize(parse("latest(bookmarks() & all(), 2)")?), @r#"
         Latest {
             candidates: CommitRef(Bookmarks(Pattern(Substring("")))),
             count: 2,
@@ -4915,7 +4884,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("present(foo ~ bar)").unwrap()), @r#"
+            optimize(parse("present(foo ~ bar)")?), @r#"
         Present(
             Difference(
                 CommitRef(Symbol("foo")),
@@ -4924,7 +4893,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("present(bookmarks() & all())").unwrap()),
+            optimize(parse("present(bookmarks() & all())")?),
             @r#"
         Present(
             CommitRef(Bookmarks(Pattern(Substring("")))),
@@ -4932,7 +4901,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("at_operation(@-, bookmarks() & all())").unwrap()), @r#"
+            optimize(parse("at_operation(@-, bookmarks() & all())")?), @r#"
         AtOperation {
             operation: "@-",
             candidates: CommitRef(Bookmarks(Pattern(Substring("")))),
@@ -4940,7 +4909,7 @@ mod tests {
         "#);
         insta::assert_debug_snapshot!(
             optimize(Arc::new(RevsetExpression::WithinReference {
-                candidates: parse("bookmarks() & all()").unwrap(),
+                candidates: parse("bookmarks() & all()")?,
                 commits: vec![CommitId::from_hex("012345")],
             })), @r#"
         WithinReference {
@@ -4952,7 +4921,7 @@ mod tests {
         "#);
         insta::assert_debug_snapshot!(
             optimize(Arc::new(RevsetExpression::WithinVisibility {
-                candidates: parse("bookmarks() & all()").unwrap(),
+                candidates: parse("bookmarks() & all()")?,
                 visible_heads: vec![CommitId::from_hex("012345")],
             })), @r#"
         WithinReference {
@@ -4969,37 +4938,38 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("~bookmarks() & all()").unwrap()),
+            optimize(parse("~bookmarks() & all()")?),
             @r#"
         NotIn(
             CommitRef(Bookmarks(Pattern(Substring("")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(bookmarks() & all()) | (all() & tags())").unwrap()), @r#"
+            optimize(parse("(bookmarks() & all()) | (all() & tags())")?), @r#"
         Union(
             CommitRef(Bookmarks(Pattern(Substring("")))),
             CommitRef(Tags(Pattern(Substring("")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(bookmarks() & all()) & (all() & tags())").unwrap()), @r#"
+            optimize(parse("(bookmarks() & all()) & (all() & tags())")?), @r#"
         Intersection(
             CommitRef(Bookmarks(Pattern(Substring("")))),
             CommitRef(Tags(Pattern(Substring("")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(bookmarks() & all()) ~ (all() & tags())").unwrap()), @r#"
+            optimize(parse("(bookmarks() & all()) ~ (all() & tags())")?), @r#"
         Difference(
             CommitRef(Bookmarks(Pattern(Substring("")))),
             CommitRef(Tags(Pattern(Substring("")))),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_unchanged_subtree() {
+    fn test_optimize_unchanged_subtree() -> TestResult {
         fn unwrap_union(
             expression: &UserRevsetExpression,
         ) -> (&Arc<UserRevsetExpression>, &Arc<UserRevsetExpression>) {
@@ -5010,20 +4980,20 @@ mod tests {
         }
 
         // transform_expression_bottom_up() should not recreate tree unnecessarily.
-        let parsed = parse("foo-").unwrap();
+        let parsed = parse("foo-")?;
         let optimized = optimize(parsed.clone());
         assert!(Arc::ptr_eq(&parsed, &optimized));
 
-        let parsed = parse("bookmarks() | tags()").unwrap();
+        let parsed = parse("bookmarks() | tags()")?;
         let optimized = optimize(parsed.clone());
         assert!(Arc::ptr_eq(&parsed, &optimized));
 
-        let parsed = parse("bookmarks() & tags()").unwrap();
+        let parsed = parse("bookmarks() & tags()")?;
         let optimized = optimize(parsed.clone());
         assert!(Arc::ptr_eq(&parsed, &optimized));
 
         // Only left subtree should be rewritten.
-        let parsed = parse("(bookmarks() & all()) | tags()").unwrap();
+        let parsed = parse("(bookmarks() & all()) | tags()")?;
         let optimized = optimize(parsed.clone());
         assert_matches!(
             unwrap_union(&optimized).0.as_ref(),
@@ -5035,7 +5005,7 @@ mod tests {
         ));
 
         // Only right subtree should be rewritten.
-        let parsed = parse("bookmarks() | (all() & tags())").unwrap();
+        let parsed = parse("bookmarks() | (all() & tags())")?;
         let optimized = optimize(parsed.clone());
         assert!(Arc::ptr_eq(
             unwrap_union(&parsed).0,
@@ -5045,50 +5015,52 @@ mod tests {
             unwrap_union(&optimized).1.as_ref(),
             RevsetExpression::CommitRef(RevsetCommitRef::Tags(_))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_basic() {
+    fn test_optimize_basic() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
-        insta::assert_debug_snapshot!(optimize(parse("all() | none()").unwrap()), @"All");
-        insta::assert_debug_snapshot!(optimize(parse("all() & none()").unwrap()), @"None");
-        insta::assert_debug_snapshot!(optimize(parse("root() | all()").unwrap()), @"All");
-        insta::assert_debug_snapshot!(optimize(parse("root() & all()").unwrap()), @"Root");
-        insta::assert_debug_snapshot!(optimize(parse("none() | root()").unwrap()), @"Root");
-        insta::assert_debug_snapshot!(optimize(parse("none() & root()").unwrap()), @"None");
-        insta::assert_debug_snapshot!(optimize(parse("~none()").unwrap()), @"All");
-        insta::assert_debug_snapshot!(optimize(parse("~~none()").unwrap()), @"None");
-        insta::assert_debug_snapshot!(optimize(parse("~all()").unwrap()), @"None");
-        insta::assert_debug_snapshot!(optimize(parse("~~all()").unwrap()), @"All");
-        insta::assert_debug_snapshot!(optimize(parse("~~foo").unwrap()), @r#"CommitRef(Symbol("foo"))"#);
+        insta::assert_debug_snapshot!(optimize(parse("all() | none()")?), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("all() & none()")?), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("root() | all()")?), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("root() & all()")?), @"Root");
+        insta::assert_debug_snapshot!(optimize(parse("none() | root()")?), @"Root");
+        insta::assert_debug_snapshot!(optimize(parse("none() & root()")?), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("~none()")?), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("~~none()")?), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("~all()")?), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("~~all()")?), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("~~foo")?), @r#"CommitRef(Symbol("foo"))"#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(root() | none()) & (visible_heads() | ~~all())").unwrap()), @"Root");
+            optimize(parse("(root() | none()) & (visible_heads() | ~~all())")?), @"Root");
         insta::assert_debug_snapshot!(
             optimize(UserRevsetExpression::commits(vec![])), @"None");
         insta::assert_debug_snapshot!(
             optimize(UserRevsetExpression::commits(vec![]).negated()), @"All");
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_difference() {
+    fn test_optimize_difference() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
-        insta::assert_debug_snapshot!(optimize(parse("foo & ~bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo & ~bar")?), @r#"
         Difference(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~foo & bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~foo & bar")?), @r#"
         Difference(
             CommitRef(Symbol("bar")),
             CommitRef(Symbol("foo")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~foo & bar & ~baz").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~foo & bar & ~baz")?), @r#"
         Difference(
             Difference(
                 CommitRef(Symbol("bar")),
@@ -5097,7 +5069,7 @@ mod tests {
             CommitRef(Symbol("baz")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("(all() & ~foo) & bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(all() & ~foo) & bar")?), @r#"
         Difference(
             CommitRef(Symbol("bar")),
             CommitRef(Symbol("foo")),
@@ -5106,15 +5078,15 @@ mod tests {
 
         // Binary difference operation should go through the same optimization passes.
         insta::assert_debug_snapshot!(
-            optimize(parse("all() ~ foo").unwrap()),
+            optimize(parse("all() ~ foo")?),
             @r#"NotIn(CommitRef(Symbol("foo")))"#);
-        insta::assert_debug_snapshot!(optimize(parse("foo ~ bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo ~ bar")?), @r#"
         Difference(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("(all() ~ foo) & bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(all() ~ foo) & bar")?), @r#"
         Difference(
             CommitRef(Symbol("bar")),
             CommitRef(Symbol("foo")),
@@ -5122,7 +5094,7 @@ mod tests {
         "#);
 
         // Range expression.
-        insta::assert_debug_snapshot!(optimize(parse("::foo & ~::bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::foo & ~::bar")?), @r#"
         Range {
             roots: CommitRef(Symbol("bar")),
             heads: CommitRef(Symbol("foo")),
@@ -5130,7 +5102,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~::foo & ::bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~::foo & ::bar")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -5138,7 +5110,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo..").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo..")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: VisibleHeadsOrReferenced,
@@ -5146,7 +5118,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo..bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo..bar")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -5154,7 +5126,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo.. & ::bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo.. & ::bar")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -5162,7 +5134,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo.. & first_ancestors(bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo.. & first_ancestors(bar)")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -5172,19 +5144,19 @@ mod tests {
         "#);
 
         // Double/triple negates.
-        insta::assert_debug_snapshot!(optimize(parse("foo & ~~bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo & ~~bar")?), @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo & ~~~bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo & ~~~bar")?), @r#"
         Difference(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~(all() & ~foo) & bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~(all() & ~foo) & bar")?), @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             CommitRef(Symbol("bar")),
@@ -5192,7 +5164,7 @@ mod tests {
         "#);
 
         // Should be better than '(all() & ~foo) & (all() & ~bar)'.
-        insta::assert_debug_snapshot!(optimize(parse("~foo & ~bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~foo & ~bar")?), @r#"
         Difference(
             NotIn(CommitRef(Symbol("foo"))),
             CommitRef(Symbol("bar")),
@@ -5200,7 +5172,7 @@ mod tests {
         "#);
 
         // The roots of multiple ranges can be folded after being unfolded.
-        insta::assert_debug_snapshot!(optimize(parse("a..b & c..d").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("a..b & c..d")?), @r#"
         Intersection(
             Range {
                 roots: Union(
@@ -5220,7 +5192,7 @@ mod tests {
         "#);
 
         // Negated `first_ancestors()` doesn't prevent re-folding.
-        insta::assert_debug_snapshot!(optimize(parse("foo..bar ~ first_ancestors(baz)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo..bar ~ first_ancestors(baz)")?), @r#"
         Difference(
             Range {
                 roots: CommitRef(Symbol("foo")),
@@ -5238,7 +5210,7 @@ mod tests {
 
         // Negated ancestors can be combined into a range regardless of intersection
         // grouping order and intervening expressions.
-        insta::assert_debug_snapshot!(optimize(parse("foo ~ ::a & (::b & bar & ::c) & (baz ~ ::d)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo ~ ::a & (::b & bar & ::c) & (baz ~ ::d)")?), @r#"
         Intersection(
             Intersection(
                 Intersection(
@@ -5265,15 +5237,16 @@ mod tests {
             CommitRef(Symbol("baz")),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_not_in_ancestors() {
+    fn test_optimize_not_in_ancestors() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // '~(::foo)' is equivalent to 'foo..'.
-        insta::assert_debug_snapshot!(optimize(parse("~(::foo)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo)")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: VisibleHeadsOrReferenced,
@@ -5283,7 +5256,7 @@ mod tests {
         "#);
 
         // '~(::foo-)' is equivalent to 'foo-..'.
-        insta::assert_debug_snapshot!(optimize(parse("~(::foo-)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo-)")?), @r#"
         Range {
             roots: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5295,7 +5268,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~(::foo--)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo--)")?), @r#"
         Range {
             roots: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5309,7 +5282,7 @@ mod tests {
         "#);
 
         // Bounded ancestors shouldn't be substituted.
-        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo, 1)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo, 1)")?), @r#"
         NotIn(
             Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5318,7 +5291,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo-, 1)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo-, 1)")?), @r#"
         NotIn(
             Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5327,19 +5300,20 @@ mod tests {
             },
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_filter_difference() {
+    fn test_optimize_filter_difference() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // '~empty()' -> '~~file(*)' -> 'file(*)'
-        insta::assert_debug_snapshot!(optimize(parse("~empty()").unwrap()), @"Filter(File(All))");
+        insta::assert_debug_snapshot!(optimize(parse("~empty()")?), @"Filter(File(All))");
 
         // '& baz' can be moved into the filter node, and form a difference node.
         insta::assert_debug_snapshot!(
-            optimize(parse("(author_name(foo) & ~bar) & baz").unwrap()), @r#"
+            optimize(parse("(author_name(foo) & ~bar) & baz")?), @r#"
         Intersection(
             Difference(
                 CommitRef(Symbol("baz")),
@@ -5351,14 +5325,14 @@ mod tests {
 
         // '~set & filter()' shouldn't be substituted.
         insta::assert_debug_snapshot!(
-            optimize(parse("~foo & author_name(bar)").unwrap()), @r#"
+            optimize(parse("~foo & author_name(bar)")?), @r#"
         Intersection(
             NotIn(CommitRef(Symbol("foo"))),
             Filter(AuthorName(Pattern(Exact("bar")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("~foo & (author_name(bar) | baz)").unwrap()), @r#"
+            optimize(parse("~foo & (author_name(bar) | baz)")?), @r#"
         Intersection(
             NotIn(CommitRef(Symbol("foo"))),
             AsFilter(
@@ -5372,37 +5346,38 @@ mod tests {
 
         // Filter should be moved right of the intersection.
         insta::assert_debug_snapshot!(
-            optimize(parse("author_name(foo) ~ bar").unwrap()), @r#"
+            optimize(parse("author_name(foo) ~ bar")?), @r#"
         Intersection(
             NotIn(CommitRef(Symbol("bar"))),
             Filter(AuthorName(Pattern(Exact("foo")))),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_filter_intersection() {
+    fn test_optimize_filter_intersection() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            optimize(parse("author_name(foo)").unwrap()),
+            optimize(parse("author_name(foo)")?),
             @r#"Filter(AuthorName(Pattern(Exact("foo"))))"#);
 
-        insta::assert_debug_snapshot!(optimize(parse("foo & description(bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo & description(bar)")?), @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             Filter(Description(Pattern(Exact("bar")))),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("author_name(foo) & bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("author_name(foo) & bar")?), @r#"
         Intersection(
             CommitRef(Symbol("bar")),
             Filter(AuthorName(Pattern(Exact("foo")))),
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("author_name(foo) & committer_name(bar)").unwrap()), @r#"
+            optimize(parse("author_name(foo) & committer_name(bar)")?), @r#"
         AsFilter(
             Intersection(
                 Filter(AuthorName(Pattern(Exact("foo")))),
@@ -5410,7 +5385,7 @@ mod tests {
             ),
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("divergent() & foo").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("divergent() & foo")?), @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             AsFilter(Divergent),
@@ -5418,7 +5393,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("foo & description(bar) & author_name(baz)").unwrap()), @r#"
+            optimize(parse("foo & description(bar) & author_name(baz)")?), @r#"
         Intersection(
             CommitRef(Symbol("foo")),
             AsFilter(
@@ -5430,7 +5405,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("committer_name(foo) & bar & author_name(baz)").unwrap()), @r#"
+            optimize(parse("committer_name(foo) & bar & author_name(baz)")?), @r#"
         Intersection(
             CommitRef(Symbol("bar")),
             AsFilter(
@@ -5444,7 +5419,7 @@ mod tests {
         insta::assert_debug_snapshot!(
             optimize(parse_with_workspace(
                 "committer_name(foo) & files(bar) & baz",
-                WorkspaceName::DEFAULT).unwrap(),
+                WorkspaceName::DEFAULT)?,
             ), @r#"
         Intersection(
             CommitRef(Symbol("baz")),
@@ -5459,7 +5434,7 @@ mod tests {
         insta::assert_debug_snapshot!(
             optimize(parse_with_workspace(
                 "committer_name(foo) & files(bar) & author_name(baz)",
-                WorkspaceName::DEFAULT).unwrap(),
+                WorkspaceName::DEFAULT)?,
             ), @r#"
         AsFilter(
             Intersection(
@@ -5474,7 +5449,7 @@ mod tests {
         insta::assert_debug_snapshot!(
             optimize(parse_with_workspace(
                 "foo & files(bar) & baz",
-                WorkspaceName::DEFAULT).unwrap(),
+                WorkspaceName::DEFAULT)?,
             ), @r#"
         Intersection(
             Intersection(
@@ -5486,7 +5461,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("foo & description(bar) & author_name(baz) & qux").unwrap()), @r#"
+            optimize(parse("foo & description(bar) & author_name(baz) & qux")?), @r#"
         Intersection(
             Intersection(
                 CommitRef(Symbol("foo")),
@@ -5501,7 +5476,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("foo & description(bar) & parents(author_name(baz)) & qux").unwrap()),
+            optimize(parse("foo & description(bar) & parents(author_name(baz)) & qux")?),
             @r#"
         Intersection(
             Intersection(
@@ -5519,7 +5494,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("foo & description(bar) & parents(author_name(baz) & qux)").unwrap()),
+            optimize(parse("foo & description(bar) & parents(author_name(baz) & qux)")?),
             @r#"
         Intersection(
             Intersection(
@@ -5539,7 +5514,7 @@ mod tests {
 
         // Symbols have to be pushed down to the innermost filter node.
         insta::assert_debug_snapshot!(
-            optimize(parse("(a & author_name(A)) & (b & author_name(B)) & (c & author_name(C))").unwrap()),
+            optimize(parse("(a & author_name(A)) & (b & author_name(B)) & (c & author_name(C))")?),
             @r#"
         Intersection(
             Intersection(
@@ -5561,7 +5536,7 @@ mod tests {
         )
         "#);
         insta::assert_debug_snapshot!(
-            optimize(parse("(a & author_name(A)) & ((b & author_name(B)) & (c & author_name(C))) & d").unwrap()),
+            optimize(parse("(a & author_name(A)) & ((b & author_name(B)) & (c & author_name(C))) & d")?),
             @r#"
         Intersection(
             Intersection(
@@ -5588,7 +5563,7 @@ mod tests {
 
         // 'all()' moves in to 'filter()' first, so 'A & filter()' can be found.
         insta::assert_debug_snapshot!(
-            optimize(parse("foo & (all() & description(bar)) & (author_name(baz) & all())").unwrap()),
+            optimize(parse("foo & (all() & description(bar)) & (author_name(baz) & all())")?),
             @r#"
         Intersection(
             CommitRef(Symbol("foo")),
@@ -5603,7 +5578,7 @@ mod tests {
 
         // Filter node shouldn't move across at_operation() boundary.
         insta::assert_debug_snapshot!(
-            optimize(parse("author_name(foo) & bar & at_operation(@-, committer_name(baz))").unwrap()),
+            optimize(parse("author_name(foo) & bar & at_operation(@-, committer_name(baz))")?),
             @r#"
         Intersection(
             Intersection(
@@ -5616,15 +5591,16 @@ mod tests {
             Filter(AuthorName(Pattern(Exact("foo")))),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_filter_subtree() {
+    fn test_optimize_filter_subtree() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         insta::assert_debug_snapshot!(
-            optimize(parse("(author_name(foo) | bar) & baz").unwrap()), @r#"
+            optimize(parse("(author_name(foo) | bar) & baz")?), @r#"
         Intersection(
             CommitRef(Symbol("baz")),
             AsFilter(
@@ -5638,7 +5614,7 @@ mod tests {
 
         // 'merges() & foo' can be evaluated independently
         insta::assert_debug_snapshot!(
-            optimize(parse("merges() & foo | bar").unwrap()), @r#"
+            optimize(parse("merges() & foo | bar")?), @r#"
         Union(
             Intersection(
                 CommitRef(Symbol("foo")),
@@ -5651,7 +5627,7 @@ mod tests {
         // 'merges() & foo' can be evaluated independently, but 'conflicts()'
         // can't. We'll need implicit 'all() & _' anyway.
         insta::assert_debug_snapshot!(
-            optimize(parse("merges() & foo | conflicts()").unwrap()), @r#"
+            optimize(parse("merges() & foo | conflicts()")?), @r#"
         AsFilter(
             Union(
                 Intersection(
@@ -5665,7 +5641,7 @@ mod tests {
 
         // Nested filter intersection with union
         insta::assert_debug_snapshot!(
-            optimize(parse("foo | conflicts() & merges() & signed()").unwrap()), @r#"
+            optimize(parse("foo | conflicts() & merges() & signed()")?), @r#"
         AsFilter(
             Union(
                 CommitRef(Symbol("foo")),
@@ -5681,7 +5657,7 @@ mod tests {
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("(foo | committer_name(bar)) & description(baz) & qux").unwrap()), @r#"
+            optimize(parse("(foo | committer_name(bar)) & description(baz) & qux")?), @r#"
         Intersection(
             CommitRef(Symbol("qux")),
             AsFilter(
@@ -5698,7 +5674,7 @@ mod tests {
 
         insta::assert_debug_snapshot!(
             optimize(parse(
-                "(~present(author_name(foo) & description(bar)) | baz) & qux").unwrap()), @r#"
+                "(~present(author_name(foo) & description(bar)) | baz) & qux")?), @r#"
         Intersection(
             CommitRef(Symbol("qux")),
             AsFilter(
@@ -5720,7 +5696,7 @@ mod tests {
         // Symbols have to be pushed down to the innermost filter node.
         insta::assert_debug_snapshot!(
             optimize(parse(
-                "(a & (author_name(A) | 0)) & (b & (author_name(B) | 1)) & (c & (author_name(C) | 2))").unwrap()),
+                "(a & (author_name(A) | 0)) & (b & (author_name(B) | 1)) & (c & (author_name(C) | 2))")?),
             @r#"
         Intersection(
             Intersection(
@@ -5752,7 +5728,7 @@ mod tests {
         "#);
 
         // Filters can be merged after ancestor unions are folded.
-        insta::assert_debug_snapshot!(optimize(parse("::foo | ::author_name(bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::foo | ::author_name(bar)")?), @r#"
         Ancestors {
             heads: HeadsRange {
                 roots: None,
@@ -5769,29 +5745,30 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_ancestors() {
+    fn test_optimize_ancestors() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Typical scenario: fold nested parents()
-        insta::assert_debug_snapshot!(optimize(parse("foo--").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo--")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 2..3,
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("::(foo---)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::(foo---)")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 3..18446744073709551615,
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("(::foo)---").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(::foo)---")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 3..18446744073709551615,
@@ -5800,7 +5777,7 @@ mod tests {
         "#);
 
         // 'foo-+' is not 'foo'.
-        insta::assert_debug_snapshot!(optimize(parse("foo---+").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo---+")?), @r#"
         Descendants {
             roots: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5812,7 +5789,7 @@ mod tests {
         "#);
 
         // For 'roots..heads', heads can be folded.
-        insta::assert_debug_snapshot!(optimize(parse("foo..(bar--)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo..(bar--)")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -5821,7 +5798,7 @@ mod tests {
         }
         "#);
         // roots can also be folded, and the range expression is reconstructed.
-        insta::assert_debug_snapshot!(optimize(parse("(foo--)..(bar---)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(foo--)..(bar---)")?), @r#"
         Range {
             roots: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5835,7 +5812,7 @@ mod tests {
         "#);
         // Bounded ancestors shouldn't be substituted to range.
         insta::assert_debug_snapshot!(
-            optimize(parse("~ancestors(foo, 2) & ::bar").unwrap()), @r#"
+            optimize(parse("~ancestors(foo, 2) & ::bar")?), @r#"
         Difference(
             Ancestors {
                 heads: CommitRef(Symbol("bar")),
@@ -5852,7 +5829,7 @@ mod tests {
 
         // If inner range is bounded by roots, it cannot be merged.
         // e.g. '..(foo..foo)' is equivalent to '..none()', not to '..foo'
-        insta::assert_debug_snapshot!(optimize(parse("(foo..bar)--").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(foo..bar)--")?), @r#"
         Ancestors {
             heads: Range {
                 roots: CommitRef(Symbol("foo")),
@@ -5864,7 +5841,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("foo..(bar..baz)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo..(bar..baz)")?), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: HeadsRange {
@@ -5880,7 +5857,7 @@ mod tests {
 
         // Ancestors of empty generation range should be empty.
         insta::assert_debug_snapshot!(
-            optimize(parse("ancestors(ancestors(foo), 0)").unwrap()), @r#"
+            optimize(parse("ancestors(ancestors(foo), 0)")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 0..0,
@@ -5889,7 +5866,7 @@ mod tests {
         "#
         );
         insta::assert_debug_snapshot!(
-            optimize(parse("ancestors(ancestors(foo, 0))").unwrap()), @r#"
+            optimize(parse("ancestors(ancestors(foo, 0))")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 0..0,
@@ -5900,7 +5877,7 @@ mod tests {
 
         // Ancestors can only be folded if parent ranges match.
         insta::assert_debug_snapshot!(
-            optimize(parse("first_ancestors(first_ancestors(foo, 5), 5)").unwrap()), @r#"
+            optimize(parse("first_ancestors(first_ancestors(foo, 5), 5)")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 0..9,
@@ -5909,7 +5886,7 @@ mod tests {
         "#
         );
         insta::assert_debug_snapshot!(
-            optimize(parse("first_ancestors(first_parent(foo), 5)").unwrap()), @r#"
+            optimize(parse("first_ancestors(first_parent(foo), 5)")?), @r#"
         Ancestors {
             heads: CommitRef(Symbol("foo")),
             generation: 1..6,
@@ -5918,7 +5895,7 @@ mod tests {
         "#
         );
         insta::assert_debug_snapshot!(
-            optimize(parse("first_ancestors(ancestors(foo, 5), 5)").unwrap()), @r#"
+            optimize(parse("first_ancestors(ancestors(foo, 5), 5)")?), @r#"
         Ancestors {
             heads: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5931,7 +5908,7 @@ mod tests {
         "#
         );
         insta::assert_debug_snapshot!(
-            optimize(parse("ancestors(first_ancestors(foo, 5), 5)").unwrap()), @r#"
+            optimize(parse("ancestors(first_ancestors(foo, 5), 5)")?), @r#"
         Ancestors {
             heads: Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -5943,27 +5920,28 @@ mod tests {
         }
         "#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_descendants() {
+    fn test_optimize_descendants() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Typical scenario: fold nested children()
-        insta::assert_debug_snapshot!(optimize(parse("foo++").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo++")?), @r#"
         Descendants {
             roots: CommitRef(Symbol("foo")),
             generation: 2..3,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("(foo+++)::").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(foo+++)::")?), @r#"
         Descendants {
             roots: CommitRef(Symbol("foo")),
             generation: 3..18446744073709551615,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("(foo::)+++").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(foo::)+++")?), @r#"
         Descendants {
             roots: CommitRef(Symbol("foo")),
             generation: 3..18446744073709551615,
@@ -5971,7 +5949,7 @@ mod tests {
         "#);
 
         // 'foo+-' is not 'foo'.
-        insta::assert_debug_snapshot!(optimize(parse("foo+++-").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("foo+++-")?), @r#"
         Ancestors {
             heads: Descendants {
                 roots: CommitRef(Symbol("foo")),
@@ -5985,7 +5963,7 @@ mod tests {
         // TODO: Inner Descendants can be folded into DagRange. Perhaps, we can rewrite
         // 'x::y' to 'x:: & ::y' first, so the common substitution rule can handle both
         // 'x+::y' and 'x+ & ::y'.
-        insta::assert_debug_snapshot!(optimize(parse("(foo++)::bar").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("(foo++)::bar")?), @r#"
         DagRange {
             roots: Descendants {
                 roots: CommitRef(Symbol("foo")),
@@ -5994,15 +5972,16 @@ mod tests {
             heads: CommitRef(Symbol("bar")),
         }
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_flatten_intersection() {
+    fn test_optimize_flatten_intersection() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Nested intersections should be flattened.
-        insta::assert_debug_snapshot!(optimize(parse("a & ((b & c) & (d & e))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("a & ((b & c) & (d & e))")?), @r#"
         Intersection(
             Intersection(
                 Intersection(
@@ -6017,15 +5996,16 @@ mod tests {
             CommitRef(Symbol("e")),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_ancestors_union() {
+    fn test_optimize_ancestors_union() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Ancestors should be folded in unions.
-        insta::assert_debug_snapshot!(optimize(parse("::a | ::b | ::c | ::d").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::a | ::b | ::c | ::d")?), @r#"
         Ancestors {
             heads: Union(
                 Union(
@@ -6041,7 +6021,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("ancestors(a-) | ancestors(b)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("ancestors(a-) | ancestors(b)")?), @r#"
         Ancestors {
             heads: Union(
                 Ancestors {
@@ -6057,7 +6037,7 @@ mod tests {
         "#);
 
         // Negated ancestors should be folded.
-        insta::assert_debug_snapshot!(optimize(parse("~::a- & ~::b & ~::c & ::d").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~::a- & ~::b & ~::c & ::d")?), @r#"
         Range {
             roots: Union(
                 Union(
@@ -6075,7 +6055,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("a..b ~ ::c- ~ ::d").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("a..b ~ ::c- ~ ::d")?), @r#"
         Range {
             roots: Union(
                 Union(
@@ -6095,7 +6075,7 @@ mod tests {
         "#);
 
         // Ancestors with a bounded generation range should not be merged.
-        insta::assert_debug_snapshot!(optimize(parse("ancestors(a, 2) | ancestors(b)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("ancestors(a, 2) | ancestors(b)")?), @r#"
         Union(
             Ancestors {
                 heads: CommitRef(Symbol("a")),
@@ -6109,16 +6089,17 @@ mod tests {
             },
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_sort_negations_and_ancestors() {
+    fn test_optimize_sort_negations_and_ancestors() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Negated ancestors and ancestors should be moved to the left, and other
         // negations should be moved to the right.
-        insta::assert_debug_snapshot!(optimize(parse("~a & ::b & ~::c & d ~ e & f & ::g & ~::h").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("~a & ::b & ~::c & d ~ e & f & ::g & ~::h")?), @r#"
         Difference(
             Difference(
                 Intersection(
@@ -6148,15 +6129,16 @@ mod tests {
             CommitRef(Symbol("e")),
         )
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_heads_range() {
+    fn test_optimize_heads_range() -> TestResult {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
 
         // Heads of basic range operators can be folded.
-        insta::assert_debug_snapshot!(optimize(parse("heads(::)").unwrap()), @"
+        insta::assert_debug_snapshot!(optimize(parse("heads(::)")?), @"
         HeadsRange {
             roots: None,
             heads: VisibleHeadsOrReferenced,
@@ -6164,7 +6146,7 @@ mod tests {
             filter: All,
         }
         ");
-        insta::assert_debug_snapshot!(optimize(parse("heads(::foo)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(::foo)")?), @r#"
         HeadsRange {
             roots: None,
             heads: CommitRef(Symbol("foo")),
@@ -6174,7 +6156,7 @@ mod tests {
         "#);
         // It might be better to use `roots: Root`, but it would require adding a
         // special case for `~root()`, and this should be similar in performance.
-        insta::assert_debug_snapshot!(optimize(parse("heads(..)").unwrap()), @"
+        insta::assert_debug_snapshot!(optimize(parse("heads(..)")?), @"
         HeadsRange {
             roots: None,
             heads: VisibleHeadsOrReferenced,
@@ -6182,7 +6164,7 @@ mod tests {
             filter: NotIn(Root),
         }
         ");
-        insta::assert_debug_snapshot!(optimize(parse("heads(foo..)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(foo..)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("foo")),
             heads: VisibleHeadsOrReferenced,
@@ -6190,7 +6172,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(..bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(..bar)")?), @r#"
         HeadsRange {
             roots: Root,
             heads: CommitRef(Symbol("bar")),
@@ -6198,7 +6180,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(foo..bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(foo..bar)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -6206,7 +6188,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo & ::bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo & ::bar)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -6214,7 +6196,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("foo")),
             heads: VisibleHeadsOrReferenced,
@@ -6222,7 +6204,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(a..b & c..d)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(a..b & c..d)")?), @r#"
         HeadsRange {
             roots: Union(
                 CommitRef(Symbol("a")),
@@ -6239,7 +6221,7 @@ mod tests {
         "#);
 
         // Heads of first-parent ancestors can also be folded.
-        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo))")?), @r#"
         HeadsRange {
             roots: None,
             heads: CommitRef(Symbol("foo")),
@@ -6247,7 +6229,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo) & bar..)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo) & bar..)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("bar")),
             heads: CommitRef(Symbol("foo")),
@@ -6255,7 +6237,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(foo.. & first_ancestors(bar) & ::baz)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(foo.. & first_ancestors(bar) & ::baz)")?), @r#"
         HeadsRange {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -6269,7 +6251,7 @@ mod tests {
         "#);
 
         // Ancestors with a limited depth should not be optimized.
-        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo, 2))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo, 2))")?), @r#"
         Heads(
             Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -6278,7 +6260,7 @@ mod tests {
             },
         )
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo, 2))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(foo, 2))")?), @r#"
         Heads(
             Ancestors {
                 heads: CommitRef(Symbol("foo")),
@@ -6289,7 +6271,7 @@ mod tests {
         "#);
 
         // Generation folding should not prevent optimizing heads.
-        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo--))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo--))")?), @r#"
         HeadsRange {
             roots: None,
             heads: Ancestors {
@@ -6301,7 +6283,7 @@ mod tests {
             filter: All,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(first_parent(foo, 2)))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(first_ancestors(first_parent(foo, 2)))")?), @r#"
         HeadsRange {
             roots: None,
             heads: Ancestors {
@@ -6315,7 +6297,7 @@ mod tests {
         "#);
 
         // Heads of filters and negations can be folded.
-        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) | author_name(B))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) | author_name(B))")?), @r#"
         HeadsRange {
             roots: None,
             heads: VisibleHeadsOrReferenced,
@@ -6328,7 +6310,7 @@ mod tests {
             ),
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(~author_name(A))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(~author_name(A))")?), @r#"
         HeadsRange {
             roots: None,
             heads: VisibleHeadsOrReferenced,
@@ -6340,7 +6322,7 @@ mod tests {
             ),
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("heads(~foo)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(~foo)")?), @r#"
         HeadsRange {
             roots: None,
             heads: VisibleHeadsOrReferenced,
@@ -6350,7 +6332,7 @@ mod tests {
         "#);
 
         // Heads of intersections with filters can be folded.
-        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) & ::foo ~ author_name(B))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) & ::foo ~ author_name(B))")?), @r#"
         HeadsRange {
             roots: None,
             heads: CommitRef(Symbol("foo")),
@@ -6365,7 +6347,7 @@ mod tests {
         "#);
 
         // Heads of intersections with negations can be folded.
-        insta::assert_debug_snapshot!(optimize(parse("heads(~foo & ~roots(bar) & ::baz)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("heads(~foo & ~roots(bar) & ::baz)")?), @r#"
         HeadsRange {
             roots: None,
             heads: CommitRef(Symbol("baz")),
@@ -6376,12 +6358,13 @@ mod tests {
             ),
         }
         "#);
+        Ok(())
     }
 
     #[test]
-    fn test_optimize_ancestors_heads_range() {
+    fn test_optimize_ancestors_heads_range() -> TestResult {
         // Can use heads range to optimize ancestors of filter.
-        insta::assert_debug_snapshot!(optimize(parse("::description(bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::description(bar)")?), @r#"
         Ancestors {
             heads: HeadsRange {
                 roots: None,
@@ -6401,7 +6384,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("author_name(foo)..").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("author_name(foo)..")?), @r#"
         Range {
             roots: HeadsRange {
                 roots: None,
@@ -6424,7 +6407,7 @@ mod tests {
         "#);
 
         // Can use heads range to optimize ancestors of range.
-        insta::assert_debug_snapshot!(optimize(parse("::(foo..bar)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("::(foo..bar)")?), @r#"
         Ancestors {
             heads: HeadsRange {
                 roots: CommitRef(
@@ -6446,7 +6429,7 @@ mod tests {
         "#);
 
         // Can't optimize if not using full generation and parents ranges.
-        insta::assert_debug_snapshot!(optimize(parse("ancestors(author_name(foo), 5)").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("ancestors(author_name(foo), 5)")?), @r#"
         Ancestors {
             heads: Filter(
                 AuthorName(
@@ -6461,7 +6444,7 @@ mod tests {
             parents_range: 0..4294967295,
         }
         "#);
-        insta::assert_debug_snapshot!(optimize(parse("first_ancestors(author_name(foo))").unwrap()), @r#"
+        insta::assert_debug_snapshot!(optimize(parse("first_ancestors(author_name(foo))")?), @r#"
         Ancestors {
             heads: Filter(
                 AuthorName(
@@ -6476,6 +6459,7 @@ mod tests {
             parents_range: 0..1,
         }
         "#);
+        Ok(())
     }
 
     #[test]

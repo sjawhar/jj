@@ -580,6 +580,7 @@ mod tests {
 
     use super::*;
     use crate::dsl_util::KeywordArgument;
+    use crate::tests::TestResult;
 
     #[derive(Debug)]
     struct WithFilesetAliasesMap {
@@ -602,7 +603,7 @@ mod tests {
     ) -> WithFilesetAliasesMap {
         let mut aliases_map = FilesetAliasesMap::new();
         for (decl, defn) in aliases {
-            aliases_map.insert(decl, defn).unwrap();
+            aliases_map.insert(decl, defn, None).unwrap();
         }
         WithFilesetAliasesMap { aliases_map }
     }
@@ -798,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pattern() {
+    fn test_parse_pattern() -> TestResult {
         fn unwrap_pattern(kind: ExpressionKind<'_>) -> (&str, ExpressionKind<'_>) {
             match kind {
                 ExpressionKind::Pattern(pattern) => (pattern.name, pattern.value.kind),
@@ -807,23 +808,23 @@ mod tests {
         }
 
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#" foo:bar "#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#" foo:bar "#)?),
             ("foo", ExpressionKind::Identifier("bar"))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(" foo:glob*[chars]? ").unwrap()),
+            unwrap_pattern(parse_into_kind(" foo:glob*[chars]? ")?),
             ("foo", ExpressionKind::Identifier("glob*[chars]?"))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#" foo:"bar" "#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#" foo:"bar" "#)?),
             ("foo", ExpressionKind::String("bar".to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#" foo:"" "#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#" foo:"" "#)?),
             ("foo", ExpressionKind::String("".to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_into_kind(r#" foo:'\' "#).unwrap()),
+            unwrap_pattern(parse_into_kind(r#" foo:'\' "#)?),
             ("foo", ExpressionKind::String(r"\".to_owned()))
         );
         assert_eq!(
@@ -857,10 +858,11 @@ mod tests {
 
         // Pattern prefix is like (type)x cast, so is evaluated from right
         assert_eq!(parse_normalized("x:y:z"), parse_normalized("x:(y:z)"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_operator() {
+    fn test_parse_operator() -> TestResult {
         assert_matches!(
             parse_into_kind("~x"),
             Ok(ExpressionKind::Unary(UnaryOp::Negate, _))
@@ -895,14 +897,15 @@ mod tests {
         assert_eq!(parse_normalized("x|y:z"), parse_normalized("x|(y:z)"));
 
         // Expression span
-        assert_eq!(parse_program(" ~ x ").unwrap().span.as_str(), "~ x");
-        assert_eq!(parse_program(" x |y ").unwrap().span.as_str(), "x |y");
-        assert_eq!(parse_program(" (x) ").unwrap().span.as_str(), "(x)");
-        assert_eq!(parse_program("~( x|y) ").unwrap().span.as_str(), "~( x|y)");
+        assert_eq!(parse_program(" ~ x ")?.span.as_str(), "~ x");
+        assert_eq!(parse_program(" x |y ")?.span.as_str(), "x |y");
+        assert_eq!(parse_program(" (x) ")?.span.as_str(), "(x)");
+        assert_eq!(parse_program("~( x|y) ")?.span.as_str(), "~( x|y)");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_function_call() {
+    fn test_parse_function_call() -> TestResult {
         fn unwrap_function_call(node: ExpressionNode<'_>) -> Box<FunctionCallNode<'_>> {
             match node.kind {
                 ExpressionKind::FunctionCall(function) => function,
@@ -928,16 +931,17 @@ mod tests {
         assert!(parse_into_kind("foo(a,,b)").is_err());
 
         // Expression span
-        let function = unwrap_function_call(parse_program("foo( a, (b) , ~(c) )").unwrap());
+        let function = unwrap_function_call(parse_program("foo( a, (b) , ~(c) )")?);
         assert_eq!(function.name_span.as_str(), "foo");
         assert_eq!(function.args_span.as_str(), "a, (b) , ~(c)");
         assert_eq!(function.args[0].span.as_str(), "a");
         assert_eq!(function.args[1].span.as_str(), "(b)");
         assert_eq!(function.args[2].span.as_str(), "~(c)");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_bare_string() {
+    fn test_parse_bare_string() -> TestResult {
         fn unwrap_pattern(kind: ExpressionKind<'_>) -> (&str, ExpressionKind<'_>) {
             match kind {
                 ExpressionKind::Pattern(pattern) => (pattern.name, pattern.value.kind),
@@ -955,7 +959,7 @@ mod tests {
             parse_normalized("f(x)&y")
         );
         assert_eq!(
-            unwrap_pattern(parse_maybe_bare_into_kind("foo:bar").unwrap()),
+            unwrap_pattern(parse_maybe_bare_into_kind("foo:bar")?),
             ("foo", ExpressionKind::Identifier("bar"))
         );
 
@@ -989,11 +993,11 @@ mod tests {
 
         // Bare string pattern
         assert_eq!(
-            unwrap_pattern(parse_maybe_bare_into_kind("foo: bar baz").unwrap()),
+            unwrap_pattern(parse_maybe_bare_into_kind("foo: bar baz")?),
             ("foo", ExpressionKind::String(" bar baz".to_owned()))
         );
         assert_eq!(
-            unwrap_pattern(parse_maybe_bare_into_kind("foo:glob * [chars]?").unwrap()),
+            unwrap_pattern(parse_maybe_bare_into_kind("foo:glob * [chars]?")?),
             ("foo", ExpressionKind::String("glob * [chars]?".to_owned()))
         );
         assert_eq!(
@@ -1015,6 +1019,7 @@ mod tests {
             parse_maybe_bare_into_kind(" No trim "),
             Ok(ExpressionKind::String(" No trim ".to_owned()))
         );
+        Ok(())
     }
 
     #[test]
@@ -1030,58 +1035,60 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_alias_symbol_decl() {
+    fn test_parse_alias_symbol_decl() -> TestResult {
         let mut aliases_map = FilesetAliasesMap::new();
-        aliases_map.insert("sym", "symbol").unwrap();
+        aliases_map.insert("sym", "symbol", None)?;
         assert_eq!(aliases_map.symbol_names().count(), 1);
-        let (id, defn) = aliases_map.get_symbol("sym").unwrap();
+        let (id, defn, _doc) = aliases_map.get_symbol("sym").unwrap();
         assert_eq!(id, AliasId::Symbol("sym"));
         assert_eq!(defn, "symbol");
 
         // Non-ASCII character isn't allowed in alias symbol. This rule can be
         // relaxed if needed.
-        assert!(aliases_map.insert("柔術", "none()").is_err());
+        assert!(aliases_map.insert("柔術", "none()", None).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_alias_pattern_decl() {
+    fn test_parse_alias_pattern_decl() -> TestResult {
         let mut aliases_map = FilesetAliasesMap::new();
-        assert!(aliases_map.insert("pat:", "bad_pattern").is_err());
-        aliases_map.insert("pat:a", "pattern_a").unwrap();
-        aliases_map.insert("pat:b", "pattern_b").unwrap();
+        assert!(aliases_map.insert("pat:", "bad_pattern", None).is_err());
+        aliases_map.insert("pat:a", "pattern_a", None)?;
+        aliases_map.insert("pat:b", "pattern_b", None)?;
         assert_eq!(aliases_map.pattern_names().count(), 1);
-        let (id, param, defn) = aliases_map.get_pattern("pat").unwrap();
+        let (id, param, defn, _doc) = aliases_map.get_pattern("pat").unwrap();
         assert_eq!(id, AliasId::Pattern("pat", "b"));
         assert_eq!(param, "b");
         assert_eq!(defn, "pattern_b");
 
         // Non-ASCII character isn't allowed. This rule can be relaxed if
         // needed.
-        assert!(aliases_map.insert("柔術:x", "none()").is_err());
-        assert!(aliases_map.insert("x:柔術", "none()").is_err());
+        assert!(aliases_map.insert("柔術:x", "none()", None).is_err());
+        assert!(aliases_map.insert("x:柔術", "none()", None).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_alias_func_decl() {
+    fn test_parse_alias_func_decl() -> TestResult {
         let mut aliases_map = FilesetAliasesMap::new();
-        assert!(aliases_map.insert("5func()", "bad_function").is_err());
-        aliases_map.insert("func()", "function_0").unwrap();
-        aliases_map.insert("func(a)", "function_1a").unwrap();
-        aliases_map.insert("func(b)", "function_1b").unwrap();
-        aliases_map.insert("func(a, b)", "function_2").unwrap();
+        assert!(aliases_map.insert("5func()", "bad_function", None).is_err());
+        aliases_map.insert("func()", "function_0", None)?;
+        aliases_map.insert("func(a)", "function_1a", None)?;
+        aliases_map.insert("func(b)", "function_1b", None)?;
+        aliases_map.insert("func(a, b)", "function_2", None)?;
         assert_eq!(aliases_map.function_names().count(), 1);
 
-        let (id, params, defn) = aliases_map.get_function("func", 0).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 0).unwrap();
         assert_eq!(id, AliasId::Function("func", &[]));
         assert!(params.is_empty());
         assert_eq!(defn, "function_0");
 
-        let (id, params, defn) = aliases_map.get_function("func", 1).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 1).unwrap();
         assert_eq!(id, AliasId::Function("func", &["b".to_owned()]));
         assert_eq!(params, ["b"]);
         assert_eq!(defn, "function_1b");
 
-        let (id, params, defn) = aliases_map.get_function("func", 2).unwrap();
+        let (id, params, defn, _doc) = aliases_map.get_function("func", 2).unwrap();
         assert_eq!(
             id,
             AliasId::Function("func", &["a".to_owned(), "b".to_owned()])
@@ -1090,6 +1097,7 @@ mod tests {
         assert_eq!(defn, "function_2");
 
         assert!(aliases_map.get_function("func", 3).is_none());
+        Ok(())
     }
 
     #[test]
@@ -1097,19 +1105,19 @@ mod tests {
         let mut aliases_map = FilesetAliasesMap::new();
         // Formal parameter 'a' can't be redefined
         assert_eq!(
-            aliases_map.insert("f(a, a)", "bad").unwrap_err().kind,
+            aliases_map.insert("f(a, a)", "bad", None).unwrap_err().kind,
             FilesetParseErrorKind::RedefinedFunctionParameter
         );
         // Trailing comma isn't allowed for empty parameter
-        assert!(aliases_map.insert("f(,)", "bad").is_err());
+        assert!(aliases_map.insert("f(,)", "bad", None).is_err());
         // Trailing comma is allowed for the last parameter
-        assert!(aliases_map.insert("g(a,)", "bad").is_ok());
-        assert!(aliases_map.insert("h(a ,  )", "bad").is_ok());
-        assert!(aliases_map.insert("i(,a)", "bad").is_err());
-        assert!(aliases_map.insert("j(a,,)", "bad").is_err());
-        assert!(aliases_map.insert("k(a  , , )", "bad").is_err());
-        assert!(aliases_map.insert("l(a,b,)", "bad").is_ok());
-        assert!(aliases_map.insert("m(a,,b)", "bad").is_err());
+        assert!(aliases_map.insert("g(a,)", "bad", None).is_ok());
+        assert!(aliases_map.insert("h(a ,  )", "bad", None).is_ok());
+        assert!(aliases_map.insert("i(,a)", "bad", None).is_err());
+        assert!(aliases_map.insert("j(a,,)", "bad", None).is_err());
+        assert!(aliases_map.insert("k(a  , , )", "bad", None).is_err());
+        assert!(aliases_map.insert("l(a,b,)", "bad", None).is_ok());
+        assert!(aliases_map.insert("m(a,,b)", "bad", None).is_err());
     }
 
     #[test]

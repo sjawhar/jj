@@ -60,10 +60,22 @@ pub async fn merge_commit_trees(repo: &dyn Repo, commits: &[Commit]) -> BackendR
     if let [commit] = commits {
         Ok(commit.tree())
     } else {
-        merge_commit_trees_no_resolve_without_repo(repo.store(), repo.index(), commits)
+        merge_commit_trees_no_resolve(repo, commits)
             .await?
             .resolve()
             .await
+    }
+}
+
+/// Merges `commits` without attempting to resolve file conflicts.
+pub async fn merge_commit_trees_no_resolve(
+    repo: &dyn Repo,
+    commits: &[Commit],
+) -> BackendResult<MergedTree> {
+    if let [commit] = commits {
+        Ok(commit.tree())
+    } else {
+        merge_commit_trees_no_resolve_without_repo(repo.store(), repo.index(), commits).await
     }
 }
 
@@ -826,7 +838,7 @@ pub async fn compute_move_commits(
     let mut roots = target_roots.iter().cloned().collect_vec();
     roots.extend(new_children.iter().ids().cloned());
 
-    let descendants = repo.find_descendants_for_rebase(roots.clone())?;
+    let descendants = repo.find_descendants_for_rebase(roots.clone()).await?;
     let commit_new_parents_map = descendants
         .iter()
         .map(|commit| -> BackendResult<_> {

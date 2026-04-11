@@ -50,7 +50,7 @@ pub async fn cmd_debug_tree(
     command: &CommandHelper,
     args: &DebugTreeArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui)?;
+    let workspace_command = command.workspace_helper(ui).await?;
     let matcher = workspace_command
         .parse_file_patterns(ui, &args.paths)?
         .to_matcher();
@@ -73,7 +73,8 @@ pub async fn cmd_debug_tree(
             )
         } else {
             let commit = workspace_command
-                .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))?;
+                .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))
+                .await?;
             let tree = commit.tree();
             Box::new(tree.entries_matching(matcher.as_ref()))
         };

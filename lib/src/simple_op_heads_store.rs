@@ -63,10 +63,12 @@ impl SimpleOpHeadsStore {
         "simple_op_heads_store"
     }
 
-    pub fn init(dir: &Path) -> Result<Self, SimpleOpHeadsStoreInitError> {
+    pub fn init(dir: &Path, root_op_id: &OperationId) -> Result<Self, SimpleOpHeadsStoreInitError> {
         let op_heads_dir = dir.join("heads");
         fs::create_dir(&op_heads_dir).context(&op_heads_dir)?;
-        Ok(Self { dir: op_heads_dir })
+        let store = Self { dir: op_heads_dir };
+        store.add_op_head(root_op_id)?;
+        Ok(store)
     }
 
     pub fn load(dir: &Path) -> Self {
@@ -74,22 +76,26 @@ impl SimpleOpHeadsStore {
         Self { dir: op_heads_dir }
     }
 
-    fn add_op_head(&self, id: &OperationId) -> io::Result<()> {
-        std::fs::write(self.dir.join(id.hex()), "")
+    fn add_op_head(&self, id: &OperationId) -> Result<(), PathError> {
+        let path = self.dir.join(id.hex());
+        std::fs::write(&path, "").context(path)
     }
 
-    fn remove_op_head(&self, id: &OperationId) -> io::Result<()> {
-        std::fs::remove_file(self.dir.join(id.hex())).or_else(|err| {
-            if err.kind() == io::ErrorKind::NotFound {
-                // It's fine if the old head was not found. It probably means
-                // that we're on a distributed file system where the locking
-                // doesn't work. We'll probably end up with two current
-                // heads. We'll detect that next time we load the view.
-                Ok(())
-            } else {
-                Err(err)
-            }
-        })
+    fn remove_op_head(&self, id: &OperationId) -> Result<(), PathError> {
+        let path = self.dir.join(id.hex());
+        std::fs::remove_file(&path)
+            .or_else(|err| {
+                if err.kind() == io::ErrorKind::NotFound {
+                    // It's fine if the old head was not found. It probably means
+                    // that we're on a distributed file system where the locking
+                    // doesn't work. We'll probably end up with two current
+                    // heads. We'll detect that next time we load the view.
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            })
+            .context(path)
     }
 }
 
@@ -143,7 +149,13 @@ impl OpHeadsStore for SimpleOpHeadsStore {
                 op_heads.push(OperationId::new(op_head));
             }
         }
-        Ok(op_heads)
+        if op_heads.is_empty() {
+            Err(OpHeadsStoreError::Read(
+                "Corrupt repository: no head operation".into(),
+            ))
+        } else {
+            Ok(op_heads)
+        }
     }
 
     async fn lock(&self) -> Result<Box<dyn OpHeadsStoreLock + '_>, OpHeadsStoreError> {

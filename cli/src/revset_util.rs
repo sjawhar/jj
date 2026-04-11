@@ -18,6 +18,9 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
+use futures::TryStreamExt as _;
+use futures::stream::LocalBoxStream;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
@@ -36,10 +39,10 @@ use jj_lib::revset::RevsetDiagnostics;
 use jj_lib::revset::RevsetEvaluationError;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::revset::RevsetExtensions;
-use jj_lib::revset::RevsetIteratorExt as _;
 use jj_lib::revset::RevsetParseContext;
 use jj_lib::revset::RevsetParseError;
 use jj_lib::revset::RevsetResolutionError;
+use jj_lib::revset::RevsetStreamExt as _;
 use jj_lib::revset::SymbolResolver;
 use jj_lib::revset::SymbolResolverExtension;
 use jj_lib::revset::UserRevsetExpression;
@@ -125,10 +128,10 @@ impl<'repo> RevsetExpressionEvaluator<'repo> {
     pub fn evaluate_to_commit_ids(
         &self,
     ) -> Result<
-        Box<dyn Iterator<Item = Result<CommitId, RevsetEvaluationError>> + 'repo>,
+        LocalBoxStream<'repo, Result<CommitId, RevsetEvaluationError>>,
         UserRevsetEvaluationError,
     > {
-        Ok(self.evaluate()?.iter())
+        Ok(self.evaluate()?.stream())
     }
 
     /// Evaluates the expression to an iterator over commit objects. Entries are
@@ -136,10 +139,14 @@ impl<'repo> RevsetExpressionEvaluator<'repo> {
     pub fn evaluate_to_commits(
         &self,
     ) -> Result<
-        impl Iterator<Item = Result<Commit, RevsetEvaluationError>> + use<'repo>,
+        LocalBoxStream<'repo, Result<Commit, RevsetEvaluationError>>,
         UserRevsetEvaluationError,
     > {
-        Ok(self.evaluate()?.iter().commits(self.repo.store()))
+        Ok(self
+            .evaluate()?
+            .stream()
+            .commits(self.repo.store())
+            .boxed_local())
     }
 }
 
@@ -187,7 +194,7 @@ pub fn parse_immutable_heads_expression(
     diagnostics: &mut RevsetDiagnostics,
     context: &RevsetParseContext,
 ) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
-    let (_, _, immutable_heads_str) = context
+    let (_, _, immutable_heads_str, _) = context
         .aliases_map
         .get_function(USER_IMMUTABLE_HEADS, 0)
         .unwrap();
@@ -203,7 +210,7 @@ pub(super) fn try_resolve_trunk_alias(
     repo: &dyn Repo,
     context: &RevsetParseContext,
 ) -> Result<Option<Arc<ResolvedRevsetExpression>>, RevsetResolutionError> {
-    let (_, _, revset_str) = context
+    let (_, _, revset_str, _) = context
         .aliases_map
         .get_function("trunk", 0)
         .expect("trunk() should be defined by default");
@@ -217,24 +224,26 @@ pub(super) fn try_resolve_trunk_alias(
     Ok(Some(resolved))
 }
 
-pub(super) fn evaluate_revset_to_single_commit<'a>(
+pub(super) async fn evaluate_revset_to_single_commit<'a>(
     revision_str: &str,
     expression: &RevsetExpressionEvaluator<'_>,
     commit_summary_template: impl FnOnce() -> TemplateRenderer<'a, Commit>,
 ) -> Result<Commit, CommandError> {
-    let mut iter = expression.evaluate_to_commits()?.fuse();
-    match (iter.next(), iter.next()) {
-        (Some(commit), None) => Ok(commit?),
-        (None, _) => Err(user_error(format!(
+    let commits: Vec<_> = expression
+        .evaluate_to_commits()?
+        .take(6)
+        .try_collect()
+        .await?;
+    match commits.as_slice() {
+        [commit] => Ok(commit.clone()),
+        [] => Err(user_error(format!(
             "Revset `{revision_str}` didn't resolve to any revisions"
         ))),
-        (Some(commit0), Some(commit1)) => {
-            let mut iter = [commit0, commit1].into_iter().chain(iter);
-            let commits: Vec<_> = iter.by_ref().take(5).try_collect()?;
-            let elided = iter.next().is_some();
+        _ => {
+            let elided = commits.len() > 5;
             Err(format_multiple_revisions_error(
                 revision_str,
-                &commits,
+                &commits[..std::cmp::min(5, commits.len())],
                 elided,
                 &commit_summary_template(),
             ))
@@ -337,7 +346,7 @@ pub fn parse_remote_auto_track_bookmarks_map(
         let Some(text) = &settings.auto_track_bookmarks else {
             continue;
         };
-        let expr = parse_remote_auto_track_text(ui, name, text, "auto-track-bookmarks")?;
+        let expr = parse_remote_string_expression(ui, name, text, "auto-track-bookmarks")?;
         matchers.insert(name.clone(), expr.to_matcher());
     }
     Ok(matchers)
@@ -355,7 +364,7 @@ pub fn parse_remote_auto_track_bookmarks_map_for_new_bookmarks(
     for (name, settings) in remote_settings {
         let mut exprs = Vec::new();
         if let Some(text) = &settings.auto_track_bookmarks {
-            exprs.push(parse_remote_auto_track_text(
+            exprs.push(parse_remote_string_expression(
                 ui,
                 name,
                 text,
@@ -363,12 +372,15 @@ pub fn parse_remote_auto_track_bookmarks_map_for_new_bookmarks(
             )?);
         }
         if let Some(text) = &settings.auto_track_created_bookmarks {
-            exprs.push(parse_remote_auto_track_text(
+            exprs.push(parse_remote_string_expression(
                 ui,
                 name,
                 text,
                 "auto-track-created-bookmarks",
             )?);
+        }
+        if exprs.is_empty() {
+            continue;
         }
         matchers.insert(
             name.clone(),
@@ -378,7 +390,33 @@ pub fn parse_remote_auto_track_bookmarks_map_for_new_bookmarks(
     Ok(matchers)
 }
 
-fn parse_remote_auto_track_text(
+/// Parses the given `remotes.<name>.fetch-bookmarks` setting.
+pub fn parse_remote_fetch_bookmarks(
+    ui: &Ui,
+    remote_settings: &RemoteSettingsMap,
+    name: &RemoteName,
+) -> Result<Option<StringExpression>, CommandError> {
+    remote_settings
+        .get(name)
+        .and_then(|settings| settings.fetch_bookmarks.as_ref())
+        .map(|text| parse_remote_string_expression(ui, name, text, "fetch-bookmarks"))
+        .transpose()
+}
+
+/// Parses the given `remotes.<name>.fetch-tags` setting.
+pub fn parse_remote_fetch_tags(
+    ui: &Ui,
+    remote_settings: &RemoteSettingsMap,
+    name: &RemoteName,
+) -> Result<Option<StringExpression>, CommandError> {
+    remote_settings
+        .get(name)
+        .and_then(|settings| settings.fetch_tags.as_ref())
+        .map(|text| parse_remote_string_expression(ui, name, text, "fetch-tags"))
+        .transpose()
+}
+
+fn parse_remote_string_expression(
     ui: &Ui,
     name: &RemoteName,
     text: &str,

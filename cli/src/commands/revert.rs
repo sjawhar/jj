@@ -17,6 +17,8 @@ use std::collections::HashSet;
 use bstr::ByteVec as _;
 use clap::ArgGroup;
 use clap_complete::ArgValueCompleter;
+use futures::TryStreamExt as _;
+use futures::future::try_join_all;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
@@ -47,7 +49,13 @@ use crate::ui::Ui;
 #[command(group(ArgGroup::new("location").args(&["onto", "insert_after", "insert_before"]).multiple(true).required(true)))]
 pub(crate) struct RevertArgs {
     /// The revision(s) to apply the reverse of
-    #[arg(long, short, value_name = "REVSETS", required = true)]
+    #[arg(
+        long = "revision",
+        short,
+        value_name = "REVSETS",
+        required = true,
+        alias = "revisions"
+    )]
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_all))]
     revisions: Vec<RevisionArg>,
 
@@ -93,11 +101,12 @@ pub(crate) async fn cmd_revert(
     command: &CommandHelper,
     args: &RevertArgs,
 ) -> Result<(), CommandError> {
-    let mut workspace_command = command.workspace_helper(ui)?;
+    let mut workspace_command = command.workspace_helper(ui).await?;
     let to_revert: Vec<_> = workspace_command
         .parse_union_revsets(ui, &args.revisions)?
         .evaluate_to_commits()?
-        .try_collect()?; // in reverse topological order
+        .try_collect()
+        .await?; // in reverse topological order
     if to_revert.is_empty() {
         writeln!(ui.status(), "No revisions to revert.")?;
         return Ok(());
@@ -109,7 +118,8 @@ pub(crate) async fn cmd_revert(
         args.insert_after.as_deref(),
         args.insert_before.as_deref(),
         "reverted commits",
-    )?;
+    )
+    .await?;
     let transaction_description = if to_revert.len() == 1 {
         format!("revert commit {}", to_revert[0].id().hex())
     } else {
@@ -135,10 +145,12 @@ pub(crate) async fn cmd_revert(
     };
     let mut tx = workspace_command.start_transaction();
     let original_parent_commit_ids: HashSet<_> = new_parent_ids.iter().cloned().collect();
-    let new_parents: Vec<_> = new_parent_ids
-        .iter()
-        .map(|id| tx.repo().store().get_commit(id))
-        .try_collect()?;
+    let new_parents = try_join_all(
+        new_parent_ids
+            .iter()
+            .map(|id| tx.repo().store().get_commit_async(id)),
+    )
+    .await?;
     let mut new_base_tree = merge_commit_trees(tx.repo(), &new_parents).await?;
     let mut parent_ids = new_parent_ids;
     let mut parent_labels = conflict_label_for_commits(&new_parents);
@@ -225,7 +237,7 @@ pub(crate) async fn cmd_revert(
             writeln!(formatter, "Rebased {num_rebased} descendant commits")?;
         }
     }
-    tx.finish(ui, transaction_description)?;
+    tx.finish(ui, transaction_description).await?;
 
     Ok(())
 }

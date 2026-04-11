@@ -25,7 +25,10 @@ use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use futures::future::try_join_all;
+use futures::stream;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell;
 use thiserror::Error;
@@ -44,6 +47,7 @@ use crate::commit::CommitByCommitterTimestamp;
 use crate::commit_builder::CommitBuilder;
 use crate::commit_builder::DetachedCommitBuilder;
 use crate::dag_walk;
+use crate::dag_walk_async;
 use crate::default_index::DefaultIndexStore;
 use crate::default_index::DefaultMutableIndex;
 use crate::default_submodule_store::DefaultSubmoduleStore;
@@ -65,7 +69,6 @@ use crate::merged_tree::MergedTree;
 use crate::object_id::HexPrefix;
 use crate::object_id::PrefixResolution;
 use crate::op_heads_store;
-use crate::op_heads_store::OpHeadResolutionError;
 use crate::op_heads_store::OpHeadsStore;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store;
@@ -92,7 +95,7 @@ use crate::refs::merge_remote_refs;
 use crate::revset;
 use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
-use crate::revset::RevsetIteratorExt as _;
+use crate::revset::RevsetStreamExt as _;
 use crate::rewrite::CommitRewriter;
 use crate::rewrite::RebaseOptions;
 use crate::rewrite::RebasedCommit;
@@ -187,7 +190,9 @@ impl ReadonlyRepo {
     }
 
     pub fn default_op_heads_store_initializer() -> &'static OpHeadsStoreInitializer<'static> {
-        &|_settings, store_path| Ok(Box::new(SimpleOpHeadsStore::init(store_path)?))
+        &|_settings, store_path, root_op_id| {
+            Ok(Box::new(SimpleOpHeadsStore::init(store_path, root_op_id)?))
+        }
     }
 
     pub fn default_index_store_initializer() -> &'static IndexStoreInitializer<'static> {
@@ -232,12 +237,10 @@ impl ReadonlyRepo {
 
         let op_heads_path = repo_path.join("op_heads");
         fs::create_dir(&op_heads_path).context(&op_heads_path)?;
-        let op_heads_store = op_heads_store_initializer(settings, &op_heads_path)?;
+        let op_heads_store =
+            op_heads_store_initializer(settings, &op_heads_path, op_store.root_operation_id())?;
         let op_heads_type_path = op_heads_path.join("type");
         fs::write(&op_heads_type_path, op_heads_store.name()).context(&op_heads_type_path)?;
-        op_heads_store
-            .update_op_heads(&[], op_store.root_operation_id())
-            .await?;
         let op_heads_store: Arc<dyn OpHeadsStore> = Arc::from(op_heads_store);
 
         let index_path = repo_path.join("index");
@@ -385,8 +388,11 @@ pub type BackendInitializer<'a> =
 pub type OpStoreInitializer<'a> =
     dyn Fn(&UserSettings, &Path, RootOperationData) -> Result<Box<dyn OpStore>, BackendInitError>
     + 'a;
-pub type OpHeadsStoreInitializer<'a> =
-    dyn Fn(&UserSettings, &Path) -> Result<Box<dyn OpHeadsStore>, BackendInitError> + 'a;
+#[rustfmt::skip] // auto-formatted line would exceed the maximum width
+pub type OpHeadsStoreInitializer<'a> = 
+    dyn Fn(&UserSettings, &Path, &OperationId)
+    -> Result<Box<dyn OpHeadsStore>, BackendInitError>
+    + 'a;
 pub type IndexStoreInitializer<'a> =
     dyn Fn(&UserSettings, &Path) -> Result<Box<dyn IndexStore>, BackendInitError> + 'a;
 pub type SubmoduleStoreInitializer<'a> =
@@ -652,8 +658,6 @@ pub enum RepoLoaderError {
     Index(#[from] IndexError),
     #[error(transparent)]
     IndexStore(#[from] IndexStoreError),
-    #[error(transparent)]
-    OpHeadResolution(#[from] OpHeadResolutionError),
     #[error(transparent)]
     OpHeadsStoreError(#[from] OpHeadsStoreError),
     #[error(transparent)]
@@ -1141,6 +1145,7 @@ impl MutableRepo {
     ) -> BackendResult<()> {
         self.update_all_references(options).await?;
         self.update_heads()
+            .await
             .map_err(|err| err.into_backend_error())?;
         Ok(())
     }
@@ -1237,7 +1242,7 @@ impl MutableRepo {
         Ok(())
     }
 
-    fn update_heads(&mut self) -> Result<(), RevsetEvaluationError> {
+    async fn update_heads(&mut self) -> Result<(), RevsetEvaluationError> {
         let old_commits_expression =
             RevsetExpression::commits(self.parent_mapping.keys().cloned().collect())
                 .intersection(&RevsetExpression::visible_heads().ancestors());
@@ -1246,8 +1251,9 @@ impl MutableRepo {
             .minus(&old_commits_expression);
         let heads_to_add: Vec<_> = heads_to_add_expression
             .evaluate(self)?
-            .iter()
-            .try_collect()?;
+            .stream()
+            .try_collect()
+            .await?;
 
         let mut view = self.view().store_view().clone();
         for commit_id in self.parent_mapping.keys() {
@@ -1260,7 +1266,10 @@ impl MutableRepo {
 
     /// Find descendants of `root`, unless they've already been rewritten
     /// (according to `parent_mapping`).
-    pub fn find_descendants_for_rebase(&self, roots: Vec<CommitId>) -> BackendResult<Vec<Commit>> {
+    pub async fn find_descendants_for_rebase(
+        &self,
+        roots: Vec<CommitId>,
+    ) -> BackendResult<Vec<Commit>> {
         let to_visit_revset = RevsetExpression::commits(roots)
             .descendants()
             .minus(&RevsetExpression::commits(
@@ -1269,16 +1278,17 @@ impl MutableRepo {
             .evaluate(self)
             .map_err(|err| err.into_backend_error())?;
         let to_visit = to_visit_revset
-            .iter()
+            .stream()
             .commits(self.store())
             .try_collect()
+            .await
             .map_err(|err| err.into_backend_error())?;
         Ok(to_visit)
     }
 
     /// Order a set of commits in an order they should be rebased in. The result
     /// is in reverse order so the next value can be removed from the end.
-    fn order_commits_for_rebase(
+    async fn order_commits_for_rebase(
         &self,
         to_visit: Vec<Commit>,
         new_parents_map: &HashMap<CommitId, Vec<CommitId>>,
@@ -1289,17 +1299,17 @@ impl MutableRepo {
         // Calculate an order where we rebase parents first, but if the parents were
         // rewritten, make sure we rebase the rewritten parent first.
         let store = self.store();
-        dag_walk::topo_order_reverse_ok(
+        dag_walk_async::topo_order_reverse(
             to_visit.into_iter().map(Ok),
             |commit| commit.id().clone(),
-            |commit| -> Vec<BackendResult<Commit>> {
+            async |commit| -> Vec<BackendResult<Commit>> {
                 visited.insert(commit.id().clone());
                 let mut dependents = vec![];
                 let parent_ids = new_parents_map
                     .get(commit.id())
                     .map_or(commit.parent_ids(), |parent_ids| parent_ids);
                 for parent_id in parent_ids {
-                    let parent = store.get_commit(parent_id);
+                    let parent = store.get_commit_async(parent_id).await;
                     let Ok(parent) = parent else {
                         dependents.push(parent);
                         continue;
@@ -1307,7 +1317,7 @@ impl MutableRepo {
                     if let Some(rewrite) = self.parent_mapping.get(parent.id()) {
                         for target in rewrite.new_parent_ids() {
                             if to_visit_set.contains(target) && !visited.contains(target) {
-                                dependents.push(store.get_commit(target));
+                                dependents.push(store.get_commit_async(target).await);
                             }
                         }
                     }
@@ -1319,6 +1329,7 @@ impl MutableRepo {
             },
             |_| panic!("graph has cycle"),
         )
+        .await
     }
 
     /// Rewrite descendants of the given roots.
@@ -1356,7 +1367,7 @@ impl MutableRepo {
         options: &RewriteRefsOptions,
         callback: impl AsyncFnMut(CommitRewriter) -> BackendResult<()>,
     ) -> BackendResult<()> {
-        let descendants = self.find_descendants_for_rebase(roots)?;
+        let descendants = self.find_descendants_for_rebase(roots).await?;
         self.transform_commits(descendants, new_parents_map, options, callback)
             .await
     }
@@ -1375,7 +1386,9 @@ impl MutableRepo {
         options: &RewriteRefsOptions,
         mut callback: impl AsyncFnMut(CommitRewriter) -> BackendResult<()>,
     ) -> BackendResult<()> {
-        let mut to_visit = self.order_commits_for_rebase(commits, new_parents_map)?;
+        let mut to_visit = self
+            .order_commits_for_rebase(commits, new_parents_map)
+            .await?;
         while let Some(old_commit) = to_visit.pop() {
             let parent_ids = new_parents_map
                 .get(old_commit.id())
@@ -1656,36 +1669,7 @@ impl MutableRepo {
                 }
             }
             _ => {
-                let missing_commits = dag_walk::topo_order_reverse_ord_ok(
-                    heads
-                        .iter()
-                        .cloned()
-                        .map(CommitByCommitterTimestamp)
-                        .map(Ok),
-                    |CommitByCommitterTimestamp(commit)| commit.id().clone(),
-                    |CommitByCommitterTimestamp(commit)| {
-                        commit
-                            .parent_ids()
-                            .iter()
-                            .filter_map(|id| match self.index().has_id(id) {
-                                Ok(false) => Some(
-                                    self.store().get_commit(id).map(CommitByCommitterTimestamp),
-                                ),
-                                Ok(true) => None,
-                                // TODO: indexing error shouldn't be a "BackendError"
-                                Err(err) => Some(Err(BackendError::Other(err.into()))),
-                            })
-                            .collect_vec()
-                    },
-                    |_| panic!("graph has cycle"),
-                )?;
-                for CommitByCommitterTimestamp(missing_commit) in missing_commits.iter().rev() {
-                    self.index
-                        .add_commit(missing_commit)
-                        .await
-                        // TODO: indexing error shouldn't be a "BackendError"
-                        .map_err(|err| BackendError::Other(err.into()))?;
-                }
+                self.index_commits(heads).await?;
                 for head in heads {
                     self.view.get_mut().add_head(head.id());
                 }
@@ -1698,6 +1682,52 @@ impl MutableRepo {
     pub fn remove_head(&mut self, head: &CommitId) {
         self.view_mut().remove_head(head);
         self.view.mark_dirty();
+    }
+
+    /// Adds the given `heads` and ancestor commits to the index without making
+    /// them visible. Returns newly-indexed commits.
+    pub async fn index_commits(&mut self, heads: &[Commit]) -> BackendResult<Vec<Commit>> {
+        let missing_commits = dag_walk_async::topo_order_reverse_ord(
+            heads
+                .iter()
+                .filter_map(|commit| match self.index().has_id(commit.id()) {
+                    Ok(false) => Some(Ok(CommitByCommitterTimestamp(commit.clone()))),
+                    Ok(true) => None,
+                    // TODO: indexing error shouldn't be a "BackendError"
+                    Err(err) => Some(Err(BackendError::Other(err.into()))),
+                }),
+            |CommitByCommitterTimestamp(commit)| commit.id().clone(),
+            async |CommitByCommitterTimestamp(commit)| {
+                stream::iter(commit.parent_ids())
+                    .filter_map(async |id| match self.index().has_id(id) {
+                        Ok(false) => Some(
+                            self.store()
+                                .get_commit_async(id)
+                                .await
+                                .map(CommitByCommitterTimestamp),
+                        ),
+                        Ok(true) => None,
+                        // TODO: indexing error shouldn't be a "BackendError"
+                        Err(err) => Some(Err(BackendError::Other(err.into()))),
+                    })
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            |_| panic!("graph has cycle"),
+        )
+        .await?;
+        for CommitByCommitterTimestamp(missing_commit) in missing_commits.iter().rev() {
+            self.index
+                .add_commit(missing_commit)
+                .await
+                // TODO: indexing error shouldn't be a "BackendError"
+                .map_err(|err| BackendError::Other(err.into()))?;
+        }
+        let indexed_commits = missing_commits
+            .into_iter()
+            .map(|CommitByCommitterTimestamp(commit)| commit)
+            .collect();
+        Ok(indexed_commits)
     }
 
     pub fn get_local_bookmark(&self, name: &RefName) -> RefTarget {
@@ -1958,15 +1988,20 @@ impl MutableRepo {
         new_heads: &[CommitId],
     ) -> BackendResult<()> {
         let mut removed_changes: HashMap<ChangeId, Vec<CommitId>> = HashMap::new();
-        for item in revset::walk_revs(self, old_heads, new_heads)
-            .map_err(|err| err.into_backend_error())?
-            .commit_change_ids()
         {
-            let (commit_id, change_id) = item.map_err(|err| err.into_backend_error())?;
-            removed_changes
-                .entry(change_id)
-                .or_default()
-                .push(commit_id);
+            let mut stream = revset::walk_revs(self, old_heads, new_heads)
+                .map_err(|err| err.into_backend_error())?
+                .commit_change_ids();
+            while let Some((commit_id, change_id)) = stream
+                .try_next()
+                .await
+                .map_err(|err| err.into_backend_error())?
+            {
+                removed_changes
+                    .entry(change_id)
+                    .or_default()
+                    .push(commit_id);
+            }
         }
         if removed_changes.is_empty() {
             return Ok(());
@@ -1974,20 +2009,25 @@ impl MutableRepo {
 
         let mut rewritten_changes = HashSet::new();
         let mut rewritten_commits: HashMap<CommitId, Vec<CommitId>> = HashMap::new();
-        for item in revset::walk_revs(self, new_heads, old_heads)
-            .map_err(|err| err.into_backend_error())?
-            .commit_change_ids()
         {
-            let (commit_id, change_id) = item.map_err(|err| err.into_backend_error())?;
-            if let Some(old_commits) = removed_changes.get(&change_id) {
-                for old_commit in old_commits {
-                    rewritten_commits
-                        .entry(old_commit.clone())
-                        .or_default()
-                        .push(commit_id.clone());
+            let mut stream = revset::walk_revs(self, new_heads, old_heads)
+                .map_err(|err| err.into_backend_error())?
+                .commit_change_ids();
+            while let Some((commit_id, change_id)) = stream
+                .try_next()
+                .await
+                .map_err(|err| err.into_backend_error())?
+            {
+                if let Some(old_commits) = removed_changes.get(&change_id) {
+                    for old_commit in old_commits {
+                        rewritten_commits
+                            .entry(old_commit.clone())
+                            .or_default()
+                            .push(commit_id.clone());
+                    }
                 }
+                rewritten_changes.insert(change_id);
             }
-            rewritten_changes.insert(change_id);
         }
         for (old_commit, new_commits) in rewritten_commits {
             if new_commits.len() == 1 {

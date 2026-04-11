@@ -60,8 +60,10 @@ pub(crate) async fn cmd_file_list(
     command: &CommandHelper,
     args: &FileListArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui)?;
-    let commit = workspace_command.resolve_single_rev(ui, &args.revision)?;
+    let workspace_command = command.workspace_helper(ui).await?;
+    let commit = workspace_command
+        .resolve_single_rev(ui, &args.revision)
+        .await?;
     let tree = commit.tree();
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();

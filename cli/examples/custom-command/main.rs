@@ -40,8 +40,10 @@ async fn run_custom_command(
 ) -> Result<(), CommandError> {
     match command {
         CustomCommand::Frobnicate(args) => {
-            let mut workspace_command = command_helper.workspace_helper(ui)?;
-            let commit = workspace_command.resolve_single_rev(ui, &args.revision)?;
+            let mut workspace_command = command_helper.workspace_helper(ui).await?;
+            let commit = workspace_command
+                .resolve_single_rev(ui, &args.revision)
+                .await?;
             let mut tx = workspace_command.start_transaction();
             let new_commit = tx
                 .repo_mut()
@@ -49,7 +51,7 @@ async fn run_custom_command(
                 .set_description("Frobnicated!")
                 .write()
                 .await?;
-            tx.finish(ui, "frobnicate")?;
+            tx.finish(ui, "frobnicate").await?;
             writeln!(
                 ui.status(),
                 "Frobnicated revision: {}",

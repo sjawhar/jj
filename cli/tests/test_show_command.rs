@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use regex::Regex;
+use testutils::TestResult;
 
 use crate::common::TestEnvironment;
 
@@ -51,15 +52,26 @@ fn test_show() {
     // Specify both positional and -r args
     let output = work_dir.run_jj(["show", "@", "-r@-"]);
     insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    error: the argument '[REVSET]' cannot be used with '-r <REVSET>'
+    Commit ID: e8849ae12c709f2321908879bc724fdb2ab8a781
+    Change ID: qpvuntsmwlqtpsluzzsnyyzlmlwvmlnu
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:07)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:07)
 
-    Usage: jj show <REVSET>
+        (no description set)
 
-    For more information, try '--help'.
+    Commit ID: 0000000000000000000000000000000000000000
+    Change ID: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+    Author   : (no name set) <(no email set)> (1970-01-01 11:00:00)
+    Committer: (no name set) <(no email set)> (1970-01-01 11:00:00)
+
+        (no description set)
+
     [EOF]
-    [exit status: 2]
     ");
+
+    // Specify empty revisions
+    let output = work_dir.run_jj(["show", "none()"]);
+    insta::assert_snapshot!(output, @"");
 }
 
 #[test]
@@ -365,7 +377,7 @@ fn test_show_with_no_template() {
 }
 
 #[test]
-fn test_show_relative_timestamps() {
+fn test_show_relative_timestamps() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
@@ -378,7 +390,7 @@ fn test_show_relative_timestamps() {
     );
 
     let output = work_dir.run_jj(["show"]);
-    let timestamp_re = Regex::new(r"\([0-9]+ years ago\)").unwrap();
+    let timestamp_re = Regex::new(r"\([0-9]+ years ago\)")?;
     let output = output.normalize_stdout_with(|s| {
         s.split_inclusive('\n')
             .skip(2)
@@ -392,6 +404,168 @@ fn test_show_relative_timestamps() {
 
         (no description set)
 
+    [EOF]
+    ");
+    Ok(())
+}
+
+#[test]
+fn test_show_multiple_revisions() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("file1", "a");
+    work_dir.run_jj(["commit", "-m", "add file1"]).success();
+
+    work_dir.write_file("file2", "b");
+    work_dir.run_jj(["commit", "-m", "add file2"]).success();
+
+    work_dir.write_file("file1", "c");
+    work_dir
+        .run_jj(["describe", "-m", "modify file1"])
+        .success();
+
+    let output = work_dir.run_jj(["show", "root()..@"]);
+    let output = output.normalize_stdout_with(|s| {
+        s.split_inclusive('\n')
+            .filter(|line| !line.starts_with("Change ID") && !line.starts_with("Commit ID"))
+            .collect()
+    });
+
+    insta::assert_snapshot!(output, @"
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:10)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:10)
+
+        modify file1
+
+    Modified regular file file1:
+       1    1: ac
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:09)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:09)
+
+        add file2
+
+    Added regular file file2:
+            1: b
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:08)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:08)
+
+        add file1
+
+    Added regular file file1:
+            1: a
+    [EOF]
+    ");
+
+    // Specify revision with -r
+    let output = work_dir.run_jj(["show", "-r", "root()..@"]);
+    let output = output.normalize_stdout_with(|s| {
+        s.split_inclusive('\n')
+            .filter(|line| !line.starts_with("Change ID") && !line.starts_with("Commit ID"))
+            .collect()
+    });
+
+    insta::assert_snapshot!(output, @"
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:10)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:10)
+
+        modify file1
+
+    Modified regular file file1:
+       1    1: ac
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:09)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:09)
+
+        add file2
+
+    Added regular file file2:
+            1: b
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:08)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:08)
+
+        add file1
+
+    Added regular file file1:
+            1: a
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["show", "--no-patch", "root()..@"]);
+    let output = output.normalize_stdout_with(|s| {
+        s.split_inclusive('\n')
+            .filter(|line| !line.starts_with("Change ID") && !line.starts_with("Commit ID"))
+            .collect()
+    });
+
+    insta::assert_snapshot!(output, @"
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:10)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:10)
+
+        modify file1
+
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:09)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:09)
+
+        add file2
+
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:08)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:08)
+
+        add file1
+
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["show", "--git", "root()..@"]);
+    let output = output.normalize_stdout_with(|s| {
+        s.split_inclusive('\n')
+            .filter(|line| {
+                !line.starts_with("Change ID")
+                    && !line.starts_with("Commit ID")
+                    && !line.starts_with("index")
+            })
+            .collect()
+    });
+
+    insta::assert_snapshot!(output, @"
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:10)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:10)
+
+        modify file1
+
+    diff --git a/file1 b/file1
+    --- a/file1
+    +++ b/file1
+    @@ -1,1 +1,1 @@
+    -a
+    \\ No newline at end of file
+    +c
+    \\ No newline at end of file
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:09)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:09)
+
+        add file2
+
+    diff --git a/file2 b/file2
+    new file mode 100644
+    --- /dev/null
+    +++ b/file2
+    @@ -0,0 +1,1 @@
+    +b
+    \\ No newline at end of file
+    Author   : Test User <test.user@example.com> (2001-02-03 08:05:08)
+    Committer: Test User <test.user@example.com> (2001-02-03 08:05:08)
+
+        add file1
+
+    diff --git a/file1 b/file1
+    new file mode 100644
+    --- /dev/null
+    +++ b/file1
+    @@ -0,0 +1,1 @@
+    +a
+    \\ No newline at end of file
     [EOF]
     ");
 }

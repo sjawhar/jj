@@ -26,6 +26,7 @@ use std::time::SystemTime;
 
 use assert_matches::assert_matches;
 use bstr::BString;
+use futures::AsyncReadExt as _;
 use gix::odb::pack::FindExt as _;
 use indoc::indoc;
 use itertools::Itertools as _;
@@ -81,7 +82,6 @@ use testutils::repo_path;
 use testutils::repo_path_buf;
 use testutils::repo_path_component;
 use testutils::write_random_commit;
-use tokio::io::AsyncReadExt as _;
 
 fn check_icase_fs(dir: &Path) -> bool {
     let test_file = tempfile::Builder::new()
@@ -384,8 +384,9 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) {
                 assert!(metadata.is_dir(), "{path:?} should be a directory");
             }
             Kind::GitSubmodule => {
-                // Not supported for now
-                assert!(maybe_metadata.is_err(), "{path:?} should not exist");
+                assert!(maybe_metadata.is_ok(), "{path:?} should exist");
+                let metadata = maybe_metadata.unwrap();
+                assert!(metadata.is_dir(), "{path:?} should be a directory");
             }
         }
     }
@@ -746,7 +747,7 @@ fn test_reset() {
     // After we reset to the commit without the file, it should still exist on disk,
     // but it should not be in the tree state, and it should not get added when we
     // commit the working copy (because it's ignored).
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws
         .locked_wc()
         .reset(&commit_without_file)
@@ -762,7 +763,7 @@ fn test_reset() {
     // Now test the opposite direction: resetting to a commit where the file is
     // tracked. The file should become tracked (even though it's ignored).
     let ws = &mut test_workspace.workspace;
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws
         .locked_wc()
         .reset(&commit_with_file)
@@ -807,7 +808,7 @@ fn test_checkout_discard() {
     assert!(wc.file_states().unwrap().contains_path(file1_path));
 
     // Start a checkout
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws
         .locked_wc()
         .check_out(&commit2)
@@ -1436,6 +1437,7 @@ fn test_snapshot_racy_timestamps() {
         let mut locked_ws = test_workspace
             .workspace
             .start_working_copy_mutation()
+            .block_on()
             .unwrap();
         let (new_tree, _stats) = locked_ws
             .locked_wc()
@@ -1469,7 +1471,7 @@ fn test_snapshot_special_file() {
     assert!(!fifo_disk_path.is_file());
 
     // Snapshot the working copy with the socket file
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     let (tree, _stats) = locked_ws
         .locked_wc()
         .snapshot(&empty_snapshot_options())
@@ -1603,6 +1605,7 @@ fn test_gitignores_in_ignored_dir() {
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     locked_ws.locked_wc().reset(&commit2).block_on().unwrap();
     locked_ws
@@ -1779,7 +1782,11 @@ fn test_git_submodule(gitignore_content: &str) {
     let store = repo.store().clone();
     let workspace_root = test_workspace.workspace.workspace_root().to_owned();
     let base_ignores = GitIgnoreFile::empty()
-        .chain("", Path::new(""), gitignore_content.as_bytes())
+        .chain(
+            RepoPath::root(),
+            Path::new(""),
+            gitignore_content.as_bytes(),
+        )
         .unwrap();
     let snapshot_options = SnapshotOptions {
         base_ignores,
@@ -1823,12 +1830,27 @@ fn test_git_submodule(gitignore_content: &str) {
     let tree_id2 = tree_builder.write_tree().block_on().unwrap();
     let commit2 = commit_with_tree(repo.store(), tree_id2.clone());
 
+    // A commit with a file instead of the submodule at the same path
+    let mut tree_builder = MergedTreeBuilder::new(store.empty_merged_tree());
+    tree_builder.set_or_remove(
+        submodule_path.to_owned(),
+        Merge::normal(TreeValue::File {
+            id: testutils::write_file(
+                repo.store(),
+                submodule_path,
+                "file with same path as submodule\n",
+            ),
+            executable: false,
+            copy_id: CopyId::new(vec![]),
+        }),
+    );
+    let tree_id3 = tree_builder.write_tree().block_on().unwrap();
+    let commit3_file_clash = commit_with_tree(repo.store(), tree_id3.clone());
+
     let ws = &mut test_workspace.workspace;
     ws.check_out(repo.op_id().clone(), None, &commit1)
         .block_on()
         .unwrap();
-
-    std::fs::create_dir(submodule_path.to_fs_path_unchecked(&workspace_root)).unwrap();
 
     testutils::write_working_copy_file(
         &workspace_root,
@@ -1877,7 +1899,94 @@ fn test_git_submodule(gitignore_content: &str) {
         .check_out(repo.op_id().clone(), None, &store.root_commit())
         .block_on()
         .unwrap();
-    assert_eq!(stats.skipped_files, 1);
+    assert_eq!(stats.skipped_files, 0, "Empty tree should checkout cleanly");
+
+    // Start with an empty submodule directory and check out a commit without
+    // the submodule
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit1)
+        .block_on()
+        .unwrap();
+    std::fs::remove_file(added_submodule_path.to_fs_path_unchecked(&workspace_root)).unwrap();
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &store.root_commit())
+        .block_on()
+        .unwrap();
+
+    // Check that the empty submodule directory was removed
+    let submodule_dir = submodule_path.to_fs_path_unchecked(&workspace_root);
+    assert!(
+        submodule_dir.metadata().is_err(),
+        "{submodule_dir:?} should not exist"
+    );
+
+    // Go back to a commit with the submodule
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit2)
+        .block_on()
+        .unwrap();
+
+    // Check that the empty submodule directory was created
+    let submodule_dir = submodule_path.to_fs_path_unchecked(&workspace_root);
+    assert!(
+        submodule_dir.metadata().is_ok(),
+        "{submodule_dir:?} should exist"
+    );
+    assert_eq!(stats.skipped_files, 0);
+
+    // Restore submodule contents (pretend that the user did `git submodule update`)
+    testutils::write_working_copy_file(
+        &workspace_root,
+        added_submodule_path,
+        "i am a file in a submodule\n",
+    );
+
+    // Check that the files in the submodule are not deleted after checking out
+    // a commit without the submodule
+    let ws = &mut test_workspace.workspace;
+    let stats = ws
+        .check_out(repo.op_id().clone(), None, &store.root_commit())
+        .block_on()
+        .unwrap();
+    let file_in_submodule_path = added_submodule_path.to_fs_path_unchecked(&workspace_root);
+    assert!(
+        file_in_submodule_path.metadata().is_ok(),
+        "{file_in_submodule_path:?} should exist"
+    );
+
+    // Check that checking out a submodule over an existing directory with the
+    // same path does not result in a conflict and that the submodule is still
+    // recorded as a submodule in the commit
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit2)
+        .block_on()
+        .unwrap();
+    assert_eq!(stats.skipped_files, 0);
+    let (new_tree, _stats) = test_workspace
+        .snapshot_with_options(&snapshot_options)
+        .unwrap();
+    assert_tree_eq!(new_tree, tree_id2);
+
+    // Restore submodule contents (pretend that the user did `git submodule update`)
+    testutils::write_working_copy_file(
+        &workspace_root,
+        added_submodule_path,
+        "i am a file in a submodule\n",
+    );
+
+    // Check out a commit which tries to place a file at the same path
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit3_file_clash)
+        .block_on()
+        .unwrap();
+
+    // Check that the submodule is not replaced by the file, preserving the
+    // user's existing submodule files
+    let file_in_submodule_path = added_submodule_path.to_fs_path_unchecked(&workspace_root);
+    assert!(
+        file_in_submodule_path.metadata().is_ok(),
+        "{file_in_submodule_path:?} should exist"
+    );
 }
 
 #[test]
@@ -2254,7 +2363,7 @@ fn test_check_out_reserved_file_path(file_path_str: &str) {
     assert!(!workspace_root.join("sub").join(".jj").exists());
 
     // Pretend that the checkout somehow succeeded.
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws.locked_wc().reset(&commit1).block_on().unwrap();
     locked_ws.finish(repo.op_id().clone()).block_on().unwrap();
     if ![".git", ".jj"].contains(&file_path_str) {
@@ -2313,7 +2422,7 @@ fn test_check_out_reserved_file_path_icase_fs(file_path_str: &str) {
     assert!(!workspace_root.join("sub").join(".jj").exists());
 
     // Pretend that the checkout somehow succeeded.
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws.locked_wc().reset(&commit1).block_on().unwrap();
     locked_ws.finish(repo.op_id().clone()).block_on().unwrap();
     std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
@@ -2378,7 +2487,7 @@ fn test_check_out_reserved_file_path_hfs_plus(file_path_str: &str) {
     assert!(!workspace_root.join("sub").join(".jj").exists());
 
     // Pretend that the checkout somehow succeeded.
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws.locked_wc().reset(&commit1).block_on().unwrap();
     locked_ws.finish(repo.op_id().clone()).block_on().unwrap();
     std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
@@ -2448,7 +2557,7 @@ fn test_check_out_reserved_file_path_vfat(vfat_path_str: &str, file_path_strs: &
     assert!(!workspace_root.join("sub").join(".jj").exists());
 
     // Pretend that the checkout somehow succeeded.
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws.locked_wc().reset(&commit1).block_on().unwrap();
     locked_ws.finish(repo.op_id().clone()).block_on().unwrap();
     if is_vfat {
@@ -2510,7 +2619,7 @@ fn test_check_out_reserved_file_path_dot_git_symlink(file_path_str: &str) {
     assert!(!dot_git_path.join("pwned").exists());
 
     // Pretend that the checkout somehow succeeded.
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     locked_ws.locked_wc().reset(&commit1).block_on().unwrap();
     locked_ws.finish(repo.op_id().clone()).block_on().unwrap();
     if file_path_str != ".git" {
@@ -2955,6 +3064,7 @@ fn test_snapshot_and_update_valid_symlink(get_link_target: impl FnOnce(&Path, &P
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     let root_commit = test_workspace.repo.store().root_commit();
     locked_ws
@@ -2974,6 +3084,7 @@ fn test_snapshot_and_update_valid_symlink(get_link_target: impl FnOnce(&Path, &P
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     locked_ws.locked_wc().check_out(&commit).block_on().unwrap();
     locked_ws

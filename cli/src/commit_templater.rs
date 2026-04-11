@@ -81,6 +81,10 @@ use jj_lib::signing::Verification;
 use jj_lib::store::Store;
 use jj_lib::trailer;
 use jj_lib::trailer::Trailer;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
+use jj_lib::workspace_store::SimpleWorkspaceStore;
+use jj_lib::workspace_store::WorkspaceStore as _;
 use once_cell::unsync::OnceCell;
 use pollster::FutureExt as _;
 use serde::Serialize as _;
@@ -117,7 +121,6 @@ use crate::templater::BoxedAnyProperty;
 use crate::templater::BoxedSerializeProperty;
 use crate::templater::BoxedTemplateProperty;
 use crate::templater::Literal;
-use crate::templater::PlainTextFormattedProperty;
 use crate::templater::SizeHint;
 use crate::templater::Template;
 use crate::templater::TemplateFormatter;
@@ -548,76 +551,79 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
         }
     }
 
-    fn try_into_boolean(self) -> Option<BoxedTemplateProperty<'repo, bool>> {
+    fn try_into_byte_string(self) -> Result<BoxedTemplateProperty<'repo, BString>, Self> {
         match self {
-            Self::Core(property) => property.try_into_boolean(),
-            Self::Operation(property) => property.try_into_boolean(),
-            Self::Commit(_) => None,
-            Self::CommitOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::CommitList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::CommitEvolutionEntry(_) => None,
-            Self::CommitRef(_) => None,
-            Self::CommitRefOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::CommitRefList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::WorkspaceRef(_) => None,
-            Self::WorkspaceRefOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::WorkspaceRefList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::RefSymbol(_) => None,
-            Self::RefSymbolOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::RepoPath(_) => None,
-            Self::RepoPathOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::ChangeId(_) => None,
-            Self::CommitId(_) => None,
-            Self::ShortestIdPrefix(_) => None,
+            Self::Core(property) => property.try_into_byte_string().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_byte_string().map_err(Self::Operation),
+            _ => Err(self),
+        }
+    }
+
+    fn try_into_string(self) -> Result<BoxedTemplateProperty<'repo, String>, Self> {
+        match self {
+            Self::Core(property) => property.try_into_string().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_string().map_err(Self::Operation),
+            Self::RefSymbol(property) => Ok(property.map(|RefSymbolBuf(s)| s).into_dyn()),
+            Self::RefSymbolOpt(property) => Ok(property
+                .map(|opt| opt.map_or_else(String::new, |RefSymbolBuf(s)| s))
+                .into_dyn()),
+            _ => Err(self),
+        }
+    }
+
+    fn try_into_boolean(self) -> Result<BoxedTemplateProperty<'repo, bool>, Self> {
+        match self {
+            Self::Core(property) => property.try_into_boolean().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_boolean().map_err(Self::Operation),
+            Self::Commit(_) => Err(self),
+            Self::CommitOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::CommitList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::CommitEvolutionEntry(_) => Err(self),
+            Self::CommitRef(_) => Err(self),
+            Self::CommitRefOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::CommitRefList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::WorkspaceRef(_) => Err(self),
+            Self::WorkspaceRefOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::WorkspaceRefList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::RefSymbol(_) => Err(self),
+            Self::RefSymbolOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::RepoPath(_) => Err(self),
+            Self::RepoPathOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::ChangeId(_) => Err(self),
+            Self::CommitId(_) => Err(self),
+            Self::ShortestIdPrefix(_) => Err(self),
             // TODO: boolean cast could be implemented, but explicit
             // diff.empty() method might be better.
-            Self::TreeDiff(_) => None,
-            Self::TreeDiffEntry(_) => None,
-            Self::TreeDiffEntryList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::TreeEntry(_) => None,
-            Self::TreeEntryList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::DiffStats(_) => None,
-            Self::DiffStatEntry(_) => None,
-            Self::DiffStatEntryList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::TreeDiff(_) => Err(self),
+            Self::TreeDiffEntry(_) => Err(self),
+            Self::TreeDiffEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::TreeEntry(_) => Err(self),
+            Self::TreeEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::DiffStats(_) => Err(self),
+            Self::DiffStatEntry(_) => Err(self),
+            Self::DiffStatEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
             Self::CryptographicSignatureOpt(property) => {
-                Some(property.map(|sig| sig.is_some()).into_dyn())
+                Ok(property.map(|sig| sig.is_some()).into_dyn())
             }
-            Self::AnnotationLine(_) => None,
-            Self::Trailer(_) => None,
-            Self::TrailerList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::AnnotationLine(_) => Err(self),
+            Self::Trailer(_) => Err(self),
+            Self::TrailerList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
         }
     }
 
-    fn try_into_integer(self) -> Option<BoxedTemplateProperty<'repo, i64>> {
+    fn try_into_integer(self) -> Result<BoxedTemplateProperty<'repo, i64>, Self> {
         match self {
-            Self::Core(property) => property.try_into_integer(),
-            Self::Operation(property) => property.try_into_integer(),
-            _ => None,
+            Self::Core(property) => property.try_into_integer().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_integer().map_err(Self::Operation),
+            _ => Err(self),
         }
     }
 
-    fn try_into_timestamp(self) -> Option<BoxedTemplateProperty<'repo, Timestamp>> {
+    fn try_into_timestamp(self) -> Result<BoxedTemplateProperty<'repo, Timestamp>, Self> {
         match self {
-            Self::Core(property) => property.try_into_timestamp(),
-            Self::Operation(property) => property.try_into_timestamp(),
-            _ => None,
-        }
-    }
-
-    fn try_into_stringify(self) -> Option<BoxedTemplateProperty<'repo, String>> {
-        match self {
-            Self::Core(property) => property.try_into_stringify(),
-            Self::Operation(property) => property.try_into_stringify(),
-            Self::RefSymbol(property) => Some(property.map(|RefSymbolBuf(s)| s).into_dyn()),
-            Self::RefSymbolOpt(property) => Some(
-                property
-                    .map(|opt| opt.map_or_else(String::new, |RefSymbolBuf(s)| s))
-                    .into_dyn(),
-            ),
-            _ => {
-                let template = self.try_into_template()?;
-                Some(PlainTextFormattedProperty::new(template).into_dyn())
-            }
+            Self::Core(property) => property.try_into_timestamp().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_timestamp().map_err(Self::Operation),
+            _ => Err(self),
         }
     }
 
@@ -1497,7 +1503,7 @@ fn builtin_commit_evolution_entry_methods<'repo>()
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.and_then(|entry| {
-                let commits: Vec<_> = entry.predecessors().try_collect()?;
+                let commits = entry.predecessors().block_on()?;
                 Ok(commits)
             });
             Ok(out_property.into_dyn_wrapped())
@@ -1515,7 +1521,7 @@ fn builtin_commit_evolution_entry_methods<'repo>()
             let repo = language.repo;
             let matcher: Rc<dyn Matcher> = files.to_matcher().into();
             let out_property = self_property.and_then(move |entry| {
-                let predecessors: Vec<_> = entry.predecessors().try_collect()?;
+                let predecessors = entry.predecessors().block_on()?;
                 let from_tree =
                     rebase_to_dest_parent(repo, &predecessors, &entry.commit).block_on()?;
                 let to_tree = entry.commit.tree();
@@ -1772,6 +1778,42 @@ impl WorkspaceRef {
     pub fn target(&self) -> &Commit {
         &self.target
     }
+
+    /// Returns the root path of the workspace.
+    fn root(&self, path_converter: &RepoPathUiConverter) -> Result<String, TemplatePropertyError> {
+        let RepoPathUiConverter::Fs { cwd: _, base } = path_converter;
+        // TODO: Stop reconstructing the workspace loader here once we've
+        // decided which object should own the workspace store.
+        let workspace_loader = DefaultWorkspaceLoaderFactory.create(base)?;
+        let repo_path = workspace_loader.repo_path().to_owned();
+        let workspace_store = SimpleWorkspaceStore::load(&repo_path)?;
+        let workspace_path = workspace_store
+            .get_workspace_path(self.name())?
+            .ok_or_else(|| {
+                TemplatePropertyError(
+                    format!(
+                        "Workspace has no recorded path: {}",
+                        self.name().as_symbol()
+                    )
+                    .into(),
+                )
+            })?;
+        let full_path = repo_path.join(workspace_path);
+        let path = dunce::canonicalize(&full_path).map_err(|err| {
+            TemplatePropertyError(
+                format!(
+                    "Failed to resolve workspace root: {}: {}: {err}",
+                    self.name().as_symbol(),
+                    full_path.display()
+                )
+                .into(),
+            )
+        })?;
+        // TODO: Return PathBuf once the templater has a filesystem path type.
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| TemplatePropertyError("Invalid UTF-8 sequence in path".into()))
+    }
 }
 
 impl Template for WorkspaceRef {
@@ -1801,6 +1843,15 @@ fn builtin_workspace_ref_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'rep
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.map(|ws_ref| ws_ref.target);
+            Ok(out_property.into_dyn_wrapped())
+        },
+    );
+    map.insert(
+        "root",
+        |language, _diagnostics, _build_ctx, self_property, function| {
+            function.expect_no_arguments()?;
+            let path_converter = language.path_converter;
+            let out_property = self_property.and_then(move |ws_ref| ws_ref.root(path_converter));
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -2293,8 +2344,8 @@ impl TreeDiff {
         let mut copy_records = CopyRecords::default();
         for parent in commit.parent_ids() {
             let records =
-                diff_util::get_copy_records(repo.store(), parent, commit.id(), &*matcher)?;
-            copy_records.add_records(records)?;
+                diff_util::get_copy_records(repo.store(), parent, commit.id(), &*matcher).await?;
+            copy_records.add_records(records);
         }
         Ok(Self {
             from_tree: commit.parent_tree(repo).await?,
@@ -2894,7 +2945,6 @@ pub struct AnnotationLine {
 
 fn builtin_annotation_line_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, AnnotationLine>
 {
-    type P<'repo> = CommitTemplatePropertyKind<'repo>;
     let mut map = CommitTemplateBuildMethodFnMap::<AnnotationLine>::new();
     map.insert(
         "commit",
@@ -2909,8 +2959,7 @@ fn builtin_annotation_line_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'r
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.map(|line| line.content);
-            // TODO: Add Bytes or BString template type?
-            Ok(P::wrap_template(out_property.into_template()))
+            Ok(out_property.into_dyn_wrapped())
         },
     );
     map.insert(
@@ -3116,14 +3165,13 @@ mod tests {
             )
         }
 
-        fn render_ok<'a, C>(&'a self, text: &str, context: &C) -> String
+        fn render_ok<'a, C>(&'a self, text: &str, context: &C) -> BString
         where
             C: Clone + 'a,
             CommitTemplatePropertyKind<'a>: WrapTemplateProperty<'a, C>,
         {
             let template = self.parse(text).unwrap();
-            let output = template.format_plain_text(context);
-            String::from_utf8(output).unwrap()
+            template.format_plain_text(context).into()
         }
     }
 

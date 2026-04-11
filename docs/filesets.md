@@ -89,7 +89,7 @@ You can also specify patterns by using functions.
 ## Aliases
 
 New symbols, functions, and `<name>:<value>` patterns can be defined in the
-config file, by using any combination of the predefined symbols/functions and
+config file, by using any combination of the predefined symbols / functions and
 other aliases.
 
 Alias functions can be overloaded by the number of parameters. However, builtin
@@ -99,8 +99,29 @@ For example:
 
 ```toml
 [fileset-aliases]
-'LOCK' = '**/Cargo.lock | **/package-lock.json | **/uv.lock'
+LOCK = '**/Cargo.lock | **/package-lock.json | **/uv.lock'
 'not:x' = '~x'
+```
+
+### Alias descriptions
+
+Alias descriptions can be surfaced in shell completions by defining the alias
+as a table with `.doc` and `.definition` properties. For example:
+
+```toml
+[fileset-aliases]
+LOCK = {
+    definition = '**/Cargo.lock | **/package-lock.json | **/uv.lock',
+    doc = 'Lockfiles'
+}
+```
+
+You can also use the dotted key syntax:
+
+```toml
+[fileset-aliases]
+LOCK.definition = '**/Cargo.lock | **/package-lock.json | **/uv.lock'
+LOCK.doc = 'Lockfiles'
 ```
 
 ## Examples

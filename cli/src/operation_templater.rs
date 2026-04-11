@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 
+use bstr::BString;
 use itertools::Itertools as _;
 use jj_lib::backend::Timestamp;
 use jj_lib::extensions_map::ExtensionsMap;
@@ -27,6 +28,7 @@ use jj_lib::op_store::OperationId;
 use jj_lib::operation::Operation;
 use jj_lib::repo::RepoLoader;
 use jj_lib::settings::UserSettings;
+use pollster::FutureExt as _;
 
 use crate::template_builder;
 use crate::template_builder::BuildContext;
@@ -39,11 +41,11 @@ use crate::template_builder::merge_fn_map;
 use crate::template_parser;
 use crate::template_parser::FunctionCallNode;
 use crate::template_parser::TemplateDiagnostics;
+use crate::template_parser::TemplateParseError;
 use crate::template_parser::TemplateParseResult;
 use crate::templater::BoxedAnyProperty;
 use crate::templater::BoxedSerializeProperty;
 use crate::templater::BoxedTemplateProperty;
-use crate::templater::PlainTextFormattedProperty;
 use crate::templater::Template;
 use crate::templater::TemplateFormatter;
 use crate::templater::TemplatePropertyExt as _;
@@ -197,26 +199,29 @@ impl<'a> OperationTemplatePropertyKind<'a> {
         }
     }
 
-    pub fn try_into_boolean(self) -> Option<BoxedTemplateProperty<'a, bool>> {
+    pub fn try_into_byte_string(self) -> Result<BoxedTemplateProperty<'a, BString>, Self> {
+        Err(self)
+    }
+
+    pub fn try_into_string(self) -> Result<BoxedTemplateProperty<'a, String>, Self> {
+        Err(self)
+    }
+
+    pub fn try_into_boolean(self) -> Result<BoxedTemplateProperty<'a, bool>, Self> {
         match self {
-            Self::Operation(_) => None,
-            Self::OperationOpt(property) => Some(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::OperationList(property) => Some(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::OperationId(_) => None,
+            Self::Operation(_) => Err(self),
+            Self::OperationOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::OperationList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::OperationId(_) => Err(self),
         }
     }
 
-    pub fn try_into_integer(self) -> Option<BoxedTemplateProperty<'a, i64>> {
-        None
+    pub fn try_into_integer(self) -> Result<BoxedTemplateProperty<'a, i64>, Self> {
+        Err(self)
     }
 
-    pub fn try_into_timestamp(self) -> Option<BoxedTemplateProperty<'a, Timestamp>> {
-        None
-    }
-
-    pub fn try_into_stringify(self) -> Option<BoxedTemplateProperty<'a, String>> {
-        let template = self.try_into_template()?;
-        Some(PlainTextFormattedProperty::new(template).into_dyn())
+    pub fn try_into_timestamp(self) -> Result<BoxedTemplateProperty<'a, Timestamp>, Self> {
+        Err(self)
     }
 
     pub fn try_into_serialize(self) -> Option<BoxedSerializeProperty<'a>> {
@@ -309,33 +314,38 @@ impl CoreTemplatePropertyVar<'static> for OperationTemplateLanguagePropertyKind 
         }
     }
 
-    fn try_into_boolean(self) -> Option<BoxedTemplateProperty<'static, bool>> {
+    fn try_into_byte_string(self) -> Result<BoxedTemplateProperty<'static, BString>, Self> {
         match self {
-            Self::Core(property) => property.try_into_boolean(),
-            Self::Operation(property) => property.try_into_boolean(),
+            Self::Core(property) => property.try_into_byte_string().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_byte_string().map_err(Self::Operation),
         }
     }
 
-    fn try_into_integer(self) -> Option<BoxedTemplateProperty<'static, i64>> {
+    fn try_into_string(self) -> Result<BoxedTemplateProperty<'static, String>, Self> {
         match self {
-            Self::Core(property) => property.try_into_integer(),
-            Self::Operation(property) => property.try_into_integer(),
+            Self::Core(property) => property.try_into_string().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_string().map_err(Self::Operation),
         }
     }
 
-    fn try_into_timestamp(
-        self,
-    ) -> Option<BoxedTemplateProperty<'static, jj_lib::backend::Timestamp>> {
+    fn try_into_boolean(self) -> Result<BoxedTemplateProperty<'static, bool>, Self> {
         match self {
-            Self::Core(property) => property.try_into_timestamp(),
-            Self::Operation(property) => property.try_into_timestamp(),
+            Self::Core(property) => property.try_into_boolean().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_boolean().map_err(Self::Operation),
         }
     }
 
-    fn try_into_stringify(self) -> Option<BoxedTemplateProperty<'static, String>> {
+    fn try_into_integer(self) -> Result<BoxedTemplateProperty<'static, i64>, Self> {
         match self {
-            Self::Core(property) => property.try_into_stringify(),
-            Self::Operation(property) => property.try_into_stringify(),
+            Self::Core(property) => property.try_into_integer().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_integer().map_err(Self::Operation),
+        }
+    }
+
+    fn try_into_timestamp(self) -> Result<BoxedTemplateProperty<'static, Timestamp>, Self> {
+        match self {
+            Self::Core(property) => property.try_into_timestamp().map_err(Self::Core),
+            Self::Operation(property) => property.try_into_timestamp().map_err(Self::Operation),
         }
     }
 
@@ -521,13 +531,33 @@ where
         },
     );
     map.insert(
-        "tags",
+        "attributes",
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.map(|op| {
                 // TODO: introduce map type
                 op.metadata()
-                    .tags
+                    .attributes
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}"))
+                    .join("\n")
+            });
+            Ok(out_property.into_dyn_wrapped())
+        },
+    );
+    // TODO: Remove in jj 0.47+
+    map.insert(
+        "tags",
+        |_language, diagnostics, _build_ctx, self_property, function| {
+            diagnostics.add_warning(TemplateParseError::expression(
+                "operation.tags() is deprecated; use .attributes() instead",
+                function.name_span,
+            ));
+            function.expect_no_arguments()?;
+            let out_property = self_property.map(|op| {
+                // TODO: introduce map type
+                op.metadata()
+                    .attributes
                     .iter()
                     .map(|(key, value)| format!("{key}: {value}"))
                     .join("\n")
@@ -540,6 +570,20 @@ where
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.map(|op| op.metadata().is_snapshot);
+            Ok(out_property.into_dyn_wrapped())
+        },
+    );
+    map.insert(
+        "workspace_name",
+        |_language, _diagnostics, _build_ctx, self_property, function| {
+            function.expect_no_arguments()?;
+            let out_property = self_property.map(|op| {
+                op.metadata()
+                    .workspace_name
+                    .as_ref()
+                    .map(|name| format!("{}@", name.as_symbol()))
+                    .unwrap_or_default()
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -577,7 +621,7 @@ where
         |_language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let out_property = self_property.and_then(|op| {
-                let ops: Vec<_> = op.parents().try_collect()?;
+                let ops = op.parents().block_on()?;
                 Ok(ops)
             });
             Ok(out_property.into_dyn_wrapped())

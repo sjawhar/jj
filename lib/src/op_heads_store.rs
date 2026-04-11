@@ -24,7 +24,7 @@ use futures::future::try_join_all;
 use itertools::Itertools as _;
 use thiserror::Error;
 
-use crate::dag_walk;
+use crate::dag_walk_async;
 use crate::op_store::OpStore;
 use crate::op_store::OpStoreError;
 use crate::op_store::OperationId;
@@ -43,12 +43,6 @@ pub enum OpHeadsStoreError {
     Lock(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-#[derive(Debug, Error)]
-pub enum OpHeadResolutionError {
-    #[error("Operation log has no heads")]
-    NoHeads,
-}
-
 pub trait OpHeadsStoreLock {}
 
 /// Manages the set of current heads of the operation log.
@@ -65,6 +59,8 @@ pub trait OpHeadsStore: Any + Send + Sync + Debug {
         new_id: &OperationId,
     ) -> Result<(), OpHeadsStoreError>;
 
+    /// Return the current op heads. The returned list must not be empty; it
+    /// must contain the root operation if there are no later op heads.
     async fn get_op_heads(&self) -> Result<Vec<OperationId>, OpHeadsStoreError>;
 
     /// Optionally takes a lock on the op heads store. The purpose of the lock
@@ -91,7 +87,7 @@ pub async fn resolve_op_heads<E>(
     resolver: impl AsyncFnOnce(Vec<Operation>) -> Result<Operation, E>,
 ) -> Result<Operation, E>
 where
-    E: From<OpHeadResolutionError> + From<OpHeadsStoreError> + From<OpStoreError>,
+    E: From<OpHeadsStoreError> + From<OpStoreError>,
 {
     // This can be empty if the OpHeadsStore doesn't support atomic updates.
     // For example, all entries ahead of a readdir() pointer could be deleted by
@@ -114,10 +110,7 @@ where
     // work (and producing another set of divergent heads).
     let _lock = op_heads_store.lock().await?;
     let op_head_ids = op_heads_store.get_op_heads().await?;
-
-    if op_head_ids.is_empty() {
-        return Err(OpHeadResolutionError::NoHeads.into());
-    }
+    assert!(!op_head_ids.is_empty());
 
     if op_head_ids.len() == 1 {
         let op_head_id = op_head_ids[0].clone();
@@ -135,11 +128,12 @@ where
     // Remove ancestors so we don't create merge operation with an operation and its
     // ancestor
     let op_head_ids_before: HashSet<_> = op_heads.iter().map(|op| op.id().clone()).collect();
-    let filtered_op_heads = dag_walk::heads_ok(
-        op_heads.into_iter().map(Ok),
+    let filtered_op_heads = dag_walk_async::heads(
+        op_heads,
         |op: &Operation| op.id().clone(),
-        |op: &Operation| op.parents().collect_vec(),
-    )?;
+        async |op: &Operation| op.parents().await,
+    )
+    .await?;
     let op_head_ids_after: HashSet<_> =
         filtered_op_heads.iter().map(|op| op.id().clone()).collect();
     let ancestor_op_heads = op_head_ids_before

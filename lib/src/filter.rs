@@ -16,7 +16,6 @@
 //! working copy, similar to the filter gitattributes feature.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,9 +30,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bstr::BString;
 use bstr::ByteSlice as _;
+use futures::AsyncRead;
+use futures::AsyncReadExt as _;
+use futures::io::Cursor;
 use itertools::Itertools as _;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt as _;
 
 use crate::command_config::CommandNameAndArgs;
 use crate::config::ConfigGetError;

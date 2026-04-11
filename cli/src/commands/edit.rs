@@ -50,20 +50,25 @@ pub(crate) async fn cmd_edit(
     command: &CommandHelper,
     args: &EditArgs,
 ) -> Result<(), CommandError> {
-    let mut workspace_command = command.workspace_helper(ui)?;
+    let mut workspace_command = command.workspace_helper(ui).await?;
     let revision_arg = args
         .revision_pos
         .as_ref()
         .or(args.revision_opt.as_ref())
         .expect("either positional or -r arg should be provided");
-    let new_commit = workspace_command.resolve_single_rev(ui, revision_arg)?;
-    workspace_command.check_rewritable([new_commit.id()])?;
+    let new_commit = workspace_command
+        .resolve_single_rev(ui, revision_arg)
+        .await?;
+    workspace_command
+        .check_rewritable([new_commit.id()])
+        .await?;
     if workspace_command.get_wc_commit_id() == Some(new_commit.id()) {
         writeln!(ui.status(), "Already editing that commit")?;
     } else {
         let mut tx = workspace_command.start_transaction();
         tx.edit(&new_commit)?;
-        tx.finish(ui, format!("edit commit {}", new_commit.id().hex()))?;
+        tx.finish(ui, format!("edit commit {}", new_commit.id().hex()))
+            .await?;
     }
     Ok(())
 }

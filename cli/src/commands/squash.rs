@@ -17,8 +17,9 @@ use std::iter::once;
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use futures::TryStreamExt as _;
+use futures::future::try_join_all;
 use indoc::formatdoc;
-use itertools::Itertools as _;
 use jj_lib::commit::Commit;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::matchers::Matcher;
@@ -186,7 +187,7 @@ pub(crate) async fn cmd_squash(
     let insert_destination_commit =
         args.onto.is_some() || args.insert_after.is_some() || args.insert_before.is_some();
 
-    let mut workspace_command = command.workspace_helper(ui)?;
+    let mut workspace_command = command.workspace_helper(ui).await?;
 
     let mut sources: Vec<Commit>;
     let pre_existing_destination;
@@ -198,12 +199,14 @@ pub(crate) async fn cmd_squash(
             workspace_command.parse_union_revsets(ui, &args.from)?
         }
         .evaluate_to_commits()?
-        .try_collect()?;
+        .try_collect()
+        .await?;
         if insert_destination_commit {
             pre_existing_destination = None;
         } else {
             let destination = workspace_command
-                .resolve_single_rev(ui, args.into.as_ref().unwrap_or(&RevisionArg::AT))?;
+                .resolve_single_rev(ui, args.into.as_ref().unwrap_or(&RevisionArg::AT))
+                .await?;
             // remove the destination from the sources
             sources.retain(|source| source.id() != destination.id());
             pre_existing_destination = Some(destination);
@@ -214,7 +217,8 @@ pub(crate) async fn cmd_squash(
         sources.reverse();
     } else {
         let source = workspace_command
-            .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))?;
+            .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))
+            .await?;
         let mut parents = source.parents().await?;
         if parents.len() != 1 {
             return Err(
@@ -226,7 +230,9 @@ pub(crate) async fn cmd_squash(
         pre_existing_destination = Some(parents.pop().unwrap());
     }
 
-    workspace_command.check_rewritable(sources.iter().chain(&pre_existing_destination).ids())?;
+    workspace_command
+        .check_rewritable(sources.iter().chain(&pre_existing_destination).ids())
+        .await?;
 
     // prepare the tx description before possibly rebasing the source commits
     let source_ids: Vec<_> = sources.iter().ids().collect();
@@ -255,16 +261,15 @@ pub(crate) async fn cmd_squash(
             args.insert_after.as_deref(),
             args.insert_before.as_deref(),
             "squashed commit",
-        )?;
-        let parent_commits: Vec<_> = parent_ids
-            .iter()
-            .map(|commit_id| {
-                tx.base_workspace_helper()
-                    .repo()
-                    .store()
-                    .get_commit(commit_id)
-            })
-            .try_collect()?;
+        )
+        .await?;
+        let parent_commits = try_join_all(parent_ids.iter().map(|commit_id| {
+            tx.base_workspace_helper()
+                .repo()
+                .store()
+                .get_commit_async(commit_id)
+        }))
+        .await?;
         let merged_tree = merge_commit_trees(tx.repo(), &parent_commits).await?;
         let commit = tx
             .repo_mut()
@@ -429,7 +434,7 @@ pub(crate) async fn cmd_squash(
             }
         }
     }
-    tx.finish(ui, tx_description)?;
+    tx.finish(ui, tx_description).await?;
     Ok(())
 }
 

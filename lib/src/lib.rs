@@ -41,6 +41,7 @@ pub mod conflict_labels;
 pub mod conflicts;
 pub mod copies;
 pub mod dag_walk;
+pub mod dag_walk_async;
 pub mod default_index;
 pub mod default_submodule_store;
 pub mod diff;
@@ -67,6 +68,7 @@ pub mod gitattributes;
 pub mod gitignore;
 pub mod gpg_signing;
 pub mod graph;
+pub mod graph_dominators;
 pub mod hex_util;
 pub mod id_prefix;
 pub mod index;
@@ -124,6 +126,9 @@ pub mod workspace_store;
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    // Copied from `testutils::TestResult` to remove dependency cycle.
+    pub type TestResult<T = ()> = eyre::Result<T>;
 
     /// Unlike `testutils::new_temp_dir()`, this function doesn't set up
     /// hermetic Git environment.

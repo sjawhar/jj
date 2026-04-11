@@ -67,7 +67,7 @@ fn test_sparse_checkout() {
     let ws = &mut test_workspace.workspace;
 
     // Set sparse patterns to only dir1/
-    let mut locked_ws = ws.start_working_copy_mutation().unwrap();
+    let mut locked_ws = ws.start_working_copy_mutation().block_on().unwrap();
     let sparse_patterns = to_owned_path_vec(&[dir1_path]);
     let stats = locked_ws
         .locked_wc()
@@ -137,7 +137,7 @@ fn test_sparse_checkout() {
     assert_eq!(wc.sparse_patterns().unwrap(), sparse_patterns);
 
     // Set sparse patterns to file2, dir1/subdir1/ and dir2/
-    let mut locked_wc = wc.start_mutation().unwrap();
+    let mut locked_wc = wc.start_mutation().block_on().unwrap();
     let sparse_patterns = to_owned_path_vec(&[root_file1_path, dir1_subdir1_path, dir2_path]);
     let stats = locked_wc
         .set_sparse_patterns(sparse_patterns.clone())
@@ -220,6 +220,7 @@ fn test_sparse_commit() {
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     let sparse_patterns = to_owned_path_vec(&[dir1_path]);
     locked_ws
@@ -262,6 +263,7 @@ fn test_sparse_commit() {
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     let sparse_patterns = to_owned_path_vec(&[dir1_path, dir2_path]);
     locked_ws
@@ -298,6 +300,7 @@ fn test_sparse_commit_gitignore() {
     let mut locked_ws = test_workspace
         .workspace
         .start_working_copy_mutation()
+        .block_on()
         .unwrap();
     let sparse_patterns = to_owned_path_vec(&[dir1_path]);
     locked_ws

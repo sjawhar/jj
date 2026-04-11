@@ -7,42 +7,45 @@ These are the config settings available to jj/Jujutsu.
 `jj` loads several types of config settings:
 
 - The built-in settings. These cannot be edited. They can be viewed in the
-  `cli/src/config/` directory in `jj`'s source repo.
+  [`cli/src/config/`] directory in `jj`'s source repo.
 
 - The user settings. These can be edited with `jj config edit --user`. User
-settings are located in [the user config files], which can be found with `jj
-config path --user`.
+  settings are located in [the user config files], which can be found with
+  `jj config path --user`.
 
 - The repo settings. These can be edited with `jj config edit --repo`, or found
-  with `jj config path --repo`. For security reasons, they are not located inside
-  the repo.
+  with `jj config path --repo`. For security reasons, they are not located
+  inside the repo.
 
 - The workspace settings. These can be edited with `jj config edit --workspace`,
   or found with `jj config path --workspace`. For security reasons, they are not
   located inside the workspace.
 
-- Settings [specified in the command-line](#specifying-config-on-the-command-line).
+- Settings [specified on the command-line].
 
 These are listed in the order they are loaded; the settings from earlier items
 in the list are overridden by the settings from later items if they disagree.
 Every type of config except for the built-in settings is optional.
 
 You can enable JSON Schema validation in your editor by adding a `#:schema`
-reference at the top of your TOML config files. See [JSON Schema
-Support] for details.
+reference at the top of your TOML config files. See [JSON Schema Support] for
+details.
 
 See the [TOML site] and the [syntax guide] for a detailed description of the
 syntax. We cover some of the basics below.
 
-[the user config files]: #user-config-files
-[TOML site]: https://toml.io/en/
-[syntax guide]: https://toml.io/en/v1.0.0
-[JSON Schema Support]: #json-schema-support
-
 The first thing to remember is that the value of a setting (the part to the
 right of the `=` sign) should be surrounded in quotes if it's a string.
 
+[`cli/src/config/`]: https://github.com/jj-vcs/jj/blob/main/cli/src/config/
+[JSON Schema Support]: #json-schema-support
+[specified on the command-line]: #specifying-config-on-the-command-line
+[syntax guide]: https://toml.io/en/latest
+[the user config files]: #user-config-files
+[TOML site]: https://toml.io/en/
+
 ### Dotted style and headings
+
 In TOML, anything under a heading can be dotted instead. For example,
 `user.name = "YOUR NAME"` is equivalent to:
 
@@ -66,13 +69,58 @@ colors."commit_id prefix".bold = true
 "commit_id prefix" = { bold = true }
 ```
 
-The docs below refer to keys in text using dotted notation, but example
-blocks will use heading notation to be unambiguous. If you are confident with TOML
-then use whichever suits you in your config. If you mix dotted keys and headings,
+The docs below refer to keys in text using dotted notation, but example blocks
+will use heading notation to be unambiguous. If you are confident with TOML then
+use whichever suits you in your config. If you mix dotted keys and headings,
 **you must put the dotted keys before the first heading**.
 
-That's probably enough TOML to keep you out of trouble but the [syntax guide] is
-very short if you ever need to check.
+### Escapes in strings
+
+There are two (or four) types of [strings in TOML]: basic and literal, with
+multi-line versions of each. Basic strings use double quotes (`"`) and support
+escape sequences, such as `"\n"`, `"\""`, `"\\"`, etc. Literal strings use
+single quotes (`'`) and do not support escape sequences. Using 3 double quotes
+or 3 single quotes to wrap a string makes it multi-line, and then you can use an
+unescaped double quote or single quote respectively without ending the string.
+
+A string in your config may be interpreted twice, first by the TOML parser and
+then by a Jujutsu parser. To avoid putting strings in your config that the TOML
+parser processes before it gets to the Jujutsu parser, you may want to use
+literal strings or literal multi-line strings in your `config.toml` files. For
+example:
+
+```toml
+[template-aliases]
+# basic_template = "'hello' ++ \"\n\""
+literal_template = '"hello" ++ "\n"'
+```
+
+`basic_template` is actually equivalent to this string:
+
+```
+'hello' ++ "
+"
+```
+
+because the TOML parser interprets the `\n` character as part of the string.
+This causes the Jujutsu parser to receive a different string than what you
+literally see in the TOML file, which may result in seemingly confusing parse
+error messages (such as referencing a line that you think shouldn't exist).
+
+On the other hand, `literal_template` is equivalent to:
+
+```
+"hello" ++ "\n"
+```
+
+because the TOML parser does not escape anything in the literal string.
+
+The same rules of basic and literal strings apply to custom Jujutsu languages:
+double quotes (`"`) allow escapes whereas single quotes (`'`) do not. So
+`template-aliases.my_template = "'hello\\n'"` would probably not be what you
+want.
+
+[strings in TOML]: https://toml.io/en/latest#string
 
 ## User settings
 
@@ -260,7 +308,7 @@ if(parents.len() > 1,
 '''
 ```
 
-### Bookmark/tag listing order
+### Bookmark / tag listing order
 
 By default, `jj bookmark list` and `jj tag list` display bookmarks and tags
 sorted alphabetically by name. You can customize this sorting behavior by
@@ -427,9 +475,13 @@ In git diffs you can change the default number of lines of context shown.
 
 * `context`: Number of lines of context to show in the diff. The default is `3`.
 
+* `show-path-prefix`: Whether to show the `a/` and `b/` path prefixes in
+  `diff --git` output. The default is `true`.
+
 ```toml
 [diff.git]
 context = 3
+show-path-prefix = true
 ```
 
 ### Generating diffs by external command
@@ -591,6 +643,22 @@ log = "main@origin.."
 
 The default value for `revsets.log` is
 `'present(@) | ancestors(immutable_heads().., 2) | trunk()'`.
+
+### Default revisions for operation diffs
+
+You can configure the set of revisions that are considered "interesting" when
+showing the difference between two operations (e.g. in `jj op show`,
+`jj op diff`, or `jj op log -p`). Revisions that are not in this set are
+elided into a summary count.
+
+```toml
+[revsets]
+# Only show mutable revisions and the trunk
+op-diff-changes-in = "mutable() | trunk()"
+```
+
+The default value for `revsets.op-diff-changes-in` is
+`'mutable() | immutable_heads()'`.
 
 ### Prioritize Revsets in the Log over @
 
@@ -803,6 +871,10 @@ Which pager to use can be customized by setting `ui.pager`. When choosing a
 pager, ensure that it either supports color codes or that you disable color (see
 [Colorizing output](#colorizing-output)).
 
+The `JJ_PAGER` environment variable overrides `ui.pager`, and is useful for
+tool-specific environments that should not affect other programs. The generic
+`PAGER` environment variable is ignored.
+
 Examples:
 
 ```shell
@@ -921,6 +993,27 @@ You can define aliases for commands, including their arguments. For example:
 # `jj l` shows commits on the working-copy commit's (anonymous) bookmark
 # compared to the `main` bookmark
 l = ["log", "-r", "(main..@):: | (main..@)-"]
+```
+
+### Alias descriptions
+
+Alias descriptions can be surfaced in shell completions by defining the alias
+as a table with `.doc` and `.definition` properties. For example:
+
+```toml
+[aliases]
+l = {
+    definition = ["log", "-r", "(main..@):: | (main..@)-"],
+    doc = "Log pending changes"
+}
+```
+
+You can also use the dotted key syntax:
+
+```toml
+[aliases]
+l.definition = ["log", "-r", "(main..@):: | (main..@)-"]
+l.doc = "Log pending changes"
 ```
 
 This alias syntax can only run a single jj command. However, you may want to
@@ -1306,6 +1399,25 @@ the values have the following properties:
  - `enabled`: Enables or disables the tool. If omitted, the tool is enabled.
    This is useful for defining disabled tools in user configuration that can
    be enabled in individual repositories with one config setting.
+ - `line-range-arg`: An optional template string specifying how to pass a line
+   range to the tool. It may include the variables `$first` and `$last`, which
+   will be replaced with the 1-based line numbers of, respectively, the first
+   and last lines inside the modified range. A range containing a single line
+   will have equal values for `$first` and `$last`. Empty ranges representing
+   deletions will be skipped because they cannot be represented this way.
+   If the tool does not support formatting specific line ranges, this setting
+   should be omitted, and the tool will always process the entire file.
+   Example: `line-range-arg = "--lines=$first:$last"`.
+ - `run-tool-if-zero-line-ranges`: Whether to run the tool invocation for this tool on
+   files that had zero line ranges to format in the revision being fixed.
+   Defaults to `false`, meaning the tool is skipped for these files. This default
+   behavior serves two main purposes:
+   - Avoiding unnecessary executions of tools when no line ranges are modified.
+   - Preventing tools configured with `line-range-arg` from making overly
+     broad changes (formatting the whole file) when no line ranges are available.
+
+   Setting this to `true` is useful if the tool should run regardless of diffs
+   (e.g., to sort imports, or run with `--include-unchanged-files`).
 
 `jj fix` provides the file content anonymously on standard input, but the name
 of the file being formatted may be important for include sorting or other output
@@ -1337,6 +1449,39 @@ command = ["sort", "-u"]
 patterns = ["word_list.txt"]
 ```
 
+### Enforce code formatting on modified lines
+
+You can configure `jj fix` to run a formatter only on the modified lines of a
+file, rather than formatting the entire file. This is particularly useful for
+avoiding unrelated formatting changes in untouched parts of a file.
+
+To enable this, specify the `line-range-arg` configuration to match the line
+range argument format expected by your tool. The formatter will be invoked with
+this argument repeated for each modified line range (e.g. `--lines=10-20
+--lines=30-40`).
+
+Additionally, you can use `run-tool-if-zero-line-ranges` to control the
+behavior when a diff results in zero line ranges (which can happen when lines
+are only deleted or with `--include-unchanged-files`). If `false` (the default),
+`jj` will skip the tool entirely for that file. If `true`, `jj` will run the tool
+even when there are zero line ranges calculated. This is useful for tools that
+perform file-wide operations, such as import sorting.
+
+Note that you can use the `--all-lines` CLI flag for `jj fix` to ignore these
+line ranges and format the entire modified file instead.
+
+Example of `clang-format` with line ranges:
+
+```toml
+[fix.tools.clang-format]
+command = ["/usr/bin/clang-format", "--assume-filename=$path"]
+patterns = ["glob:'**/*.cc'",
+            "glob:'**/*.h'"]
+enabled = true
+line-range-arg = "--lines=$first:$last"
+run-tool-if-zero-line-ranges = false
+```
+
 ### Tools stored inside the workspace
 
 Some fix tools may be stored inside the workspace. For example, a binary may be
@@ -1345,12 +1490,8 @@ path to such a program:
 
 ```toml
 [fix.tools.biome]
-
-# Linux and macOS
-command = ["$root/node_modules/@biomejs/cli-linux-x64/biome"]
-
-# Windows
-command = ["$root\\node_modules\\@biomejs\\cli-win32-x64\\biome.exe"]
+command = ["$root/node_modules/@biomejs/biome/bin/biome", "format", "--stdin-file-path=$path"]
+patterns = ["glob:'**/*.ts'", "glob:'**/*.tsx'"]
 ```
 
 ### Execution order of tools
@@ -1613,6 +1754,24 @@ Note that unlike `git.fetch`, `git.push` can currently only be a single remote.
 This is not a hard limitation, and could be changed in the future if there is
 demand.
 
+### Default bookmarks and tags to fetch
+
+You can configure which bookmarks and tags to fetch by default per remote, using
+the `remotes.<name>.fetch-bookmarks`/`fetch-tags` config. The value is a [string
+pattern](./revsets.md#string-patterns) that matches the names of the bookmarks
+and tags to fetch. If `remotes.<name>.fetch-bookmarks` is not configured, the
+default fetch refspecs for the remotes are read from the Git configuration.
+
+Note that **`remotes.<name>.fetch-tags` is experimental**. Tags matching this
+pattern will be fetched as tracked `<name>@<remote>` tags, and corresponding
+local tags will be created.
+
+```toml
+[remotes.origin]
+fetch-bookmarks = "~gh-pages"
+fetch-tags = "v*"
+```
+
 ### Automatic tracking of bookmarks
 
 You can configure which bookmarks to track automatically per remote, using the
@@ -1711,6 +1870,17 @@ abandon-unreachable-commits = false
 ```
 
 [reachable]: https://git-scm.com/docs/gitglossary/#Documentation/gitglossary.txt-aiddefreachableareachable
+
+### Replicating evolution history for fetched or imported Git commits
+
+By default, when `jj` imports commits from Git, it attempts to reconstruct their
+evolution history using change IDs. If you are importing a large number of
+commits, you can temporarily disable this behavior to improve performance:
+
+```toml
+[git]
+record-synthetic-predecessors = false
+```
 
 ### Generated bookmark names on push
 
@@ -1885,36 +2055,40 @@ documentation](working-copy.md#stale-working-copy).
 
 ## Working copy settings
 
-### EOL conversion settings
+### EOL conversion setting
 
-This settings serves the same purpose as the [`core.autocrlf`][git-autocrlf] git
+This setting serves the same purpose as the [`core.autocrlf`][git-autocrlf] Git
 config.
 
-The line endings conversion won't be applied to files detected as binary files
-via a heuristics[^1] regardless of the settings. This is similar to git.
+Regardless of this setting, the line endings conversion is skipped on binary
+files based on a [heuristic](#binary-file-detection). This is similar to Git.
 
 ```toml
 [working-copy]
-# No EOL conversion. Similar to core.autocrlf = false.
+# No EOL conversion. Similar to `core.autocrlf = false`.
 eol-conversion = "none"
-# Apply CRLF to LF EOL conversion when we check files in the backend store from
-# the local file system but not apply EOL conversion when we check out the code
-# from the backend store to the local file system. Similar to core.autocrlf =
-# input.
+# Apply CRLF-to-LF EOL conversion when we check files in to the backend store
+# from the local file system, but do not apply LF-to-CRLF EOL conversion when we
+# check out the code from the backend store to the local file system. Similar to
+# `core.autocrlf = input`.
 eol-conversion = "input"
-# Setting this to "input-output" if you want to have CRLF line endings in your
-# working directory and the repository has LF line endings. Similar to
-# core.autocrlf = true.
+# Apply EOL conversion on both file check-in to and file check-out from the
+# backend store, so you have CRLF line endings in your working directory while
+# the repository has LF line endings. Similar to `core.autocrlf = true`.
 eol-conversion = "input-output"
 ```
 
 [git-autocrlf]: https://git-scm.com/book/en/v2/Customizing-Git-Git-Configuration#_core_autocrlf
+
+#### Binary file detection
+
+To detect if a file is binary, Jujutsu currently checks if there is a NULL byte
+in the file, which is different from the algorithm of
+[`gitoxide`][gitoxide-is-binary] or [`Git`][git-is-binary]. Jujutsu doesn't plan
+to align the binary detection logic with Git.
+
 [gitoxide-is-binary]: https://github.com/GitoxideLabs/gitoxide/blob/073487b38ed40bcd7eb45dc110ae1ce84f9275a9/gix-filter/src/eol/utils.rs#L98-L100
 [git-is-binary]: https://github.com/git/git/blob/f1ca98f609f9a730b9accf24e5558a10a0b41b6c/convert.c#L94-L103
-[^1]: To detect if a file is binary, Jujutsu currently checks if there is NULL
-      byte in the file which is different from the algorithm of
-      [`gitoxide`][gitoxide-is-binary] or [`git`][git-is-binary]. Jujutsu
-      doesn't plan to align the binary detection logic with git.
 
 ### Respect or ignore executable bit permission changes
 
@@ -2162,7 +2336,7 @@ wip = ["log", "-r", "work"]
 
   ```toml
   --when.hostnames = ["work-laptop"]               # matches only "work-laptop"
-  --when.hostnames = ["home-desktop", "laptop"]    # matches "home-desktop" OR "laptop"
+  --when.hostnames = ["home-desktop", "laptop"]    # matches "home-desktop" *OR* "laptop"
   ```
 
 * `--when.commands`: List of subcommands to match.
@@ -2172,7 +2346,7 @@ wip = ["log", "-r", "work"]
   ```toml
   --when.commands = ["file"]        # matches `jj file show`, `jj file list`, etc
   --when.commands = ["file show"]   # matches `jj file show` but *NOT* `jj file list`
-  --when.commands = ["file", "log"] # matches `jj file` *OR* `jj log` (or subcommand of either)
+  --when.commands = ["file", "log"] # matches `jj file` *OR* `jj log` (*OR* subcommand of either)
   ```
 
 * `--when.platforms`: List of platforms to match.
@@ -2184,7 +2358,7 @@ wip = ["log", "-r", "work"]
 
   ```toml
   --when.platforms = ["windows"]            # matches only Windows
-  --when.platforms = ["linux", "freebsd"]   # matches Linux or and FreeBSD, but not macOS
+  --when.platforms = ["linux", "freebsd"]   # matches Linux *OR* FreeBSD, but *NOT* macOS
   --when.platforms = ["unix"]               # matches anything in the Unix family (Linux, FreeBSD, macOS, etc.)
   ```
 
@@ -2195,6 +2369,6 @@ wip = ["log", "-r", "work"]
   ```toml
   --when.environments = ["CI=true"]                     # matches when CI is set to "true"
   --when.environments = ["CI"]                          # matches when CI is set to anything
-  --when.environments = ["CI=true", "CI=1"]             # matches when CI is "true" or "1"
-  --when.environments = ["CI=true", "GITHUB_ACTIONS=1"] # matches when EITHER condition holds
+  --when.environments = ["CI=true", "CI=1"]             # matches when CI is "true" *OR* "1"
+  --when.environments = ["CI=true", "GITHUB_ACTIONS=1"] # matches when *EITHER* condition holds
   ```

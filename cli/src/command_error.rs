@@ -37,7 +37,6 @@ use jj_lib::fix::FixError;
 use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::index::IndexError;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::op_heads_store::OpHeadResolutionError;
 use jj_lib::op_heads_store::OpHeadsStoreError;
 use jj_lib::op_store::OpStoreError;
 use jj_lib::op_walk::OpsetEvaluationError;
@@ -422,16 +421,6 @@ impl From<WorkspaceInitError> for CommandError {
     }
 }
 
-impl From<OpHeadResolutionError> for CommandError {
-    fn from(err: OpHeadResolutionError) -> Self {
-        match err {
-            OpHeadResolutionError::NoHeads => {
-                internal_error_with_message("Corrupt repository", err)
-            }
-        }
-    }
-}
-
 impl From<OpsetEvaluationError> for CommandError {
     fn from(err: OpsetEvaluationError) -> Self {
         match err {
@@ -441,7 +430,6 @@ impl From<OpsetEvaluationError> for CommandError {
                 cmd_err.extend_hints(hint);
                 cmd_err
             }
-            OpsetEvaluationError::OpHeadResolution(err) => err.into(),
             OpsetEvaluationError::OpHeadsStore(err) => err.into(),
             OpsetEvaluationError::OpStore(err) => err.into(),
         }
@@ -596,6 +584,7 @@ jj currently does not support partial clones. To use jj with this repository, tr
                 ),
                 GitImportError::Backend(_) => None,
                 GitImportError::Index(_) => None,
+                GitImportError::RevsetEvaluation(_) => None,
                 GitImportError::Git(_) => None,
                 GitImportError::UnexpectedBackend(_) => None,
             };
@@ -800,6 +789,7 @@ impl From<FixError> for CommandError {
 impl From<BisectionError> for CommandError {
     fn from(err: BisectionError) -> Self {
         match err {
+            BisectionError::BackendError(_) => user_error(err),
             BisectionError::RevsetEvaluationError(_) => user_error(err),
         }
     }
