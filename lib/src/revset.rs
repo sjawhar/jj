@@ -159,8 +159,6 @@ pub enum RevsetCommitRef {
         symbol: RemoteRefSymbolExpression,
         remote_ref_state: Option<RemoteRefState>,
     },
-    GitRefs,
-    GitHead,
 }
 
 /// String expressions to match `name@remote` bookmarks/tags.
@@ -314,7 +312,9 @@ pub enum RevsetExpression<St: ExpressionState> {
         filter: Arc<Self>,
     },
     Roots(Arc<Self>),
+    Forks,
     ForkPoint(Arc<Self>),
+    MergePoint(Arc<Self>),
     Bisect(Arc<Self>),
     HasSize {
         candidates: Arc<Self>,
@@ -377,6 +377,10 @@ impl<St: ExpressionState> RevsetExpression<St> {
 
     pub fn root() -> Arc<Self> {
         Arc::new(Self::Root)
+    }
+
+    pub fn forks() -> Arc<Self> {
+        Arc::new(Self::Forks)
     }
 
     pub fn commit(commit_id: CommitId) -> Arc<Self> {
@@ -456,14 +460,6 @@ impl<St: ExpressionState<CommitRef = RevsetCommitRef>> RevsetExpression<St> {
             symbol,
             remote_ref_state,
         }))
-    }
-
-    pub fn git_refs() -> Arc<Self> {
-        Arc::new(Self::CommitRef(RevsetCommitRef::GitRefs))
-    }
-
-    pub fn git_head() -> Arc<Self> {
-        Arc::new(Self::CommitRef(RevsetCommitRef::GitHead))
     }
 }
 
@@ -558,6 +554,11 @@ impl<St: ExpressionState> RevsetExpression<St> {
     /// Fork point (best common ancestors) of `self`.
     pub fn fork_point(self: &Arc<Self>) -> Arc<Self> {
         Arc::new(Self::ForkPoint(self.clone()))
+    }
+
+    /// Merge point (best common descendants) of `self`.
+    pub fn merge_point(self: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self::MergePoint(self.clone()))
     }
 
     /// Commits with ~half of the descendants in `self`.
@@ -768,7 +769,14 @@ pub enum ResolvedExpression {
         filter: Option<ResolvedPredicateExpression>,
     },
     Roots(Box<Self>),
+    Forks {
+        heads: Box<Self>,
+    },
     ForkPoint(Box<Self>),
+    MergePoint {
+        roots: Box<Self>,
+        visible_heads: Box<Self>,
+    },
     Bisect(Box<Self>),
     HasSize {
         candidates: Box<Self>,
@@ -922,10 +930,10 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         })?;
         Ok(RevsetExpression::commit_id_prefix(prefix))
     });
-    map.insert("bookmarks", |diagnostics, function, context| {
+    map.insert("bookmarks", |diagnostics, function, _context| {
         let ([], [opt_arg]) = function.expect_arguments()?;
         let expr = if let Some(arg) = opt_arg {
-            expect_string_expression(diagnostics, arg, context)?
+            expect_string_expression(diagnostics, arg)?
         } else {
             StringExpression::all()
         };
@@ -952,10 +960,10 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
             Ok(RevsetExpression::remote_bookmarks(symbol, state))
         },
     );
-    map.insert("tags", |diagnostics, function, context| {
+    map.insert("tags", |diagnostics, function, _context| {
         let ([], [opt_arg]) = function.expect_arguments()?;
         let expr = if let Some(arg) = opt_arg {
-            expect_string_expression(diagnostics, arg, context)?
+            expect_string_expression(diagnostics, arg)?
         } else {
             StringExpression::all()
         };
@@ -978,24 +986,6 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         let state = Some(RemoteRefState::New);
         Ok(RevsetExpression::remote_tags(symbol, state))
     });
-    // TODO: Remove in jj 0.43+
-    map.insert("git_refs", |diagnostics, function, _context| {
-        diagnostics.add_warning(RevsetParseError::expression(
-            "git_refs() is deprecated; use remote_bookmarks()/tags() instead",
-            function.name_span,
-        ));
-        function.expect_no_arguments()?;
-        Ok(RevsetExpression::git_refs())
-    });
-    // TODO: Remove in jj 0.43+
-    map.insert("git_head", |diagnostics, function, _context| {
-        diagnostics.add_warning(RevsetParseError::expression(
-            "git_head() is deprecated; use first_parent(@) instead",
-            function.name_span,
-        ));
-        function.expect_no_arguments()?;
-        Ok(RevsetExpression::git_head())
-    });
     map.insert("latest", |diagnostics, function, context| {
         let ([candidates_arg], [count_opt_arg]) = function.expect_arguments()?;
         let candidates = lower_expression(diagnostics, candidates_arg, context)?;
@@ -1010,6 +1000,11 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         let [expression_arg] = function.expect_exact_arguments()?;
         let expression = lower_expression(diagnostics, expression_arg, context)?;
         Ok(RevsetExpression::fork_point(&expression))
+    });
+    map.insert("merge_point", |diagnostics, function, context| {
+        let [expression_arg] = function.expect_exact_arguments()?;
+        let expression = lower_expression(diagnostics, expression_arg, context)?;
+        Ok(RevsetExpression::merge_point(&expression))
     });
     map.insert("bisect", |diagnostics, function, context| {
         let [expression_arg] = function.expect_exact_arguments()?;
@@ -1028,35 +1023,39 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
             RevsetFilterPredicate::ParentCount(2..u32::MAX),
         ))
     });
-    map.insert("description", |diagnostics, function, context| {
+    map.insert("forks", |_diagnostics, function, _context| {
+        function.expect_no_arguments()?;
+        Ok(RevsetExpression::forks())
+    });
+    map.insert("description", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::Description(expr);
         Ok(RevsetExpression::filter(predicate))
     });
-    map.insert("subject", |diagnostics, function, context| {
+    map.insert("subject", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::Subject(expr);
         Ok(RevsetExpression::filter(predicate))
     });
-    map.insert("author", |diagnostics, function, context| {
+    map.insert("author", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let name_predicate = RevsetFilterPredicate::AuthorName(expr.clone());
         let email_predicate = RevsetFilterPredicate::AuthorEmail(expr);
         Ok(RevsetExpression::filter(name_predicate)
             .union(&RevsetExpression::filter(email_predicate)))
     });
-    map.insert("author_name", |diagnostics, function, context| {
+    map.insert("author_name", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::AuthorName(expr);
         Ok(RevsetExpression::filter(predicate))
     });
-    map.insert("author_email", |diagnostics, function, context| {
+    map.insert("author_email", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::AuthorEmail(expr);
         Ok(RevsetExpression::filter(predicate))
     });
@@ -1081,23 +1080,23 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         let predicate = RevsetFilterPredicate::AuthorEmail(StringExpression::pattern(pattern));
         Ok(RevsetExpression::filter(predicate))
     });
-    map.insert("committer", |diagnostics, function, context| {
+    map.insert("committer", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let name_predicate = RevsetFilterPredicate::CommitterName(expr.clone());
         let email_predicate = RevsetFilterPredicate::CommitterEmail(expr);
         Ok(RevsetExpression::filter(name_predicate)
             .union(&RevsetExpression::filter(email_predicate)))
     });
-    map.insert("committer_name", |diagnostics, function, context| {
+    map.insert("committer_name", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::CommitterName(expr);
         Ok(RevsetExpression::filter(predicate))
     });
-    map.insert("committer_email", |diagnostics, function, context| {
+    map.insert("committer_email", |diagnostics, function, _context| {
         let [arg] = function.expect_exact_arguments()?;
-        let expr = expect_string_expression(diagnostics, arg, context)?;
+        let expr = expect_string_expression(diagnostics, arg)?;
         let predicate = RevsetFilterPredicate::CommitterEmail(expr);
         Ok(RevsetExpression::filter(predicate))
     });
@@ -1132,7 +1131,7 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
             ));
         }
         let ([text_arg], [files_opt_arg]) = function.expect_arguments()?;
-        let text = expect_string_expression(diagnostics, text_arg, context)?;
+        let text = expect_string_expression(diagnostics, text_arg)?;
         let files = expand_optional_files_arg(files_opt_arg, diagnostics, context)?;
         let predicate = RevsetFilterPredicate::DiffLines {
             text,
@@ -1143,7 +1142,7 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
     });
     map.insert("diff_lines_added", |diagnostics, function, context| {
         let ([text_arg], [files_opt_arg]) = function.expect_arguments()?;
-        let text = expect_string_expression(diagnostics, text_arg, context)?;
+        let text = expect_string_expression(diagnostics, text_arg)?;
         let files = expand_optional_files_arg(files_opt_arg, diagnostics, context)?;
         let predicate = RevsetFilterPredicate::DiffLines {
             text,
@@ -1154,7 +1153,7 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
     });
     map.insert("diff_lines_removed", |diagnostics, function, context| {
         let ([text_arg], [files_opt_arg]) = function.expect_arguments()?;
-        let text = expect_string_expression(diagnostics, text_arg, context)?;
+        let text = expect_string_expression(diagnostics, text_arg)?;
         let files = expand_optional_files_arg(files_opt_arg, diagnostics, context)?;
         let predicate = RevsetFilterPredicate::DiffLines {
             text,
@@ -1247,39 +1246,18 @@ pub fn expect_fileset_expression(
 pub fn expect_string_expression(
     diagnostics: &mut RevsetDiagnostics,
     node: &ExpressionNode,
-    context: &LoweringContext,
-) -> Result<StringExpression, RevsetParseError> {
-    let default_kind = if context.use_glob_by_default {
-        "glob"
-    } else {
-        "substring"
-    };
-    expect_string_expression_inner(diagnostics, node, default_kind)
-}
-
-fn expect_string_expression_inner(
-    diagnostics: &mut RevsetDiagnostics,
-    node: &ExpressionNode,
-    // TODO: remove this parameter with ui.revsets-use-glob-by-default
-    default_kind: &str,
 ) -> Result<StringExpression, RevsetParseError> {
     revset_parser::catch_aliases(diagnostics, node, |diagnostics, node| {
         let expr_error = || RevsetParseError::expression("Invalid string expression", node.span);
         let pattern_error = || RevsetParseError::expression("Invalid string pattern", node.span);
-        let default_pattern = |diagnostics: &mut RevsetDiagnostics, value: &str| {
-            if default_kind == "substring" {
-                diagnostics.add_warning(RevsetParseError::expression(
-                    "ui.revsets-use-glob-by-default=false will be removed in a future release",
-                    node.span,
-                ));
-            }
-            let pattern = StringPattern::from_str_kind(value, default_kind)
-                .map_err(|err| pattern_error().with_source(err))?;
+        let default_pattern = |value: &str| {
+            let pattern =
+                StringPattern::glob(value).map_err(|err| pattern_error().with_source(err))?;
             Ok(StringExpression::pattern(pattern))
         };
         match &node.kind {
-            ExpressionKind::Identifier(value) => default_pattern(diagnostics, value),
-            ExpressionKind::String(value) => default_pattern(diagnostics, value),
+            ExpressionKind::Identifier(value) => default_pattern(value),
+            ExpressionKind::String(value) => default_pattern(value),
             ExpressionKind::Pattern(pattern) => {
                 let value = revset_parser::expect_string_literal("string", &pattern.value)?;
                 let pattern = StringPattern::from_str_kind(value, pattern.name)
@@ -1292,7 +1270,7 @@ fn expect_string_expression_inner(
             | ExpressionKind::DagRangeAll
             | ExpressionKind::RangeAll => Err(expr_error()),
             ExpressionKind::Unary(op, arg_node) => {
-                let arg = expect_string_expression_inner(diagnostics, arg_node, default_kind)?;
+                let arg = expect_string_expression(diagnostics, arg_node)?;
                 match op {
                     UnaryOp::Negate => Ok(arg.negated()),
                     UnaryOp::DagRangePre
@@ -1304,8 +1282,8 @@ fn expect_string_expression_inner(
                 }
             }
             ExpressionKind::Binary(op, lhs_node, rhs_node) => {
-                let lhs = expect_string_expression_inner(diagnostics, lhs_node, default_kind)?;
-                let rhs = expect_string_expression_inner(diagnostics, rhs_node, default_kind)?;
+                let lhs = expect_string_expression(diagnostics, lhs_node)?;
+                let rhs = expect_string_expression(diagnostics, rhs_node)?;
                 match op {
                     BinaryOp::Intersection => Ok(lhs.intersection(rhs)),
                     BinaryOp::Difference => Ok(lhs.intersection(rhs.negated())),
@@ -1315,7 +1293,7 @@ fn expect_string_expression_inner(
             ExpressionKind::UnionAll(nodes) => {
                 let expressions = nodes
                     .iter()
-                    .map(|node| expect_string_expression_inner(diagnostics, node, default_kind))
+                    .map(|node| expect_string_expression(diagnostics, node))
                     .try_collect()?;
                 Ok(StringExpression::union_all(expressions))
             }
@@ -1348,12 +1326,12 @@ fn parse_remote_refs_arguments(
 ) -> Result<RemoteRefSymbolExpression, RevsetParseError> {
     let ([], [name_opt_arg, remote_opt_arg]) = function.expect_named_arguments(&["", "remote"])?;
     let name = if let Some(name_arg) = name_opt_arg {
-        expect_string_expression(diagnostics, name_arg, context)?
+        expect_string_expression(diagnostics, name_arg)?
     } else {
         StringExpression::all()
     };
     let remote = if let Some(remote_arg) = remote_opt_arg {
-        expect_string_expression(diagnostics, remote_arg, context)?
+        expect_string_expression(diagnostics, remote_arg)?
     } else if let Some(remote) = context.default_ignored_remote {
         StringExpression::exact(remote).negated()
     } else {
@@ -1469,8 +1447,7 @@ pub fn parse_string_expression(
     text: &str,
 ) -> Result<StringExpression, RevsetParseError> {
     let node = parse_program(text)?;
-    let default_kind = "glob";
-    expect_string_expression_inner(diagnostics, &node, default_kind)
+    expect_string_expression(diagnostics, &node)
 }
 
 /// Constructs binary tree from `expressions` list, `unit` node, and associative
@@ -1609,8 +1586,12 @@ fn try_transform_expression<St: ExpressionState, E>(
             RevsetExpression::Roots(candidates) => {
                 transform_rec(candidates, pre, post)?.map(RevsetExpression::Roots)
             }
+            RevsetExpression::Forks => None,
             RevsetExpression::ForkPoint(expression) => {
                 transform_rec(expression, pre, post)?.map(RevsetExpression::ForkPoint)
+            }
+            RevsetExpression::MergePoint(expression) => {
+                transform_rec(expression, pre, post)?.map(RevsetExpression::MergePoint)
             }
             RevsetExpression::Bisect(expression) => {
                 transform_rec(expression, pre, post)?.map(RevsetExpression::Bisect)
@@ -1855,9 +1836,14 @@ where
             let roots = folder.fold_expression(roots)?;
             RevsetExpression::Roots(roots).into()
         }
+        RevsetExpression::Forks => RevsetExpression::Forks.into(),
         RevsetExpression::ForkPoint(expression) => {
             let expression = folder.fold_expression(expression)?;
             RevsetExpression::ForkPoint(expression).into()
+        }
+        RevsetExpression::MergePoint(expression) => {
+            let expression = folder.fold_expression(expression)?;
+            RevsetExpression::MergePoint(expression).into()
         }
         RevsetExpression::Bisect(expression) => {
             let expression = folder.fold_expression(expression)?;
@@ -2733,27 +2719,7 @@ impl PartialSymbolResolver for BookmarkResolver {
     }
 }
 
-struct GitRefResolver;
-
-impl PartialSymbolResolver for GitRefResolver {
-    fn resolve_symbol(
-        &self,
-        repo: &dyn Repo,
-        symbol: &str,
-    ) -> Result<Option<CommitId>, RevsetResolutionError> {
-        let view = repo.view();
-        for git_ref_prefix in &["", "refs/"] {
-            let target = view.get_git_ref([git_ref_prefix, symbol].concat().as_ref());
-            if let Some(id) = to_resolved_ref("git_ref", symbol, target)? {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
-    }
-}
-
-const DEFAULT_RESOLVERS: &[&dyn PartialSymbolResolver] =
-    &[&TagResolver, &BookmarkResolver, &GitRefResolver];
+const DEFAULT_RESOLVERS: &[&dyn PartialSymbolResolver] = &[&TagResolver, &BookmarkResolver];
 
 struct CommitPrefixResolver<'a> {
     context_repo: &'a dyn Repo,
@@ -3039,14 +3005,6 @@ fn resolve_commit_ref(
                 .collect();
             Ok(commit_ids)
         }
-        RevsetCommitRef::GitRefs => {
-            let mut commit_ids = vec![];
-            for ref_target in repo.view().git_refs().values() {
-                commit_ids.extend(ref_target.added_ids().cloned());
-            }
-            Ok(commit_ids)
-        }
-        RevsetCommitRef::GitHead => Ok(repo.view().git_head().added_ids().cloned().collect()),
     }
 }
 
@@ -3232,9 +3190,16 @@ impl VisibilityResolutionContext<'_> {
             RevsetExpression::Roots(candidates) => {
                 ResolvedExpression::Roots(self.resolve(candidates).into())
             }
+            RevsetExpression::Forks => ResolvedExpression::Forks {
+                heads: self.resolve_visible_heads_or_referenced().into(),
+            },
             RevsetExpression::ForkPoint(expression) => {
                 ResolvedExpression::ForkPoint(self.resolve(expression).into())
             }
+            RevsetExpression::MergePoint(expression) => ResolvedExpression::MergePoint {
+                roots: self.resolve(expression).into(),
+                visible_heads: self.resolve_visible_heads_or_referenced().into(),
+            },
             RevsetExpression::Bisect(expression) => {
                 ResolvedExpression::Bisect(self.resolve(expression).into())
             }
@@ -3371,7 +3336,9 @@ impl VisibilityResolutionContext<'_> {
             | RevsetExpression::Heads(_)
             | RevsetExpression::HeadsRange { .. }
             | RevsetExpression::Roots(_)
+            | RevsetExpression::Forks
             | RevsetExpression::ForkPoint(_)
+            | RevsetExpression::MergePoint(_)
             | RevsetExpression::Bisect(_)
             | RevsetExpression::HasSize { .. }
             | RevsetExpression::Latest { .. } => {
@@ -3440,8 +3407,8 @@ pub trait Revset: fmt::Debug {
     where
         Self: 'a;
 
-    /// Returns true if iterator will emit no commit nor error.
-    fn is_empty(&self) -> bool;
+    /// Returns true if iterator will emit no commit.
+    fn is_empty(&self) -> Result<bool, RevsetEvaluationError>;
 
     /// Inclusive lower bound and, optionally, inclusive upper bound of how many
     /// commits are in the revset. The implementation can use its discretion as
@@ -3534,7 +3501,6 @@ pub struct RevsetParseContext<'a> {
     /// Special remote that should be ignored by default. (e.g. "git")
     pub default_ignored_remote: Option<&'a RemoteName>,
     pub fileset_aliases_map: &'a FilesetAliasesMap,
-    pub use_glob_by_default: bool,
     pub extensions: &'a RevsetExtensions,
     pub workspace: Option<RevsetWorkspaceContext<'a>>,
 }
@@ -3548,7 +3514,6 @@ impl<'a> RevsetParseContext<'a> {
             date_pattern_context,
             default_ignored_remote,
             fileset_aliases_map,
-            use_glob_by_default,
             extensions,
             workspace,
         } = *self;
@@ -3557,7 +3522,6 @@ impl<'a> RevsetParseContext<'a> {
             date_pattern_context,
             default_ignored_remote,
             fileset_aliases_map,
-            use_glob_by_default,
             extensions,
             workspace,
         }
@@ -3571,7 +3535,6 @@ pub struct LoweringContext<'a> {
     date_pattern_context: DatePatternContext,
     default_ignored_remote: Option<&'a RemoteName>,
     fileset_aliases_map: &'a FilesetAliasesMap,
-    use_glob_by_default: bool,
     extensions: &'a RevsetExtensions,
     workspace: Option<RevsetWorkspaceContext<'a>>,
 }
@@ -3668,7 +3631,6 @@ mod tests {
             date_pattern_context: chrono::Utc::now().fixed_offset().into(),
             default_ignored_remote: Some("ignored".as_ref()),
             fileset_aliases_map: &FilesetAliasesMap::new(),
-            use_glob_by_default: true,
             extensions: &RevsetExtensions::default(),
             workspace: None,
         };
@@ -3700,7 +3662,6 @@ mod tests {
             date_pattern_context: chrono::Utc::now().fixed_offset().into(),
             default_ignored_remote: Some("ignored".as_ref()),
             fileset_aliases_map: &FilesetAliasesMap::new(),
-            use_glob_by_default: true,
             extensions: &RevsetExtensions::default(),
             workspace: Some(workspace_ctx),
         };

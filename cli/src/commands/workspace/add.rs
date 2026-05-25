@@ -13,25 +13,38 @@
 // limitations under the License.
 
 use std::fs;
+use std::path::Path;
+#[cfg(feature = "git")]
+use std::path::PathBuf;
+#[cfg(feature = "git")]
+use std::process::Command;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
+#[cfg(feature = "git")]
+use jj_lib::git;
 use jj_lib::ref_name::WorkspaceNameBuf;
+use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::workspace::Workspace;
+use jj_lib::workspace_store::SimpleWorkspaceStore;
+use jj_lib::workspace_store::WorkspaceStore as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::WorkspaceCommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
+#[cfg(feature = "git")]
+use crate::git_util::is_colocated_git_workspace;
 use crate::ui::Ui;
 
 /// How to handle sparse patterns when creating a new workspace.
@@ -84,6 +97,23 @@ pub struct WorkspaceAddArgs {
     /// How to handle sparse patterns when creating a new workspace.
     #[arg(long, value_enum, default_value_t = SparseInheritance::Copy)]
     sparse_patterns: SparseInheritance,
+
+    /// Create a Git worktree for the new workspace (force colocation)
+    ///
+    /// Overrides the `git.auto-register-worktrees` config and the parent
+    /// workspace's colocation status. Has no effect in a non-colocated repo.
+    #[cfg(feature = "git")]
+    #[arg(long, conflicts_with = "no_colocate")]
+    colocate: bool,
+
+    /// Do not create a Git worktree for the new workspace
+    ///
+    /// By default, the new workspace will be colocated if and only if the
+    /// parent workspace is colocated. Use this flag to create a non-colocated
+    /// workspace regardless of the parent's status.
+    #[cfg(feature = "git")]
+    #[arg(long)]
+    no_colocate: bool,
 }
 
 #[instrument(skip_all)]
@@ -114,12 +144,107 @@ pub async fn cmd_workspace_add(
             name = workspace_name.as_symbol()
         )));
     }
-    if !destination_path.exists() {
-        fs::create_dir(&destination_path).context(&destination_path)?;
-    } else if !file_util::is_empty_dir(&destination_path)? {
-        return Err(user_error(
-            "Destination path exists and is not an empty directory",
-        ));
+
+    // Set up colocation based on parent workspace (auto-detect, unless
+    // --no-colocate) The guard will clean up the worktree if we return early
+    // due to an error
+    #[cfg(feature = "git")]
+    let worktree_guard = {
+        // Check if parent workspace is colocated
+        let parent_is_colocated =
+            is_colocated_git_workspace(old_workspace_command.workspace(), repo.as_ref());
+
+        // Determine if colocation is requested:
+        // - --no-colocate: never colocate (overrides everything)
+        // - --colocate: always colocate (overrides auto-detect + config)
+        // - (no flag): colocate if the parent is colocated AND the
+        //   `git.auto-register-worktrees` config is enabled (default true)
+        let colocate_requested = if args.no_colocate {
+            false
+        } else if args.colocate {
+            true
+        } else {
+            parent_is_colocated && command.settings().get_bool("git.auto-register-worktrees")?
+        };
+
+        if colocate_requested {
+            let git_backend = git::get_git_backend(repo.store())?;
+            let git_repo = git_backend.git_repo();
+            // git -C works from any directory within the repo, so workdir() is fine.
+            // For bare repos backing worktrees, use common_dir() instead.
+            let git_dir = git_repo.workdir().unwrap_or(git_repo.common_dir());
+
+            // Prune any dangling git worktree registrations. Without this, a prior
+            // `workspace add` + `workspace forget` + manual `rm -rf` sequence leaves a
+            // stale registration that makes `git worktree add` fail with "missing but
+            // already registered worktree". `prune` only removes registrations whose
+            // directories no longer exist, so it's safe to run unconditionally.
+            let prune_output = Command::new("git")
+                .arg("-C")
+                .arg(git_dir)
+                .arg("worktree")
+                .arg("prune")
+                .env("LC_ALL", "C")
+                .output()
+                .map_err(|e| user_error(format!("Failed to run git worktree prune: {e}")))?;
+            if !prune_output.status.success() {
+                return Err(user_error(format!(
+                    "Failed to prune Git worktrees: {}",
+                    String::from_utf8_lossy(&prune_output.stderr).trim()
+                )));
+            }
+
+            // Create git worktree with an orphan branch. This avoids checking out
+            // files (jj will do its own checkout) and works even in empty repos.
+            // Use a unique branch name per workspace to avoid conflicts between worktrees.
+            // TODO: Use gix API when worktree creation is implemented.
+            // See: https://github.com/Byron/gitoxide/blob/main/crate-status.md
+            let branch_name = format!("jj-worktree-{}", workspace_name.as_str());
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(git_dir)
+                .arg("worktree")
+                .arg("add")
+                .arg("--orphan")
+                .arg("-B")
+                .arg(&branch_name)
+                .arg(&destination_path)
+                .env("LC_ALL", "C") // Disable translation so we can parse output
+                .output()
+                .map_err(|e| user_error(format!("Failed to run git worktree add: {e}")))?;
+
+            if !output.status.success() {
+                return Err(user_error(format!(
+                    "Failed to create Git worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+
+            Some(GitWorktreeGuard::new(
+                git_dir.to_path_buf(),
+                destination_path.clone(),
+            ))
+        } else {
+            if !destination_path.exists() {
+                fs::create_dir(&destination_path).context(&destination_path)?;
+            } else if !file_util::is_empty_dir(&destination_path)? {
+                return Err(user_error(
+                    "Destination path exists and is not an empty directory",
+                ));
+            }
+            None
+        }
+    };
+
+    #[cfg(not(feature = "git"))]
+    {
+        if !destination_path.exists() {
+            fs::create_dir(&destination_path).context(&destination_path)?;
+        } else if !file_util::is_empty_dir(&destination_path)? {
+            return Err(user_error(
+                "Destination path exists and is not an empty directory",
+            ));
+        }
     }
 
     let working_copy_factory = command.get_working_copy_factory()?;
@@ -134,20 +259,84 @@ pub async fn cmd_workspace_add(
         workspace_name.clone(),
     )
     .await?;
-    writeln!(
-        ui.status(),
-        "Created workspace in \"{}\"",
-        file_util::relative_path(command.cwd(), &destination_path).display()
-    )?;
-    // Show a warning if the user passed a path without a separator, since they
-    // may have intended the argument to only be the name for the workspace.
-    if !args.destination.contains(std::path::is_separator) {
-        writeln!(
-            ui.warning_default(),
-            r#"Workspace created inside current directory. If this was unintentional, delete the "{}" directory and run `jj workspace forget {name}` to remove it."#,
-            args.destination,
-            name = workspace_name.as_symbol()
-        )?;
+
+    #[cfg(feature = "git")]
+    let colocated = worktree_guard.is_some();
+    #[cfg(not(feature = "git"))]
+    let colocated = false;
+
+    // The workspace is now durably registered in the repo view. Any failure
+    // past this point must roll that registration back; otherwise a workspace
+    // without a working copy on disk (a "phantom" workspace) is left behind,
+    // still listed by `jj workspace list`.
+    let result = materialize_workspace(
+        ui,
+        command,
+        &old_workspace_command,
+        new_workspace,
+        repo,
+        &workspace_name,
+        args,
+        &destination_path,
+        colocated,
+    )
+    .await;
+
+    match result {
+        Ok(()) => {
+            // All operations succeeded - don't clean up the worktree
+            #[cfg(feature = "git")]
+            if let Some(guard) = worktree_guard {
+                guard.defuse();
+            }
+            Ok(())
+        }
+        Err(err) => {
+            writeln!(
+                ui.warning_default(),
+                "Failed to set up workspace {name}; rolling back its registration",
+                name = workspace_name.as_symbol()
+            )?;
+            if let Err(rollback_err) =
+                rollback_workspace_registration(ui, command, &workspace_name).await
+            {
+                writeln!(
+                    ui.warning_default(),
+                    "Failed to roll back registration of workspace {name}: {err}",
+                    name = workspace_name.as_symbol(),
+                    err = rollback_err.error
+                )?;
+                writeln!(
+                    ui.hint_default(),
+                    "Run `jj workspace forget {name}` to remove it.",
+                    name = workspace_name.as_symbol()
+                )?;
+            }
+            // `worktree_guard` drops here and removes the Git worktree (with a
+            // warning if that fails).
+            Err(err)
+        }
+    }
+}
+
+/// Sets up the working copy of a freshly registered workspace: checks out the
+/// initial working-copy commit and applies sparse patterns.
+#[expect(clippy::too_many_arguments)]
+async fn materialize_workspace(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    old_workspace_command: &WorkspaceCommandHelper,
+    new_workspace: Workspace,
+    repo: std::sync::Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceNameBuf,
+    args: &WorkspaceAddArgs,
+    destination_path: &Path,
+    colocated: bool,
+) -> Result<(), CommandError> {
+    // Add .gitignore to .jj directory to prevent git from tracking jj files.
+    if colocated {
+        let gitignore_path = destination_path.join(".jj").join(".gitignore");
+        fs::write(&gitignore_path, "*\n").context(&gitignore_path)?;
     }
 
     let mut new_workspace_command = command.for_workable_repo(ui, new_workspace, repo)?;
@@ -232,5 +421,103 @@ pub async fn cmd_workspace_add(
         ),
     )
     .await?;
+
+    writeln!(
+        ui.status(),
+        "Created workspace in \"{}\"",
+        file_util::relative_path(command.cwd(), destination_path).display()
+    )?;
+
+    // Show a warning if the user passed a path without a separator, since they
+    // may have intended the argument to only be the name for the workspace.
+    if !args.destination.contains(std::path::is_separator) {
+        writeln!(
+            ui.warning_default(),
+            r#"Workspace created inside current directory. If this was unintentional, delete the "{}" directory and run `jj workspace forget {name}` to remove it."#,
+            args.destination,
+            name = workspace_name.as_symbol()
+        )?;
+    }
+
     Ok(())
+}
+
+/// Removes a workspace registration that was created by this command before
+/// its working copy could be set up.
+async fn rollback_workspace_registration(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    workspace_name: &WorkspaceNameBuf,
+) -> Result<(), CommandError> {
+    // Reload the repo at the current operation head; the registration was
+    // committed after `old_workspace_command` was loaded.
+    let mut workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+    let workspace_store = SimpleWorkspaceStore::load(workspace_command.repo_path())?;
+    let mut tx = workspace_command.start_transaction();
+    tx.repo_mut().remove_wc_commit(workspace_name).await?;
+    workspace_store.forget(&[workspace_name.as_ref()])?;
+    tx.finish(
+        ui,
+        format!(
+            "roll back failed creation of workspace {name}",
+            name = workspace_name.as_symbol()
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Guard that removes a git worktree on drop, unless defused.
+#[cfg(feature = "git")]
+struct GitWorktreeGuard {
+    git_dir: PathBuf,
+    worktree_path: PathBuf,
+    defused: bool,
+}
+
+#[cfg(feature = "git")]
+impl GitWorktreeGuard {
+    fn new(git_dir: PathBuf, worktree_path: PathBuf) -> Self {
+        Self {
+            git_dir,
+            worktree_path,
+            defused: false,
+        }
+    }
+
+    /// Prevent the guard from cleaning up the worktree.
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+#[cfg(feature = "git")]
+impl Drop for GitWorktreeGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(&self.git_dir)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(&self.worktree_path)
+            .env("LC_ALL", "C")
+            .output();
+        let already_gone =
+            |stderr: &[u8]| String::from_utf8_lossy(stderr).contains("is not a working tree");
+        match &result {
+            Ok(output) if output.status.success() => {}
+            Ok(output) if already_gone(&output.stderr) => {}
+            _ => {
+                eprintln!(
+                    "Warning: failed to remove Git worktree at {path}; run `git worktree remove \
+                     --force {path}` to clean up",
+                    path = self.worktree_path.display()
+                );
+            }
+        }
+    }
 }

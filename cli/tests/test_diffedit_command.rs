@@ -141,9 +141,9 @@ fn test_diffedit() -> TestResult {
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     std::fs::write(&edit_script, "write file3\nmodified\n")?;
     let output = work_dir.run_jj(["diffedit", "-r", "@-"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kkmpptxz 9f0ebae1 (no description set)
     Parent commit (@-)      : rlvkpnrz 72bcd8e9 (no description set)
     Added 0 files, modified 1 files, removed 0 files
@@ -214,9 +214,9 @@ fn test_diffedit() -> TestResult {
         .join("\0"),
     )?;
     let output = work_dir.run_jj(["diffedit", "--to", "@-"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kkmpptxz 9a4e9bcc (no description set)
     Parent commit (@-)      : rlvkpnrz fb5c77f4 (no description set)
     [EOF]
@@ -236,6 +236,60 @@ fn test_diffedit() -> TestResult {
     D file1
     [EOF]
     ");
+    Ok(())
+}
+
+#[test]
+fn test_diffedit_file_by_file() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_diff_editor();
+    test_env.add_config(r#"merge-tools.fake-diff-editor.edit-invocation-mode = "file-by-file""#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("file1", "a\n");
+    work_dir.write_file("file2", "a\n");
+    work_dir.run_jj(["new"]).success();
+    work_dir.remove_file("file1");
+    work_dir.write_file("file2", "b\n");
+    work_dir.write_file("file3", "c\n");
+    work_dir.run_jj(["debug", "snapshot"]).success();
+
+    // The editor should be invoked once per changed file, with file paths
+    // rather than directory paths. The fake editor prints the file basenames
+    // on each invocation, so we expect one stanza per changed file. Note that
+    // JJ-INSTRUCTIONS is *not* expected to appear: file-by-file mode iterates
+    // only the changed files, not the working-copy directory.
+    std::fs::write(
+        &edit_script,
+        [
+            "print ==",
+            "print-files-before",
+            "print --",
+            "print-files-after",
+        ]
+        .join("\0"),
+    )?;
+    let output = work_dir.run_jj(["diffedit"]);
+    insta::assert_snapshot!(output, @r"
+    ==
+    file1
+    --
+    file1
+    ==
+    file2
+    --
+    file2
+    ==
+    file3
+    --
+    file3
+    [EOF]
+    ------- stderr -------
+    Nothing changed.
+    [EOF]
+    ");
+
     Ok(())
 }
 
@@ -424,7 +478,7 @@ fn test_diffedit_external_tool_conflict_marker_style() -> TestResult {
         .join("\0"),
     )?;
     let output = work_dir.run_jj(["diffedit"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Working copy  (@) now at: mzvwutvl a2e4617e (conflict) (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 74e448a1 side-a
@@ -666,9 +720,9 @@ fn test_diffedit_merge() -> TestResult {
         "files-before file1\0files-after JJ-INSTRUCTIONS file1 file3\0rm file1",
     )?;
     let output = work_dir.run_jj(["diffedit", "-r", "@-"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: yqosqzyt 9fc53f3e (conflict) (empty) (no description set)
     Parent commit (@-)      : royxmykx 70ca98fe (conflict) merge
     Added 0 files, modified 0 files, removed 1 files
@@ -818,9 +872,9 @@ fn test_diffedit_restore_descendants() -> TestResult {
     // Add a ";" after the line with "bar". There should be no conflict.
     std::fs::write(edit_script, "write file\nprintln!(\"bar\");\n")?;
     let output = work_dir.run_jj(["diffedit", "-r", "@-", "--restore-descendants"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits (while preserving their content)
+    Rebased 1 descendant commits (while preserving their content).
     Working copy  (@) now at: kkmpptxz a35ef1a5 (no description set)
     Parent commit (@-)      : rlvkpnrz 2e949a84 (no description set)
     [EOF]

@@ -79,10 +79,12 @@ You can have multiple working copies backed by a single repo. Use
 directory together is called a "workspace". Each workspace can have a different
 commit checked out.
 
-Having multiple workspaces can be useful for running long-running tests in a one
+Having multiple workspaces can be useful for running long-running tests in one
 while you continue developing in another, for example. If needed,
 `jj workspace root --name <workspace>` prints the root path of the specified
 workspace (defaults to the current one).
+
+`jj workspace list` shows every workspace together with its available root path.
 
 When you're done using a workspace, use `jj workspace forget` to make the repo
 forget about it. The files can be deleted from disk separately (either before or

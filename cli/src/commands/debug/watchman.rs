@@ -128,7 +128,7 @@ pub async fn cmd_debug_watchman(
                 .reset_watchman()
                 .map_err(|err| CommandError::from_snapshot_error(err, &path_converter))?;
             locked_ws.finish(repo.op_id().clone()).await?;
-            writeln!(ui.status(), "Reset Watchman clock")?;
+            writeln!(ui.status(), "Reset Watchman clock.")?;
         }
     }
     Ok(())

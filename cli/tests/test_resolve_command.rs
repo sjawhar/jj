@@ -571,10 +571,10 @@ fn test_files_still_have_conflicts() -> TestResult {
         "--config",
         "hints.resolving-conflicts=false",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Resolving conflicts in: file1
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     New conflicts appeared in 1 commits:
       vruxwmqv b7972990 conflict | (conflict) conflict
     Warning: After this operation, some files at this revision still have conflicts:
@@ -593,10 +593,10 @@ fn test_files_still_have_conflicts() -> TestResult {
         "--config",
         "hints.resolving-conflicts=false",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Resolving conflicts in: file1
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: znkkpsqq b97a283e c | (conflict) (empty) c
     Parent commit (@-)      : vruxwmqv e97ef12c conflict | (conflict) conflict
     Added 0 files, modified 1 files, removed 0 files
@@ -1464,7 +1464,7 @@ fn test_resolve_change_delete_executable() -> TestResult {
 
     // Take modified content, the executable bit should be kept as "x"
     let output = work_dir.run_jj(["resolve", "file5", "--tool=:theirs"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Working copy  (@) now at: kmkuslsw 7337267a conflict | conflict
     Parent commit (@-)      : mzvwutvl e2d3924b a | a
@@ -2275,9 +2275,9 @@ fn test_resolve_with_contents_of_side() -> TestResult {
     // Check that ":ours" merge tool works correctly
     insta::assert_snapshot!(work_dir.run_jj(["diff", "--git"]), @"");
     let output = work_dir.run_jj(["resolve", "-r", "conflict", "--tool", ":ours"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kmkuslsw 6cca6d79 tip | (empty) tip
     Parent commit (@-)      : znkkpsqq b84d5da4 conflict | conflict
     Added 0 files, modified 2 files, removed 0 files
@@ -2296,9 +2296,9 @@ fn test_resolve_with_contents_of_side() -> TestResult {
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     insta::assert_snapshot!(work_dir.run_jj(["diff", "--git"]), @"");
     let output = work_dir.run_jj(["resolve", "-r", "conflict", "--tool", ":theirs"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kmkuslsw 4a54e224 tip | (empty) tip
     Parent commit (@-)      : znkkpsqq ffd341c7 conflict | conflict
     Added 0 files, modified 2 files, removed 0 files

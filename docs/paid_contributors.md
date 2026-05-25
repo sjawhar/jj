@@ -15,6 +15,7 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 * ConnerPetzold
 * davidbarsky
 * ilyagr
+* martinvonz
 * steveklabnik
 * thoughtpolice
 
@@ -22,6 +23,7 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 
 * 06393993
 * 2079884FDavid
+* ajaspers
 * algmyr
 * AM5800
 * aspotashev
@@ -42,7 +44,6 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 * kevincliao
 * kiranani
 * lukegb
-* martinvonz
 * matts1
 * matttproud
 * michaelchirico

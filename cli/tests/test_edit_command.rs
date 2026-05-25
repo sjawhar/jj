@@ -74,13 +74,13 @@ fn test_edit() {
     // Changes in the working copy are amended into the commit
     work_dir.write_file("file2", "0");
     let output = get_log_output(&work_dir);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ○  29c4ac30d18f second
     @  b10da1f49611 first
     ◆  000000000000
     [EOF]
     ------- stderr -------
-    Rebased 1 descendant commits onto updated working copy
+    Rebased 1 descendant commits onto updated working copy.
     [EOF]
     ");
 
@@ -106,16 +106,16 @@ fn test_edit_current() {
 
     // Editing the current revision is a no-op
     let output = work_dir.run_jj(["edit", "@"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Already editing that commit
+    Already editing that commit.
     [EOF]
     ");
 
     // No operation created
     let output = work_dir.run_jj(["op", "log", "--limit=1"]);
     insta::assert_snapshot!(output, @"
-    @  90267f31f904 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
+    @  e39dc288903d test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
     │  add workspace 'default'
     [EOF]
     ");

@@ -67,7 +67,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::iter;
+use std::rc::Rc;
 
+use futures::future::try_join_all;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
@@ -155,16 +157,6 @@ where
     pub graph: SimpleDirectedGraph<N>,
     /// The start node.
     pub start_node: N,
-}
-
-impl<N> FlowGraph<N>
-where
-    N: Clone + Eq + Hash,
-{
-    /// Constructs a new FlowGraph.
-    pub fn new(graph: SimpleDirectedGraph<N>, start_node: N) -> Self {
-        Self { graph, start_node }
-    }
 }
 
 /// Calculates the dominators in a flow graph. Also has a method for finding the
@@ -385,6 +377,231 @@ where
     }
 }
 
+/// Errors that can occur while finding a dominator value (i.e. a dominator in a
+/// value flow graph).
+#[derive(Debug, Error, PartialEq)]
+pub enum FindDominatorValueError<E> {
+    /// An error occurred while computing the value of a node.
+    #[error(transparent)]
+    ValueFnError(E),
+    /// An error occurred while finding the dominator.
+    #[error(transparent)]
+    DominatorFinderError(#[from] DominatorFinderError),
+}
+
+/// Helper struct for constructing a value flow graph. It caches the results
+/// of applying value_fn to nodes, and also keeps track of the mapping from
+/// values to nodes and nodes to values.
+pub struct ValueCache<N, V, VF> {
+    /// The function that emits values.
+    value_fn: VF,
+    /// Maps nodes to their corresponding values.
+    node_values: HashMap<N, Rc<V>>,
+    /// Maps values to the nodes that have that value.
+    value_to_nodes: HashMap<Rc<V>, Vec<N>>,
+}
+
+impl<N, V, VF, E> ValueCache<N, V, VF>
+where
+    N: Hash + Eq + Clone,
+    V: Hash + Eq,
+    VF: AsyncFn(&N) -> Result<V, E>,
+{
+    /// Creates a new ValueCache that uses the given function to get values.
+    pub fn new(value_fn: VF) -> Self {
+        Self {
+            value_fn,
+            node_values: HashMap::new(),
+            value_to_nodes: HashMap::new(),
+        }
+    }
+
+    /// Returns the value for the given node, computing it if it is not already
+    /// cached.
+    pub async fn get_value(&mut self, node: &N) -> Result<Rc<V>, E> {
+        let values = self.get_values([node]).await?;
+        assert_eq!(values.len(), 1);
+        Ok(values[0].clone())
+    }
+
+    /// Returns the nodes that have the given value.
+    pub fn get_nodes_for_value(&self, value: &Rc<V>) -> Option<&Vec<N>> {
+        self.value_to_nodes.get(value)
+    }
+
+    /// Returns the value of the given nodes, computing them (if they are not
+    /// already cached) asynchronously and concurrently. The result will have
+    /// the same cardinality as `nodes`, and may contain duplicate values
+    /// (e.g. if multiple nodes have the same value, or if
+    /// there are repeated nodes). The order of the result is not specified
+    /// (any order is possible).
+    async fn get_values<'a, NI>(&mut self, nodes: NI) -> Result<Vec<Rc<V>>, E>
+    where
+        N: 'a,
+        NI: IntoIterator<Item = &'a N>,
+    {
+        let mut values = vec![];
+        let mut futures = vec![];
+
+        // 1. Filter out nodes already in the map and create futures for new nodes.
+        for node in nodes {
+            match self.node_values.get(node) {
+                Some(value) => {
+                    values.push(value.clone());
+                }
+                None => {
+                    // This node is not cached, we will compute its value.
+                    futures.push(async {
+                        let value = (self.value_fn)(node).await?;
+                        Ok((node.clone(), Rc::new(value)))
+                    });
+                }
+            }
+        }
+        // 2. Run all new futures concurrently
+        let new_results: Vec<(N, Rc<V>)> = try_join_all(futures).await?;
+        // 3. Insert the new entries into the maps.
+        for (node, value) in new_results {
+            self.node_values.insert(node.clone(), value.clone());
+            self.value_to_nodes
+                .entry(value.clone())
+                .or_default()
+                .push(node);
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+impl<N> FlowGraph<N>
+where
+    N: Clone + Eq + Hash,
+{
+    /// Constructs a new FlowGraph.
+    pub fn new(graph: SimpleDirectedGraph<N>, start_node: N) -> Self {
+        Self { graph, start_node }
+    }
+
+    /// Creates a flow graph of values from a flow graph of nodes.
+    ///
+    /// More precisely, let G be a FlowGraph of nodes with start node S. The
+    /// value flow graph G' is a FlowGraph derived from G. Let v(g) be the
+    /// result of applying value_fn to g. The nodes of G' are the set of values
+    /// v(g), for all g in G. For each edge g1->g2 in G, there is a
+    /// corresponding edge v(g1)->v(g2) in G'. The start node in G' is v(S).
+    ///
+    /// Returns an error if any value_fn invocation fails.
+    pub fn create_value_flow_graph<'a, V>(&self, node_values: &'a HashMap<N, V>) -> FlowGraph<&'a V>
+    where
+        V: Eq + Hash,
+    {
+        let mut edges = vec![];
+        let start_value = node_values.get(&self.start_node).expect("cached");
+        for (parent, children) in &self.graph.adj {
+            let parent_value = node_values.get(parent).expect("cached");
+            for child in children {
+                let child_value = node_values.get(child).expect("cached");
+                edges.push((parent_value, child_value));
+            }
+        }
+        FlowGraph::new(SimpleDirectedGraph::new(edges), start_value)
+    }
+
+    /// Constructs a value flow graph from the given flow graph and value
+    /// function, and finds the closest common dominator value for the
+    /// values of the final nodes. Returns an error if value_fn returns an
+    /// error for any node in the flow graph. `final_nodes` must not be empty.
+    pub async fn find_dominator_value<'a, NI, V, VF, E>(
+        &'a self,
+        final_nodes: NI,
+        value_fn: VF,
+    ) -> Result<V, FindDominatorValueError<E>>
+    where
+        NI: IntoIterator<Item = &'a N>,
+        V: Hash + Eq + Clone,
+        VF: AsyncFn(&N) -> Result<V, E>,
+    {
+        let mut value_cache = ValueCache::new(value_fn);
+        let value_rc = self
+            .find_dominator_value_with_value_cache(final_nodes, &mut value_cache)
+            .await?;
+        Ok((*value_rc).clone())
+    }
+
+    /// Constructs a value flow graph from the given flow graph and value_cache,
+    /// and finds the closest common dominator value (in the value flow graph)
+    /// of the values of the final nodes.
+    ///
+    /// Returns an error if final_nodes is empty or if value_cache returns an
+    /// error.
+    pub async fn find_dominator_value_with_value_cache<'a, NI, V, VF, E>(
+        &'a self,
+        final_nodes: NI,
+        value_cache: &mut ValueCache<N, V, VF>,
+    ) -> Result<Rc<V>, FindDominatorValueError<E>>
+    where
+        NI: IntoIterator<Item = &'a N>,
+        V: Hash + Eq,
+        VF: AsyncFn(&N) -> Result<V, E>,
+    {
+        // First compute the values of all final nodes asynchronously and concurrently.
+        let final_values = value_cache
+            .get_values(final_nodes)
+            .await
+            .map_err(|e| FindDominatorValueError::ValueFnError(e))?;
+
+        match &*final_values {
+            [] => {
+                return Err(FindDominatorValueError::DominatorFinderError(
+                    DominatorFinderError::EmptyTargetSet,
+                ));
+            }
+            [final_value] => {
+                // Optimization: if all final nodes have the same value, that value is the
+                // closest common dominator. There is no need to build the value flow graph.
+                return Ok(final_value.clone());
+            }
+            _ => {}
+        }
+
+        let start_value = value_cache
+            .get_value(&self.start_node)
+            .await
+            .map_err(|err| FindDominatorValueError::ValueFnError(err))?;
+        if final_values.contains(&start_value) {
+            return Ok(Rc::clone(&start_value));
+        }
+
+        // Compute all remaining values.
+        value_cache
+            .get_values(self.graph.nodes())
+            .await
+            .map_err(|err| FindDominatorValueError::ValueFnError(err))?;
+
+        // NOTE: at this point we could compare the cardinality of the value set versus
+        // the number of nodes: if equal then we know that every node has a
+        // different value, and it is tempting to conclude that the result should be
+        // `start_value` (because the shape of the value flow graph is identical
+        // to the shape of the original flow graph). That is not always correct,
+        // consider this example with start node A and final nodes C and D:
+        //
+        // A(1) -> B(2) -> C(3)
+        //            \--> D(4)
+        //
+        // However, IF start node IS the closest common dominator of the original graph
+        // (it is not in the example above) then the answer would be `start_value`;
+        // so IF we knew that to be true we could skip building the value flow graph and
+        // running the dominator algorithm in the value flow graph.
+
+        let value_flow_graph = self.create_value_flow_graph(&value_cache.node_values);
+        let dominator_finder = DominatorFinder::calculate(&value_flow_graph)?;
+        let dominator_value =
+            dominator_finder.find_closest_common_dominator(final_values.iter())?;
+
+        Ok(Rc::clone(dominator_value))
+    }
+}
+
 /// Traverses nodes from `start_node` in post-order.
 fn post_order<T, NI>(
     start_node: T,
@@ -428,6 +645,7 @@ where
 #[cfg(test)]
 mod tests {
     use maplit::hashmap;
+    use pollster::FutureExt as _;
 
     use super::*;
 
@@ -1269,5 +1487,162 @@ mod tests {
         assert_eq!(post_order('C', neighbors_fn).collect_vec(), ['A', 'B', 'C']);
         assert_eq!(post_order('B', neighbors_fn).collect_vec(), ['C', 'A', 'B']);
         assert_eq!(post_order('A', neighbors_fn).collect_vec(), ['B', 'C', 'A']);
+    }
+
+    #[test]
+    fn test_value_flow_graph_new() {
+        // A(1) -> B(1) -> C(2)
+        let simple_graph = SimpleDirectedGraph::new([("A", "B"), ("B", "C")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let node_values = HashMap::from([("A", 1), ("B", 1), ("C", 2)]);
+        let value_flow_graph = flow_graph.create_value_flow_graph(&node_values);
+
+        let expected_value_edges = [(&1, &1), (&1, &2)];
+        let expected_flow_graph =
+            FlowGraph::new(SimpleDirectedGraph::new(expected_value_edges), &1);
+        assert_eq!(value_flow_graph, expected_flow_graph);
+    }
+
+    #[test]
+    fn test_value_flow_graph_find_dominator_value() {
+        // A(1) -> B(1) -> C(2) -> D(3)
+        //          \------------> E(3)
+        let simple_graph =
+            SimpleDirectedGraph::new([("A", "B"), ("B", "C"), ("C", "D"), ("B", "E")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let value_fn = async |node: &&str| match *node {
+            "A" | "B" => Ok(1),
+            "C" => Ok(2),
+            "D" | "E" => Ok(3),
+            _ => Err("Unknown node".to_string()),
+        };
+
+        // Value graph (* means node has a self-loop):
+        //   1* -> 2 -> 3
+        //    \         ^
+        //     \--------|
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["D", "E"], value_fn)
+                .block_on(),
+            Ok(3)
+        );
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["C", "D"], value_fn)
+                .block_on(),
+            Ok(1)
+        );
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["B", "C"], value_fn)
+                .block_on(),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn test_find_dominator_value_with_distinct_values() {
+        // A(1) -> B(2) -> C(3) -> D(4)
+        //          \------------> E(5)
+        let simple_graph =
+            SimpleDirectedGraph::new([("A", "B"), ("B", "C"), ("C", "D"), ("B", "E")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let value_fn = async |node: &&str| match *node {
+            "A" => Ok(1),
+            "B" => Ok(2),
+            "C" => Ok(3),
+            "D" => Ok(4),
+            "E" => Ok(5),
+            _ => Err("Unknown node".to_string()),
+        };
+
+        // Value graph:
+        // 1 -> 2 -> 3 -> 4
+        //       \------> 5
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["D", "E"], value_fn)
+                .block_on(),
+            Ok(2)
+        );
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["C", "D"], value_fn)
+                .block_on(),
+            Ok(3)
+        );
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["B", "C"], value_fn)
+                .block_on(),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn test_find_dominator_value_with_invalid_flow_graph() {
+        // Invalid flow graph: A(1) -> B(1), C(2) -> D(2) (C and D are not reachable
+        // from A).
+        let simple_graph = SimpleDirectedGraph::new([("A", "B"), ("C", "D")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let value_fn = async |node: &&str| match *node {
+            "A" | "B" => Ok(1),
+            "C" | "D" => Ok(2),
+            _ => Err("Unknown node".to_string()),
+        };
+        // Todo: the flow_graph is invalid because C and D are not reachable from A, so
+        // ideally find_dominator_value should return UnreachableNodesInFlowGraph, but
+        // the optimizations in find_dominator_value currently cause it to
+        // return the start value. The best way to fix this is to calculate (and store)
+        // the post-order in FlowGraph::new, that way we could not possibly construct an
+        // invalid flow graph. This is not a big concern in practice though.
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["B", "D"], value_fn)
+                .block_on(),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn test_find_dominator_value_with_unknown_node_in_target_set() {
+        // Flow graph: A(1) -> B(2).
+        let simple_graph = SimpleDirectedGraph::new([("A", "B")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let value_fn = async |node: &&str| match *node {
+            "A" => Ok(1),
+            "B" => Ok(2),
+            "X" => Ok(666),
+            _ => Err("Unknown node".to_string()),
+        };
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["B", "X"], value_fn)
+                .block_on(),
+            Err(FindDominatorValueError::DominatorFinderError(
+                DominatorFinderError::UnknownNodeInTargetSet
+            ))
+        );
+    }
+
+    #[test]
+    fn test_find_dominator_value_with_unknown_node() {
+        // Flow graph: A(1) -> B(2).
+        let simple_graph = SimpleDirectedGraph::new([("A", "B")]);
+        let flow_graph = FlowGraph::new(simple_graph, "A");
+        let value_fn = async |node: &&str| match *node {
+            "A" => Ok(1),
+            "B" => Ok(2),
+            _ => Err("Unknown node".to_string()),
+        };
+        assert_eq!(
+            flow_graph
+                .find_dominator_value(&["B", "X"], value_fn)
+                .block_on(),
+            Err(FindDominatorValueError::ValueFnError(
+                "Unknown node".to_string()
+            ))
+        );
     }
 }

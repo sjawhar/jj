@@ -53,8 +53,7 @@ Jujutsu attempts to resolve a symbol in the following order:
 
 1. Tag name
 2. Bookmark name
-3. Git ref
-4. Commit ID or change ID
+3. Commit ID or change ID
 
 To override the priority, use the appropriate [revset function](#functions). For
 example, to resolve `abc` as a commit ID even if there happens to be a bookmark
@@ -268,11 +267,9 @@ revsets (expressions) as arguments.
   commit is conventionally the branch into which changes are being merged, so
   `first_ancestors()` can be used to exclude changes made on other branches.
 
-* `reachable(srcs, domain)`: All commits reachable from `srcs` within
-  `domain`, traversing all parent and child edges. `srcs` outside `domain` are
-  not considered even if a parent or child edge would reach into `domain`.
-
-  This is useful for finding all related commits in a branch or feature without
+* `reachable(srcs, domain)`: All commits reachable from `srcs`, traversing all
+  parent and child edges, such that the entire path is within `domain`. This is
+  useful for finding all related commits in a branch or feature without
   traversing outside a defined scope. For example, `reachable(@, mutable())`
   returns the stack of commits you are working on.
 
@@ -352,6 +349,13 @@ revsets (expressions) as arguments.
   the revset `heads(::x_1 & ::x_2 & ... & ::x_N)`, where `x_{1..N}` are commits
   in `x`. If `x` resolves to a single commit, `fork_point(x)` resolves to `x`.
 
+* `merge_point(x)`: The merge point of all commits in `x`. Similar to the fork
+  point, the merge point is the common descendant(s) of all commits in `x` which
+  do not have any ancestors that are also common descendants of all commits in
+  `x`. It is equivalent to the revset `roots(x_1:: & x_2:: & ... & x_N::)`,
+  where `x_{1..N}` are commits in `x`. If `x` resolves to a single commit,
+  `merge_point(x)` resolves to `x`.
+
 * `bisect(x)`: Finds commits in the input set for which about half of the input
   set are descendants. The current implementation deals somewhat poorly with
   non-linear history.
@@ -361,6 +365,8 @@ revsets (expressions) as arguments.
   when you want to ensure that some revset expression has exactly one target.
 
 * `merges()`: Merge commits.
+
+* `forks()`: Fork commits, i.e. those with more than 1 child.
 
 * `description(pattern)`: Commits that have a description matching the given
   [string pattern](#string-patterns).
@@ -383,8 +389,8 @@ revsets (expressions) as arguments.
 * `author_email(pattern)`: Commits with the author's email matching the given
   [string pattern](#string-patterns).
 
-* `author_date(pattern)`: Commits with author dates matching the specified [date
-  pattern](#date-patterns).
+* `author_date(pattern)`: Commits with [author dates](glossary.md#author-date)
+  matching the specified [date pattern](#date-patterns).
 
 * `mine()`: Commits where the author's email matches the email of the current
   user. Equivalent to `author_email(exact-i:<user-email>)`
@@ -399,8 +405,9 @@ revsets (expressions) as arguments.
 * `committer_email(pattern)`: Commits with the committer's email matching the
   given [string pattern](#string-patterns).
 
-* `committer_date(pattern)`: Commits with committer dates matching the specified
-  [date pattern](#date-patterns).
+* `committer_date(pattern)`: Commits with
+  [committer dates](glossary.md#committer-date) matching the specified [date
+  pattern](#date-patterns).
 
 * `signed()`: Commits that are cryptographically signed.
 

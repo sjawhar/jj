@@ -111,7 +111,7 @@ pub(crate) async fn cmd_simplify_parents(
         if reparented_descendants > 0 {
             writeln!(
                 formatter,
-                "Rebased {reparented_descendants} descendant commits",
+                "Rebased {reparented_descendants} descendant commits.",
             )?;
         }
     }

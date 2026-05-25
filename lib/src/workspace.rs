@@ -207,10 +207,13 @@ impl Workspace {
     pub async fn init_internal_git(
         user_settings: &UserSettings,
         workspace_root: &Path,
+        object_hash: gix::hash::Kind,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer: &BackendInitializer = &|settings, store_path| {
             Ok(Box::new(crate::git_backend::GitBackend::init_internal(
-                settings, store_path,
+                settings,
+                store_path,
+                object_hash,
             )?))
         };
         let signer = Signer::from_settings(user_settings)?;
@@ -223,6 +226,7 @@ impl Workspace {
     pub async fn init_colocated_git(
         user_settings: &UserSettings,
         workspace_root: &Path,
+        object_hash: gix::hash::Kind,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|
@@ -240,6 +244,7 @@ impl Workspace {
                 settings,
                 store_path,
                 &store_relative_workspace_root,
+                object_hash,
             )?;
             Ok(Box::new(backend))
         };
@@ -604,8 +609,12 @@ impl WorkspaceLoader for DefaultWorkspaceLoader {
         store_factories: &StoreFactories,
         working_copy_factories: &WorkingCopyFactories,
     ) -> Result<Workspace, WorkspaceLoadError> {
-        let repo_loader =
-            RepoLoader::init_from_file_system(user_settings, &self.repo_path, store_factories)?;
+        let repo_loader = RepoLoader::init_from_file_system(
+            user_settings,
+            &self.repo_path,
+            store_factories,
+            Some(&self.workspace_root),
+        )?;
         let working_copy_factory = get_working_copy_factory(self, working_copy_factories)?;
         let working_copy = working_copy_factory.load_working_copy(
             repo_loader.store().clone(),

@@ -81,9 +81,9 @@ fn test_config_nonexistent_tool() {
     work_dir.write_file("file", "content\n");
     let output = work_dir.run_jj(["fix"]);
     // We inform the user about the non-existent tool
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Warning: Failed to start `nonexistent-fix-tool-binary`
+    Warning: Failed to start `nonexistent-fix-tool-binary`.
     Fixed 0 commits of 1 checked.
     Nothing changed.
     [EOF]

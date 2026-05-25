@@ -60,6 +60,7 @@ use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathComponent;
+use jj_lib::revset::RevsetExpression;
 use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::RebasedCommit;
 use jj_lib::secret_backend::SecretBackend;
@@ -201,11 +202,13 @@ impl TestEnvironment {
         let mut factories = StoreFactories::default();
         factories.add_backend("test", {
             let factory = self.test_backend_factory.clone();
-            Box::new(move |_settings, store_path| Ok(Box::new(factory.load(store_path))))
+            Box::new(move |_settings, store_path, _workspace_root| {
+                Ok(Box::new(factory.load(store_path)))
+            })
         });
         factories.add_backend(
             SecretBackend::name(),
-            Box::new(|settings, store_path| {
+            Box::new(|settings, store_path, _workspace_root| {
                 Ok(Box::new(SecretBackend::load(settings, store_path)?))
             }),
         );
@@ -217,11 +220,16 @@ impl TestEnvironment {
         settings: &UserSettings,
         repo_path: &Path,
     ) -> Arc<ReadonlyRepo> {
-        RepoLoader::init_from_file_system(settings, repo_path, &self.default_store_factories())
-            .unwrap()
-            .load_at_head()
-            .block_on()
-            .unwrap()
+        RepoLoader::init_from_file_system(
+            settings,
+            repo_path,
+            &self.default_store_factories(),
+            None,
+        )
+        .unwrap()
+        .load_at_head()
+        .block_on()
+        .unwrap()
     }
 }
 
@@ -246,7 +254,11 @@ impl TestRepoBackend {
         store_path: &Path,
     ) -> Result<Box<dyn Backend>, BackendInitError> {
         match self {
-            Self::Git => Ok(Box::new(GitBackend::init_internal(settings, store_path)?)),
+            Self::Git => Ok(Box::new(GitBackend::init_internal(
+                settings,
+                store_path,
+                gix::hash::Kind::default(),
+            )?)),
             Self::Simple => Ok(Box::new(SimpleBackend::init(store_path))),
             Self::Test => Ok(Box::new(env.test_backend_factory.init(store_path))),
         }
@@ -758,6 +770,22 @@ pub fn write_random_commit_with_parents(mut_repo: &mut MutableRepo, parents: &[&
         .write_unwrap()
 }
 
+pub fn write_random_commit_with_parents_and_description(
+    mut_repo: &mut MutableRepo,
+    parents: &[&Commit],
+    description: &str,
+) -> Commit {
+    let parents = if parents.is_empty() {
+        &[&mut_repo.store().root_commit()]
+    } else {
+        parents
+    };
+    create_random_commit(mut_repo)
+        .set_description(description)
+        .set_parents(parents.iter().map(|commit| commit.id().clone()).collect())
+        .write_unwrap()
+}
+
 pub fn write_working_copy_file(workspace_root: &Path, path: &RepoPath, contents: impl AsRef<[u8]>) {
     let path = path.to_fs_path(workspace_root).unwrap();
     if let Some(parent) = path.parent() {
@@ -778,8 +806,9 @@ pub fn rebase_descendants_with_options_return_map(
     repo: &mut MutableRepo,
     options: &RebaseOptions,
 ) -> HashMap<CommitId, CommitId> {
+    let immutable = RevsetExpression::none();
     let mut rebased: HashMap<CommitId, CommitId> = HashMap::new();
-    repo.rebase_descendants_with_options(options, |old_commit, rebased_commit| {
+    repo.rebase_descendants_with_options(&immutable, options, |old_commit, rebased_commit| {
         let old_commit_id = old_commit.id().clone();
         let new_commit_id = match rebased_commit {
             RebasedCommit::Rewritten(new_commit) => new_commit.id().clone(),

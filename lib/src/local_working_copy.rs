@@ -1068,6 +1068,19 @@ impl TreeState {
         Ok(wc)
     }
 
+    /// Like `init` but does not persist the initial empty tree state to
+    /// disk. Use when the caller will save state itself only after a
+    /// successful operation (e.g. to use `tree_state` file absence as a
+    /// dirty marker).
+    pub fn init_without_saving(
+        store: Arc<Store>,
+        working_copy_path: PathBuf,
+        state_path: PathBuf,
+        tree_state_settings: &TreeStateSettings,
+    ) -> Self {
+        Self::empty(store, working_copy_path, state_path, tree_state_settings)
+    }
+
     fn empty(
         store: Arc<Store>,
         working_copy_path: PathBuf,
@@ -2160,8 +2173,7 @@ impl TreeState {
             debug_assert_ne!(
                 target.as_os_str().to_str().map(|path| path.contains('/')),
                 Some(true),
-                "Expect the symlink target doesn't contain \"/\", but got invalid symlink target: \
-                 {}.",
+                r#"Expect the symlink target doesn't contain "/", but got invalid symlink target: {}."#,
                 target.display()
             );
         }
@@ -2536,7 +2548,7 @@ impl TreeState {
                 }
                 Err(err) => (path, Err(err)),
             })
-            .buffered(self.store.concurrency().max(1));
+            .buffered(self.store.concurrency());
 
         // If a conflicted file didn't change between the two trees, but the conflict
         // labels did, we still need to re-materialize it in the working copy. We don't

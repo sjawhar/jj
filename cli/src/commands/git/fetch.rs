@@ -18,7 +18,6 @@ use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
 use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::git;
-use jj_lib::git::FetchTagsOverride;
 use jj_lib::git::GitFetch;
 use jj_lib::git::GitFetchRefExpression;
 use jj_lib::git::GitSettings;
@@ -101,13 +100,12 @@ pub struct GitFetchArgs {
     /// [logical operators]:
     ///     https://docs.jj-vcs.dev/latest/revsets/#string-patterns
     #[arg(long = "tag", short, group = "specific", value_name = "TAG")]
-    #[arg(hide = true)] // TODO: unhide when this gets stabilized (#7528)
     tags: Option<Vec<String>>,
 
-    /// Fetch only tracked bookmarks
+    /// Fetch only tracked bookmarks and tags
     ///
-    /// This fetches only bookmarks that are already tracked from the specified
-    /// remote(s).
+    /// This fetches only bookmarks and tags that are already tracked from the
+    /// specified remote(s).
     #[arg(long, conflicts_with = "specific")]
     tracked: bool,
 
@@ -200,8 +198,7 @@ pub async fn cmd_git_fetch(
             );
             let ref_expr = GitFetchRefExpression { bookmark, tag };
             let expanded = expand_fetch_refspecs(remote, ref_expr)?;
-            let no_implicit_tags = true;
-            expansions.push((remote, expanded, no_implicit_tags));
+            expansions.push((remote, expanded));
         }
     } else {
         let git_repo = get_git_backend(tx.repo_mut().store())?.git_repo();
@@ -215,17 +212,16 @@ pub async fn cmd_git_fetch(
                 warn_ignored_refspecs(ui, remote, ignored)?;
                 expr
             };
-            let (tag, no_implicit_tags) = if let Some(expr) = &common_tag_expr {
-                (expr.clone(), true)
+            let tag = if let Some(expr) = &common_tag_expr {
+                expr.clone()
             } else if let Some(expr) = parse_remote_fetch_tags(ui, &remote_settings, remote)? {
-                (expr, true)
+                expr
             } else {
-                // TODO: disable implicit fetching and set this to "all" (#7528)
-                (StringExpression::none(), false)
+                StringExpression::all()
             };
             let ref_expr = GitFetchRefExpression { bookmark, tag };
             let expanded = expand_fetch_refspecs(remote, ref_expr)?;
-            expansions.push((remote, expanded, no_implicit_tags));
+            expansions.push((remote, expanded));
         }
     }
 
@@ -237,12 +233,9 @@ pub async fn cmd_git_fetch(
         &import_options,
     )?;
 
-    for (remote, expanded, no_implicit_tags) in expansions {
+    for (remote, expanded) in expansions {
         let mut callback = GitSubprocessUi::new(ui);
-        // Disable implicit tag fetching if patterns are explicitly set. NoTags
-        // will be the default when this feature gets stabilized. (#7528)
-        let fetch_tags = no_implicit_tags.then_some(FetchTagsOverride::NoTags);
-        git_fetch.fetch(remote, expanded, &mut callback, None, fetch_tags)?;
+        git_fetch.fetch(remote, expanded, &mut callback, None)?;
     }
 
     let import_stats = git_fetch.import_refs().await?;

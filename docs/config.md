@@ -191,8 +191,8 @@ commit_id = "ansi-color-81"
 
 If you use a string value for a color, as in the examples above, it will be used
 for the foreground color. You can also set the background color, reverse colors
-(swap foreground and background), or make the text bold, dim, italic, or
-underlined. For that, you need to use a table:
+(swap foreground and background), or make the text bold, dim, italic,
+underlined, or crossed-out. For that, you need to use a table:
 
 ```toml
 [colors]
@@ -435,10 +435,13 @@ diff-formatter = ":git"
 
 #### Color-words diff options
 
-In color-words diffs, changed words are displayed inline by default. Because
-it's difficult to read a diff line with many removed/added words, there's a
-threshold to switch to traditional separate-line format. You can also change
-the default number of lines of context shown.
+In color-words diffs, changed words are displayed inline by default when color
+is enabled. When the formatter cannot emit color, changed words are always shown
+on separate lines because inline changes would not be distinguishable.
+
+Because it's difficult to read a diff line with many removed/added words, there's
+a threshold to switch to traditional separate-line format in colorized output.
+You can also change the default number of lines of context shown.
 
 * `max-inline-alternation`: Maximum number of removed/added word alternation to
   inline. For example, `<added> ... <added>` sequence has 1 alternation, so the
@@ -614,12 +617,7 @@ needing the original behavior.
 You can configure the template used when no `-T` is specified.
 
 - `templates.config_list` for `jj config list`
-
-```toml
-[templates]
-# Use builtin config list template
-config_list = "builtin_config_list"
-```
+- `templates.workspace_list` for `jj workspace list`
 
 If you want to see the config variable origin (type and path) when you do `jj config list`
 you can add this to your config:
@@ -643,6 +641,13 @@ log = "main@origin.."
 
 The default value for `revsets.log` is
 `'present(@) | ancestors(immutable_heads().., 2) | trunk()'`.
+
+!!! warning
+
+    When `revsets.short-prefixes` is not specified, it defaults to the value of `revsets.log`. This
+    affects how change and commit id references are resolved when multiple commits share a common
+    prefix. Changing `revsets.log` without also setting `revsets.short-prefixes` might increase the
+    length of prefixes needed on the command-line, especially in large repositories.
 
 ### Default revisions for operation diffs
 
@@ -1127,12 +1132,25 @@ edit-args = ["--newtab", "$left", "$right"]
 
 `jj` makes the following substitutions:
 
-- `$left` and `$right` are replaced with the paths to the left and right
-  directories to diff respectively.
+- `$left` is a directory containing the original contents before any changes.
+
+- `$right` is the directory containing the changed contents.
+  Edits are read back from here, so this is where tools should make changes.
 
 - If no `edit-args` are specified, `["$left", "$right"]` are set by default.
 
 - If `edit-args = []`, `jj` will refuse to use this tool for diff editing. This is a way to explicitly state that a certain tool (e.g. `mergiraf`) does not work for diff editing.
+
+Like diff viewing, diff editors are invoked with a directory containing the left
+and right sides by default. The `edit-invocation-mode` config controls this
+independently of `diff-invocation-mode`, so you can, for example, keep
+directory-based diff viewing but launch the diff editor once per changed file:
+
+```toml
+[merge-tools.my-tool]
+diff-invocation-mode = "dir"
+edit-invocation-mode = "file-by-file"
+```
 
 Finally, `ui.diff-editor` can be a list that specifies a command and its arguments.
 
@@ -1540,6 +1558,29 @@ Then to use the tool in a specific repository, set the `enabled` config:
 $ jj config set --repo fix.tools.rustfmt.enabled true
 ```
 
+## `run`: Running commands across revisions {: #run }
+
+The `jj run` command executes a command against each revision in a set,
+checking out each one into an isolated working copy, running the command, and
+amending the revision with any resulting changes.
+
+### `run.jobs`: Default parallelism {: #run.jobs }
+
+By default `jj run` processes one revision at a time. You can increase
+parallelism with the `run.jobs` setting:
+
+```toml
+[run]
+jobs = 8
+```
+
+The value must be a positive integer. The `--jobs` / `-j` CLI flag overrides
+this setting for a single invocation:
+
+```shell
+jj run -j 4 -- cargo fmt
+```
+
 ## Commit Signing
 
 `jj` can be configured to sign and verify the commits it creates using either
@@ -1719,6 +1760,23 @@ default. Set `git.colocate` to `false` to disable it.
 See [Colocated Jujutsu/Git workspaces](git-compatibility.md#colocated-jujutsugit-repos)
 for more information.
 
+### Default object hash format
+
+Traditionally, Git used the SHA-1 hash function to compute the identifiers for
+[objects]. Because SHA-1 is not considered cryptographically secure anymore, Git
+is in the [process of transitioning][transition] to a stronger hash function,
+namely SHA-256.
+
+Currently, the object hash function can only be set when initializing a new Git
+repository. The setting `git.object-hash` controls the default choice for that
+purpose. It can take the values `sha1` (default) and `sha256`.
+
+Note that at the moment there is no interopability between the formats, and not
+all code forges support SHA-256 repositories yet.
+
+[objects]: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
+[transition]: https://git-scm.com/docs/hash-function-transition
+
 ### Default remotes for `jj git fetch` and `jj git push`
 
 By default, if a single remote exists it is used for `jj git fetch` and `jj git
@@ -1762,9 +1820,9 @@ pattern](./revsets.md#string-patterns) that matches the names of the bookmarks
 and tags to fetch. If `remotes.<name>.fetch-bookmarks` is not configured, the
 default fetch refspecs for the remotes are read from the Git configuration.
 
-Note that **`remotes.<name>.fetch-tags` is experimental**. Tags matching this
-pattern will be fetched as tracked `<name>@<remote>` tags, and corresponding
-local tags will be created.
+The glob pattern supports only `*` (other wildcard characters like `?` are *not*
+supported). You can combine patterns with logical operators to specify multiple
+bookmarks and tags, but only union and negative intersection are supported.
 
 ```toml
 [remotes.origin]
@@ -2179,6 +2237,17 @@ JJ_CONFIG= jj log       # Ignores any settings specified in any config files.
 
 There are also the `--config-file <PATH>` and `--config <NAME=VALUE>`
 [global options](./cli-reference.md#options) which work with any `jj` command.
+
+### System config files
+
+On unix-like platforms, system-wide `jj` configurations are by default loaded in
+the following precedence order (with later configs overriding earlier ones).
+
+- `/etc/jj/config.toml`
+- `/etc/jj/conf.d/*.toml`
+
+These configs can be overridden by [the user config files], and will be disabled
+in favor of the `JJ_CONFIG` environment variable if it is set.
 
 ### JSON Schema Support
 

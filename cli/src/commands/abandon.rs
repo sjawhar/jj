@@ -117,6 +117,7 @@ pub(crate) async fn cmd_abandon(
     tx.repo_mut()
         .transform_descendants_with_options(
             to_abandon.iter().cloned().collect(),
+            &RevsetExpression::none(),
             &HashMap::new(),
             &options,
             async |rewriter| {
@@ -167,12 +168,12 @@ pub(crate) async fn cmd_abandon(
                 writeln!(
                     formatter,
                     "Rebased {num_rebased} descendant commits (while preserving their content) \
-                     onto parents of abandoned commits",
+                     onto parents of abandoned commits.",
                 )?;
             } else {
                 writeln!(
                     formatter,
-                    "Rebased {num_rebased} descendant commits onto parents of abandoned commits",
+                    "Rebased {num_rebased} descendant commits onto parents of abandoned commits.",
                 )?;
             }
         }

@@ -32,6 +32,7 @@ use jj_lib::git;
 use jj_lib::git::FailedRefExportReason;
 use jj_lib::git::GitExportStats;
 use jj_lib::git::GitImportOptions;
+use jj_lib::git::GitImportRefUpdate;
 use jj_lib::git::GitImportStats;
 use jj_lib::git::GitProgress;
 use jj_lib::git::GitPushStats;
@@ -39,9 +40,6 @@ use jj_lib::git::GitRefKind;
 use jj_lib::git::GitSettings;
 use jj_lib::git::GitSidebandLineTerminator;
 use jj_lib::git::GitSubprocessCallback;
-use jj_lib::op_store::RefTarget;
-use jj_lib::op_store::RemoteRef;
-use jj_lib::ref_name::RemoteRefSymbol;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use jj_lib::settings::RemoteSettingsMap;
@@ -64,18 +62,77 @@ pub fn is_colocated_git_workspace(workspace: &Workspace, repo: &ReadonlyRepo) ->
     let Ok(git_backend) = git::get_git_backend(repo.store()) else {
         return false;
     };
-    let Some(git_workdir) = git_backend.git_workdir() else {
-        return false; // Bare repository
-    };
-    if git_workdir == workspace.workspace_root() {
-        return true;
-    }
-    // Colocated workspace should have ".git" directory, file, or symlink. Compare
-    // its parent as the git_workdir might be resolved from the real ".git" path.
-    let Ok(dot_git_path) = dunce::canonicalize(workspace.workspace_root().join(".git")) else {
+
+    let dot_git_path = workspace.workspace_root().join(".git");
+    let dot_git_exists = dot_git_path.exists();
+
+    // Check if the git backend has a working directory (non-bare)
+    if let Some(git_workdir) = git_backend.git_workdir() {
+        // Primary colocated workspace: git workdir matches workspace root
+        if git_workdir == workspace.workspace_root() {
+            return true;
+        }
+
+        // Colocated workspace should have ".git" directory, file, or symlink. Compare
+        // its parent as the git_workdir might be resolved from the real ".git" path.
+        if let Ok(dot_git_canonical) = dunce::canonicalize(&dot_git_path)
+            && dunce::canonicalize(git_workdir).ok().as_deref() == dot_git_canonical.parent()
+        {
+            return true;
+        }
+
+        // Fall through to check if this might be a secondary colocated
+        // workspace (git worktree) created with `jj workspace add`
+    } else {
+        // Bare repository - can't be colocated
         return false;
-    };
-    dunce::canonicalize(git_workdir).ok().as_deref() == dot_git_path.parent()
+    }
+
+    // Check for secondary colocated workspaces (git worktrees) by comparing the
+    // common_dir of the workspace's .git with jj's backing repo. This only applies
+    // to gitlink files (.git files pointing to worktree directories), not .git
+    // directories.
+    tracing::debug!(
+        ?dot_git_path,
+        exists = dot_git_exists,
+        "Checking for worktree colocation"
+    );
+    let is_gitlink = dot_git_exists
+        && dot_git_path
+            .symlink_metadata()
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+    if is_gitlink {
+        match gix::ThreadSafeRepository::open_opts(&dot_git_path, gix::open::Options::isolated()) {
+            Ok(workspace_repo) => {
+                let workspace_common_dir = workspace_repo.to_thread_local().common_dir().to_owned();
+                let store_common_dir = git_backend.git_repo().common_dir().to_owned();
+                tracing::debug!(
+                    ?workspace_common_dir,
+                    ?store_common_dir,
+                    "Comparing common_dirs"
+                );
+                if let (Ok(ws_canonical), Ok(store_canonical)) = (
+                    dunce::canonicalize(&workspace_common_dir),
+                    dunce::canonicalize(&store_common_dir),
+                ) {
+                    tracing::debug!(?ws_canonical, ?store_canonical, "Canonicalized common_dirs");
+                    if ws_canonical == store_canonical {
+                        return true;
+                    }
+                }
+                // .git opened successfully but common_dir doesn't match - not
+                // colocated
+            }
+            Err(e) => {
+                tracing::debug!(?e, "Failed to open workspace as git repo");
+                // Broken worktree - not colocated
+            }
+        }
+        return false;
+    }
+
+    false
 }
 
 /// Parses user-specified remote URL or path to absolute form.
@@ -209,7 +266,6 @@ pub fn load_git_import_options(
     remote_settings: &RemoteSettingsMap,
 ) -> Result<GitImportOptions, CommandError> {
     Ok(GitImportOptions {
-        auto_local_bookmark: git_settings.auto_local_bookmark,
         abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
         record_synthetic_predecessors: git_settings.record_synthetic_predecessors,
         remote_auto_track_bookmarks: parse_remote_auto_track_bookmarks_map(ui, remote_settings)?,
@@ -239,9 +295,7 @@ fn print_imported_changes(
     ] {
         let refs_stats = changes
             .iter()
-            .map(|(symbol, (remote_ref, ref_target))| {
-                RefStatus::new(kind, symbol.as_ref(), remote_ref, ref_target, tx.repo())
-            })
+            .map(|update| RefStatus::new(kind, update, tx.repo()))
             .collect_vec();
         let Some(max_width) = refs_stats.iter().map(|x| x.symbol.width()).max() else {
             continue;
@@ -259,6 +313,13 @@ fn print_imported_changes(
         )?;
         let template = tx.commit_summary_template();
         print_updated_commits(formatter, &template, &stats.abandoned_commits)?;
+    }
+    if !stats.rewritten_commit_ids.is_empty() {
+        writeln!(
+            formatter,
+            "Updated {} rewritten commits.",
+            stats.rewritten_commit_ids.len()
+        )?;
     }
 
     Ok(())
@@ -294,14 +355,21 @@ fn print_failed_git_import(ui: &Ui, stats: &GitImportStats) -> Result<(), Comman
 /// Prints only the summary of git import stats (abandoned count, failed refs).
 /// Use this when a WorkspaceCommandTransaction is not available.
 pub fn print_git_import_stats_summary(ui: &Ui, stats: &GitImportStats) -> Result<(), CommandError> {
-    if !stats.abandoned_commits.is_empty()
-        && let Some(mut formatter) = ui.status_formatter()
-    {
-        writeln!(
-            formatter,
-            "Abandoned {} commits that are no longer reachable.",
-            stats.abandoned_commits.len()
-        )?;
+    if let Some(mut formatter) = ui.status_formatter() {
+        if !stats.abandoned_commits.is_empty() {
+            writeln!(
+                formatter,
+                "Abandoned {} commits that are no longer reachable.",
+                stats.abandoned_commits.len()
+            )?;
+        }
+        if !stats.rewritten_commit_ids.is_empty() {
+            writeln!(
+                formatter,
+                "Updated {} rewritten commits.",
+                stats.rewritten_commit_ids.len()
+            )?;
+        }
     }
     print_failed_git_import(ui, stats)?;
     Ok(())
@@ -399,16 +467,14 @@ struct RefStatus {
 }
 
 impl RefStatus {
-    fn new(
-        ref_kind: GitRefKind,
-        symbol: RemoteRefSymbol<'_>,
-        remote_ref: &RemoteRef,
-        ref_target: &RefTarget,
-        repo: &dyn Repo,
-    ) -> Self {
+    fn new(ref_kind: GitRefKind, update: &GitImportRefUpdate, repo: &dyn Repo) -> Self {
         let tracking_status = match ref_kind {
             GitRefKind::Bookmark => {
-                if repo.view().get_remote_bookmark(symbol).is_tracked() {
+                if repo
+                    .view()
+                    .get_remote_bookmark(update.symbol.as_ref())
+                    .is_tracked()
+                {
                     TrackingStatus::Tracked
                 } else {
                     TrackingStatus::Untracked
@@ -417,14 +483,17 @@ impl RefStatus {
             GitRefKind::Tag => TrackingStatus::NotApplicable,
         };
 
-        let import_status = match (remote_ref.target.is_absent(), ref_target.is_absent()) {
+        let import_status = match (
+            update.old_remote_ref.target.is_absent(),
+            update.new_target.is_absent(),
+        ) {
             (true, false) => ImportStatus::New,
             (false, true) => ImportStatus::Deleted,
             _ => ImportStatus::Updated,
         };
 
         Self {
-            symbol: symbol.to_string(),
+            symbol: update.symbol.to_string(),
             tracking_status,
             import_status,
             ref_kind,

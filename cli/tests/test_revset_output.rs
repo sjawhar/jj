@@ -505,7 +505,7 @@ fn test_bad_symbol_or_argument_should_not_be_optimized_out() {
       |
       = Invalid file pattern
     3: Path ".." is not in the repo "."
-    4: Invalid component ".." in repo-relative path "../"
+    4: Invalid component ".." in repo-relative path ".."
     [EOF]
     [exit status: 1]
     "#);
@@ -523,28 +523,6 @@ fn test_default_string_pattern() {
     @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
     │  (empty) (no description set)
     ~
-    [EOF]
-    ");
-
-    // with default flipped
-    let output = work_dir.run_jj([
-        "log",
-        "-rauthor('test.user')",
-        "--config=ui.revsets-use-glob-by-default=false",
-    ]);
-    insta::assert_snapshot!(output.normalize_backslash(), @"
-    @  qpvuntsm test.user@example.com 2001-02-03 08:05:07 e8849ae1
-    │  (empty) (no description set)
-    ~
-    [EOF]
-    ------- stderr -------
-    Warning: In revset expression
-     --> 1:8
-      |
-    1 | author('test.user')
-      |        ^---------^
-      |
-      = ui.revsets-use-glob-by-default=false will be removed in a future release
     [EOF]
     ");
 }

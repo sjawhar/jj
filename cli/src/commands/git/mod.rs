@@ -25,7 +25,6 @@ mod root;
 use std::io::Write as _;
 
 use clap::Subcommand;
-use clap::ValueEnum;
 use jj_lib::config::ConfigFile;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
@@ -186,7 +185,7 @@ fn write_repo_presets(
             .expect("initial repo config shouldn't have invalid values");
         writeln!(
             ui.status(),
-            "Setting the revset alias `trunk()` to `{symbol}`",
+            "Setting the revset alias `trunk()` to `{symbol}`.",
         )?;
     }
     file.save()?;
@@ -281,25 +280,19 @@ fn join_string_expressions(exprs: &[String]) -> String {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-enum FetchTagsMode {
-    /// Always fetch all tags
-    All,
-
-    /// Only fetch tags that point to objects that are already being
-    /// transmitted.
-    Included,
-
-    /// Do not fetch any tags
-    None,
+#[derive(Debug, Clone, Copy, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+enum ObjectHash {
+    Sha1,
+    Sha256,
 }
 
-impl FetchTagsMode {
-    fn as_fetch_tags(&self) -> gix::remote::fetch::Tags {
-        match self {
-            Self::All => gix::remote::fetch::Tags::All,
-            Self::Included => gix::remote::fetch::Tags::Included,
-            Self::None => gix::remote::fetch::Tags::None,
+impl From<ObjectHash> for gix::hash::Kind {
+    fn from(value: ObjectHash) -> Self {
+        match value {
+            ObjectHash::Sha1 => Self::Sha1,
+            ObjectHash::Sha256 => Self::Sha256,
         }
     }
 }

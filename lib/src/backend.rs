@@ -563,6 +563,7 @@ pub trait Backend: Any + Send + Sync + Debug {
     /// local backend like the Git backend (at until it supports partial clones)
     /// may want to set this to 1. A cloud-backed backend may want to set it to
     /// 100 or so.
+    /// It is guaranteed to return at least 1.
     ///
     /// It is not guaranteed that at most this number of concurrent requests are
     /// sent. It is the backend's responsibility to make sure it doesn't put
@@ -608,7 +609,7 @@ pub trait Backend: Any + Send + Sync + Debug {
     /// Find all copy histories that are related to the specified one. This is
     /// defined as those that are ancestors of the given specified one, plus
     /// all descendants of those ancestors. Children must be returned before
-    /// parents.
+    /// parents, and the order should be deterministic.
     ///
     /// It is valid (but wasteful) to include other copy histories, such as
     /// siblings, or even completely unrelated copy histories.

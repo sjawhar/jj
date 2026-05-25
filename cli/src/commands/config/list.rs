@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
+
 use clap_complete::ArgValueCandidates;
 use jj_lib::config::ConfigNamePathBuf;
 use jj_lib::config::ConfigSource;
@@ -57,7 +59,7 @@ pub struct ConfigListArgs {
     /// * `value: ConfigValue`: Value to be formatted in TOML syntax.
     /// * `overridden: Boolean`: True if the value is shadowed by other.
     /// * `source: String`: Source of the value.
-    /// * `path: String`: Path to the config file.
+    /// * `path: Option<FsPath>`: Path to the config file.
     ///
     /// Can be overridden by the `templates.config_list` setting. To
     /// see a detailed config list, use the `builtin_config_list_detailed`
@@ -81,7 +83,7 @@ pub async fn cmd_config_list(
     args: &ConfigListArgs,
 ) -> Result<(), CommandError> {
     let template: TemplateRenderer<AnnotatedValue> = {
-        let language = config_template_language(command.settings());
+        let language = config_template_language(command.settings(), command.cwd());
         let text = match &args.template {
             Some(value) => value.to_owned(),
             None => command.settings().get_string("templates.config_list")?,
@@ -114,9 +116,9 @@ pub async fn cmd_config_list(
     } else {
         // Note to stderr explaining why output is empty.
         if let Some(name) = &args.name {
-            writeln!(ui.warning_default(), "No matching config key for {name}")?;
+            writeln!(ui.warning_default(), "No matching config key for: {name}")?;
         } else {
-            writeln!(ui.warning_default(), "No config to list")?;
+            writeln!(ui.warning_default(), "No config to list.")?;
         }
     }
     Ok(())
@@ -128,8 +130,8 @@ generic_templater::impl_self_property_wrapper!(AnnotatedValue);
 
 // AnnotatedValue will be cloned internally in the templater. If the cloning
 // cost matters, wrap it with Rc.
-fn config_template_language(settings: &UserSettings) -> ConfigTemplateLanguage {
-    let mut language = ConfigTemplateLanguage::new(settings);
+fn config_template_language(settings: &UserSettings, current_dir: &Path) -> ConfigTemplateLanguage {
+    let mut language = ConfigTemplateLanguage::new(settings, current_dir);
     language.add_keyword("name", |self_property| {
         let out_property = self_property.map(|annotated| annotated.name.to_string());
         Ok(out_property.into_dyn_wrapped())
@@ -144,13 +146,7 @@ fn config_template_language(settings: &UserSettings) -> ConfigTemplateLanguage {
         Ok(out_property.into_dyn_wrapped())
     });
     language.add_keyword("path", |self_property| {
-        let out_property = self_property.map(|annotated| {
-            // TODO: maybe add FilePath(PathBuf) template type?
-            annotated
-                .path
-                .as_ref()
-                .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
-        });
+        let out_property = self_property.map(|annotated| annotated.path);
         Ok(out_property.into_dyn_wrapped())
     });
     language.add_keyword("overridden", |self_property| {

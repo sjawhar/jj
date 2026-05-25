@@ -80,6 +80,7 @@ use crate::op_store::RefTarget;
 use crate::op_store::RemoteRef;
 use crate::op_store::RemoteRefState;
 use crate::op_store::RootOperationData;
+use crate::op_walk;
 use crate::operation::Operation;
 use crate::ref_name::GitRefName;
 use crate::ref_name::RefName;
@@ -93,6 +94,7 @@ use crate::refs::diff_named_remote_refs;
 use crate::refs::merge_ref_targets;
 use crate::refs::merge_remote_refs;
 use crate::revset;
+use crate::revset::ResolvedRevsetExpression;
 use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetStreamExt as _;
@@ -399,7 +401,7 @@ pub type SubmoduleStoreInitializer<'a> =
     dyn Fn(&UserSettings, &Path) -> Result<Box<dyn SubmoduleStore>, BackendInitError> + 'a;
 
 type BackendFactory =
-    Box<dyn Fn(&UserSettings, &Path) -> Result<Box<dyn Backend>, BackendLoadError>>;
+    Box<dyn Fn(&UserSettings, &Path, Option<&Path>) -> Result<Box<dyn Backend>, BackendLoadError>>;
 type OpStoreFactory = Box<
     dyn Fn(&UserSettings, &Path, RootOperationData) -> Result<Box<dyn OpStore>, BackendLoadError>,
 >;
@@ -438,21 +440,25 @@ impl Default for StoreFactories {
         // Backends
         factories.add_backend(
             SimpleBackend::name(),
-            Box::new(|_settings, store_path| Ok(Box::new(SimpleBackend::load(store_path)))),
+            Box::new(|_settings, store_path, _workspace_root| {
+                Ok(Box::new(SimpleBackend::load(store_path)))
+            }),
         );
         #[cfg(feature = "git")]
         factories.add_backend(
             crate::git_backend::GitBackend::name(),
-            Box::new(|settings, store_path| {
-                Ok(Box::new(crate::git_backend::GitBackend::load(
-                    settings, store_path,
+            Box::new(|settings, store_path, workspace_root| {
+                Ok(Box::new(crate::git_backend::GitBackend::load_at_workspace(
+                    settings,
+                    store_path,
+                    workspace_root,
                 )?))
             }),
         );
         #[cfg(feature = "testing")]
         factories.add_backend(
             crate::secret_backend::SecretBackend::name(),
-            Box::new(|settings, store_path| {
+            Box::new(|settings, store_path, _workspace_root| {
                 Ok(Box::new(crate::secret_backend::SecretBackend::load(
                     settings, store_path,
                 )?))
@@ -545,6 +551,7 @@ impl StoreFactories {
         &self,
         settings: &UserSettings,
         store_path: &Path,
+        workspace_root: Option<&Path>,
     ) -> Result<Box<dyn Backend>, StoreLoadError> {
         let backend_type = read_store_type("commit", store_path.join("type"))?;
         let backend_factory = self.backend_factories.get(&backend_type).ok_or_else(|| {
@@ -553,7 +560,7 @@ impl StoreFactories {
                 store_type: backend_type.clone(),
             }
         })?;
-        Ok(backend_factory(settings, store_path)?)
+        Ok(backend_factory(settings, store_path, workspace_root)?)
     }
 
     pub fn add_op_store(&mut self, name: &str, factory: OpStoreFactory) {
@@ -700,15 +707,20 @@ impl RepoLoader {
     /// Creates a `RepoLoader` for the repo at `repo_path` by reading the
     /// various `.jj/repo/<backend>/type` files and loading the right
     /// backends from `store_factories`.
+    ///
+    /// If `workspace_root` is provided, backends that support colocation (like
+    /// GitBackend) can detect whether the workspace is colocated and configure
+    /// themselves appropriately.
     pub fn init_from_file_system(
         settings: &UserSettings,
         repo_path: &Path,
         store_factories: &StoreFactories,
+        workspace_root: Option<&Path>,
     ) -> Result<Self, StoreLoadError> {
         let merge_options =
             MergeOptions::from_settings(settings).map_err(|err| BackendLoadError(err.into()))?;
         let store = Store::new(
-            store_factories.load_backend(settings, &repo_path.join("store"))?,
+            store_factories.load_backend(settings, &repo_path.join("store"), workspace_root)?,
             Signer::from_settings(settings)?,
             merge_options,
         );
@@ -765,7 +777,21 @@ impl RepoLoader {
         let op = op_heads_store::resolve_op_heads(
             self.op_heads_store.as_ref(),
             &self.op_store,
-            async |op_heads| self.resolve_op_heads(op_heads).await,
+            async |op_heads| -> Result<Operation, RepoLoaderError> {
+                assert!(op_heads.len() > 1);
+                let workspace_name = None;
+                let transaction_description = Some("reconcile divergent operations");
+                let transaction_attributes = [];
+                let (merged_repo, _num_rebased) = self
+                    .merge_operations(
+                        op_heads,
+                        workspace_name,
+                        transaction_description,
+                        transaction_attributes,
+                    )
+                    .await?;
+                Ok(merged_repo.operation().clone())
+            },
         )
         .await?;
         let view = op.view().await?;
@@ -810,45 +836,126 @@ impl RepoLoader {
         Ok(Operation::new(self.op_store.clone(), id.clone(), data))
     }
 
-    /// Merges the given `operations` into a single operation. Returns the root
-    /// operation if the `operations` is empty.
+    /// Merges the given `operations`. Returns the merged repo and the number of
+    /// rebased commits. If `operations` is empty returns the root repo. If
+    /// `operations` has a single entry, returns that entry's repo. Otherwise
+    /// an actual merge happens. The new operation is not published.
     pub async fn merge_operations(
         &self,
         operations: Vec<Operation>,
-        tx_description: Option<&str>,
-    ) -> Result<Operation, RepoLoaderError> {
-        let num_operations = operations.len();
-        let mut operations = operations.into_iter();
-        let Some(base_op) = operations.next() else {
-            return Ok(self.root_operation().await);
-        };
-        let final_op = if num_operations > 1 {
-            let base_repo = self.load_at(&base_op).await?;
-            let mut tx = base_repo.start_transaction();
-            for other_op in operations {
-                tx.merge_operation(other_op).await?;
-                tx.repo_mut().rebase_descendants().await?;
+        workspace_name: Option<&WorkspaceName>,
+        transaction_description: Option<&str>,
+        transaction_attributes: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(Arc<ReadonlyRepo>, usize), RepoLoaderError> {
+        // IMPLEMENTATION NOTE: This used to be implemented as a much simple
+        // recursive method, but unfortunately due to the async nature of the
+        // method itself and its dependencies, that leads to stack-overflow in
+        // some cases. See https://github.com/jj-vcs/jj/pull/9586 for more
+        // details.
+        match &operations[..] {
+            [] => {
+                let root_operation = self.root_operation().await;
+                let root_repo = self.load_at(&root_operation).await?;
+                return Ok((root_repo, 0));
             }
-            let tx_description = tx_description.map_or_else(
-                || format!("merge {num_operations} operations"),
-                |tx_description| tx_description.to_string(),
-            );
-            let merged_repo = tx.write(tx_description).await?.leave_unpublished();
-            merged_repo.operation().clone()
-        } else {
-            base_op
-        };
+            [op] => {
+                let repo = self.load_at(op).await?;
+                return Ok((repo, 0));
+            }
+            _ => {}
+        }
 
-        Ok(final_op)
-    }
+        let mut num_rebased = 0;
+        let to_operation_ids =
+            |ops: &[Operation]| ops.iter().map(|op| op.id().clone()).collect_vec();
+        let operation_ids = to_operation_ids(&operations);
 
-    async fn resolve_op_heads(
-        &self,
-        op_heads: Vec<Operation>,
-    ) -> Result<Operation, RepoLoaderError> {
-        assert!(!op_heads.is_empty());
-        self.merge_operations(op_heads, Some("reconcile divergent operations"))
-            .await
+        // Caches the result of merging some operations.
+        let mut merged_operations: HashMap<Vec<OperationId>, Operation> = HashMap::new();
+        // Caches the result of op_walk::closest_common_ancestors invocations. Keyed by
+        // the arguments to that method.
+        let mut closest_common_ancestors: HashMap<_, Vec<Operation>> = HashMap::new();
+
+        let mut tx = self.load_at(&operations[0]).await?.start_transaction();
+        if let Some(workspace_name) = workspace_name {
+            tx.set_workspace_name(workspace_name);
+        }
+        for (key, value) in transaction_attributes {
+            tx.set_attribute(key, value);
+        }
+        let mut stack = vec![(1, operations, tx)];
+
+        while let Some((index, operations, mut tx)) = stack.pop() {
+            assert!(operations.len() > 1);
+            assert!(index <= operations.len());
+            if index == operations.len() {
+                // We are done processing the operations, but there is more work on the stack.
+                // Commit the transaction and cache the result.
+                let tx_description = transaction_description.map_or_else(
+                    || format!("merge {} operations", operations.len()),
+                    |tx_description| tx_description.to_string(),
+                );
+                let merged_repo = tx.write(tx_description).await?.leave_unpublished();
+                merged_operations.insert(
+                    to_operation_ids(&operations),
+                    merged_repo.operation().clone(),
+                );
+                continue;
+            }
+
+            let other_op = &operations[index];
+
+            // Get the ancestor operations between the operations we have merged so far
+            // (represented by `tx.parent_ops()`) and the next operation to merge
+            // (`other_op`).
+            let ancestor_ops = match closest_common_ancestors
+                .entry((to_operation_ids(tx.parent_ops()), other_op.id().clone()))
+            {
+                Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
+                Entry::Vacant(vacant_entry) => {
+                    let ancestor_ops = op_walk::closest_common_ancestors(
+                        tx.parent_ops().to_vec(),
+                        [other_op.clone()],
+                    )
+                    .await?;
+                    vacant_entry.insert(ancestor_ops.clone())
+                }
+            };
+            assert!(!ancestor_ops.is_empty());
+
+            let ancestor_op = if let [ancestor_op] = ancestor_ops.as_slice() {
+                // There is a single common ancestor.
+                Some(ancestor_op)
+            } else {
+                // There are multiple common ancestors, check to see if we have cached their
+                // merge result.
+                let ancestor_op_ids = ancestor_ops.iter().map(|op| op.id().clone()).collect_vec();
+                merged_operations.get(&ancestor_op_ids)
+            };
+
+            if let Some(merged_ancestor_op) = ancestor_op {
+                // We have the merge of the ancestor operations. We can proceed to merge with
+                // other_op.
+                tx.merge_operation(merged_ancestor_op, other_op).await?;
+                num_rebased += tx.repo_mut().rebase_descendants().await?;
+                // Push state on the stack to continue merging the rest of the operations.
+                stack.push((index + 1, operations, tx));
+                continue;
+            }
+
+            // We have to merge the ancestor ops.
+            // We first push the current state to the stack so that after we merge the
+            // ancestor ops, we can continue merging the rest of the operations.
+            stack.push((index, operations, tx));
+            // Then we push the ancestor ops to the stack so that we can merge them first.
+            // We need to start a separate transaction for this.
+            let new_tx = self.load_at(&ancestor_ops[0]).await?.start_transaction();
+            stack.push((1, ancestor_ops.clone(), new_tx));
+        }
+
+        // We are all done! The result should be in the cache.
+        let merged_operation = merged_operations.get(&operation_ids).cloned().unwrap();
+        Ok((self.load_at(&merged_operation).await?, num_rebased))
     }
 
     async fn finish_load(
@@ -1265,13 +1372,15 @@ impl MutableRepo {
     }
 
     /// Find descendants of `root`, unless they've already been rewritten
-    /// (according to `parent_mapping`).
+    /// (according to `parent_mapping`) or are included in `immutable`.
     pub async fn find_descendants_for_rebase(
         &self,
         roots: Vec<CommitId>,
+        immutable: &Arc<ResolvedRevsetExpression>,
     ) -> BackendResult<Vec<Commit>> {
         let to_visit_revset = RevsetExpression::commits(roots)
             .descendants()
+            .minus(immutable)
             .minus(&RevsetExpression::commits(
                 self.parent_mapping.keys().cloned().collect(),
             ))
@@ -1348,12 +1457,19 @@ impl MutableRepo {
         roots: Vec<CommitId>,
         callback: impl AsyncFnMut(CommitRewriter) -> BackendResult<()>,
     ) -> BackendResult<()> {
-        let options = RewriteRefsOptions::default();
-        self.transform_descendants_with_options(roots, &HashMap::new(), &options, callback)
-            .await
+        self.transform_descendants_with_options(
+            roots,
+            &RevsetExpression::none(),
+            &HashMap::new(),
+            &RewriteRefsOptions::default(),
+            callback,
+        )
+        .await
     }
 
     /// Rewrite descendants of the given roots with options.
+    ///
+    /// Commits within the `immutable` set are excluded.
     ///
     /// If a commit is in the `new_parents_map` is provided, it will be rebased
     /// onto the new parents provided in the map instead of its original
@@ -1363,18 +1479,17 @@ impl MutableRepo {
     pub async fn transform_descendants_with_options(
         &mut self,
         roots: Vec<CommitId>,
+        immutable: &Arc<ResolvedRevsetExpression>,
         new_parents_map: &HashMap<CommitId, Vec<CommitId>>,
         options: &RewriteRefsOptions,
         callback: impl AsyncFnMut(CommitRewriter) -> BackendResult<()>,
     ) -> BackendResult<()> {
-        let descendants = self.find_descendants_for_rebase(roots).await?;
+        let descendants = self.find_descendants_for_rebase(roots, immutable).await?;
         self.transform_commits(descendants, new_parents_map, options, callback)
             .await
     }
 
     /// Rewrite the given commits in reverse topological order.
-    ///
-    /// `commits` should be a connected range.
     ///
     /// This function is similar to
     /// [`Self::transform_descendants_with_options()`], but only rewrites the
@@ -1413,7 +1528,9 @@ impl MutableRepo {
     /// Rebase descendants of the rewritten commits with options and callback.
     ///
     /// The descendants of the commits registered in `self.parent_mappings` will
-    /// be recursively rebased onto the new version of their parents.
+    /// be recursively rebased onto the new version of their parents. Commits
+    /// within the `immutable` set are left unchanged, which also prevents their
+    /// further descendants from being rebased.
     ///
     /// If `options.empty` is the default (`EmptyBehavior::Keep`), all rebased
     /// descendant commits will be preserved even if they were emptied following
@@ -1427,12 +1544,14 @@ impl MutableRepo {
     /// `(old_commit, rebased_commit)` as arguments.
     pub async fn rebase_descendants_with_options(
         &mut self,
+        immutable: &Arc<ResolvedRevsetExpression>,
         options: &RebaseOptions,
         mut progress: impl FnMut(Commit, RebasedCommit),
     ) -> BackendResult<()> {
         let roots = self.parent_mapping.keys().cloned().collect();
         self.transform_descendants_with_options(
             roots,
+            immutable,
             &HashMap::new(),
             &options.rewrite_refs,
             async |rewriter| {
@@ -1459,11 +1578,14 @@ impl MutableRepo {
     /// emptied following the rebase operation. To customize the rebase
     /// behavior, use [`MutableRepo::rebase_descendants_with_options`].
     pub async fn rebase_descendants(&mut self) -> BackendResult<usize> {
-        let options = RebaseOptions::default();
         let mut num_rebased = 0;
-        self.rebase_descendants_with_options(&options, |_old_commit, _rebased_commit| {
-            num_rebased += 1;
-        })
+        self.rebase_descendants_with_options(
+            &RevsetExpression::none(),
+            &RebaseOptions::default(),
+            |_old_commit, _rebased_commit| {
+                num_rebased += 1;
+            },
+        )
         .await?;
         Ok(num_rebased)
     }
@@ -1884,6 +2006,17 @@ impl MutableRepo {
         self.view_mut().set_git_head_target(target);
     }
 
+    /// Returns the per-workspace Git HEAD target for the given workspace.
+    pub fn get_workspace_git_head(&self, name: &WorkspaceName) -> RefTarget {
+        self.view
+            .with_ref(|v| v.get_workspace_git_head(name).clone())
+    }
+
+    /// Sets the per-workspace Git HEAD target.
+    pub fn set_workspace_git_head(&mut self, name: &WorkspaceName, target: RefTarget) {
+        self.view_mut().set_workspace_git_head(name, target);
+    }
+
     pub fn set_view(&mut self, data: op_store::View) {
         self.view_mut().set_view(data);
         self.view.mark_dirty();
@@ -1976,6 +2109,18 @@ impl MutableRepo {
             other.git_head(),
         )?;
         self.set_git_head_target(new_git_head_target);
+
+        // Merge per-workspace Git HEADs
+        let changed_workspace_git_heads = diff_named_ref_targets(
+            base.workspace_git_heads().iter().map(|(k, v)| (&**k, v)),
+            other.workspace_git_heads().iter().map(|(k, v)| (&**k, v)),
+        );
+        for (name, (base_target, other_target)) in changed_workspace_git_heads {
+            let self_target = self.get_workspace_git_head(name);
+            let new_target =
+                merge_ref_targets(self.index(), &self_target, base_target, other_target)?;
+            self.set_workspace_git_head(name, new_target);
+        }
 
         Ok(())
     }

@@ -347,7 +347,8 @@ fn test_metaedit() {
         (no description set)
 
     Modified regular file file1:
-       1    1: bc
+       1     : b
+            1: c
     [EOF]
     ");
 
@@ -519,12 +520,12 @@ fn test_metaedit_multiple_revisions() {
         "--update-author",
         "kkmpptxz::mzvwutvl",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Modified 2 commits:
       kkmpptxz d84add51 b | (no description set)
       mzvwutvl 447d6d8a c | (no description set)
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: yostqsxw ebd66676 (empty) (no description set)
     Parent commit (@-)      : mzvwutvl 447d6d8a c | (no description set)
     [EOF]
@@ -594,11 +595,11 @@ fn test_new_change_id() {
     work_dir.write_file("file1", "c\n");
 
     let output = work_dir.run_jj(["metaedit", "--update-change-id", "kkmpptxzrspx"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Modified 1 commits:
       yqosqzyt 01d6741e b | (no description set)
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 0c3fe2d8 c | (no description set)
     Parent commit (@-)      : yqosqzyt 01d6741e b | (no description set)
     [EOF]
@@ -640,25 +641,25 @@ fn test_new_change_id() {
     insta::assert_snapshot!(work_dir.run_jj(["evolog", "-r", "yqosqzytrlswkspswpqrmlplxylrzsnz"]), @"
     ○  yqosqzyt test.user@example.com 2001-02-03 08:05:13 b 01d6741e
     │  (no description set)
-    │  -- operation 35c9be8faa47 edit commit metadata for commit 75591b1896b4990e7695701fd7cdbb32dba3ff50
+    │  -- operation 4e1d87de77a6 edit commit metadata for commit 75591b1896b4990e7695701fd7cdbb32dba3ff50
     ○  kkmpptxz/0 test.user@example.com 2001-02-03 08:05:11 75591b18 (hidden)
     │  (no description set)
-    │  -- operation 96903839b342 snapshot working copy
+    │  -- operation 88a5b4e236ec snapshot working copy
     ○  kkmpptxz/1 test.user@example.com 2001-02-03 08:05:09 acebf2bd (hidden)
        (empty) (no description set)
-       -- operation 35de69400054 new empty commit
+       -- operation 7b905effaa28 new empty commit
     [EOF]
     ");
     insta::assert_snapshot!(work_dir.run_jj(["evolog", "-r", "mzvwut"]), @"
     @  mzvwutvl test.user@example.com 2001-02-03 08:05:13 c 0c3fe2d8
     │  (no description set)
-    │  -- operation 35c9be8faa47 edit commit metadata for commit 75591b1896b4990e7695701fd7cdbb32dba3ff50
+    │  -- operation 4e1d87de77a6 edit commit metadata for commit 75591b1896b4990e7695701fd7cdbb32dba3ff50
     ○  mzvwutvl/1 test.user@example.com 2001-02-03 08:05:13 22be6c4e (hidden)
     │  (no description set)
-    │  -- operation 7d623f9b6867 snapshot working copy
+    │  -- operation 3d4521caba80 snapshot working copy
     ○  mzvwutvl/2 test.user@example.com 2001-02-03 08:05:11 b9f5490a (hidden)
        (empty) (no description set)
-       -- operation 80928a366fe1 new empty commit
+       -- operation 52935d0f98f2 new empty commit
     [EOF]
     ");
 }

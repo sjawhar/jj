@@ -235,11 +235,6 @@
                 "conflict-marker-style": {
                     "$ref": "#/properties/ui/definitions/conflict-marker-style"
                 },
-                "revsets-use-glob-by-default": {
-                    "type": "boolean",
-                    "default": true,
-                    "description": "Whether to use glob string patterns in revsets by default"
-                },
                 "show-cryptographic-signatures": {
                     "type": "boolean",
                     "default": false,
@@ -402,6 +397,9 @@
                             "underline": {
                                 "type": "boolean"
                             },
+                            "crossed-out": {
+                                "type": "boolean"
+                            },
                             "reverse": {
                                 "type": "boolean"
                             }
@@ -541,6 +539,11 @@
                     "description": "Path to the git executable",
                     "default": "git"
                 },
+                "auto-register-worktrees": {
+                    "type": "boolean",
+                    "description": "Whether `jj workspace add` in a colocated repo automatically registers a Git worktree for the new workspace, so plain `git` commands work inside it. Distinct from `git.colocate` (which controls `jj git init`/`jj git clone`). No-op in a non-colocated repo.",
+                    "default": true
+                },
                 "colocate": {
                     "type": "boolean",
                     "description": "Whether to colocate the working copy with the git repository",
@@ -587,6 +590,11 @@
                             }
                         }
                     }
+                },
+                "object-hash": {
+                    "enum": ["sha1", "sha256"],
+                    "description": "Object hash algorithm used when initializing a new Git repository",
+                    "default": "sha1"
                 }
             }
         },
@@ -690,7 +698,7 @@
                         "default": true
                     },
                     "diff-invocation-mode": {
-                        "description": "Invoke the tool with directories or individual files",
+                        "description": "Invoke the tool with directories or individual files when generating diffs.",
                         "enum": [
                             "dir",
                             "file-by-file"
@@ -702,6 +710,14 @@
                         "items": {
                             "type": "string"
                         }
+                    },
+                    "edit-invocation-mode": {
+                        "description": "Invoke the tool with directories or individual files when editing diffs (e.g. jj diffedit, jj split).",
+                        "enum": [
+                            "dir",
+                            "file-by-file"
+                        ],
+                        "default": "dir"
                     },
                     "merge-args": {
                         "type": "array",
@@ -751,6 +767,11 @@
                     "type": "string",
                     "description": "Revisions to give shorter change and commit IDs to",
                     "default": "<revsets.log>"
+                },
+                "run": {
+                    "type": "string",
+                    "description": "Default set of revisions to run a command on when no explicit revset is given for jj run",
+                    "default": "reachable(@, mutable())"
                 },
                 "simplify-parents": {
                     "type": "string",
@@ -868,6 +889,17 @@
                         ]
                     }
                 ]
+            }
+        },
+        "run": {
+            "type": "object",
+            "description": "Settings for the `jj run` command, which runs a shell command across a set of revisions.",
+            "properties": {
+                "jobs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of working copies (and parallel jobs) `jj run` uses. Defaults to 1. Overridden by `--jobs`."
+                }
             }
         },
         "snapshot": {

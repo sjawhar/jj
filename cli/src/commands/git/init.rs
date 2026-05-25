@@ -30,9 +30,11 @@ use jj_lib::repo::Repo as _;
 use jj_lib::view::View;
 use jj_lib::workspace::Workspace;
 
+use super::ObjectHash;
 use super::RepoPresets;
 use super::write_repo_presets;
 use crate::cli_util::CommandHelper;
+use crate::cli_util::shell_quote;
 use crate::cli_util::start_repo_transaction;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
@@ -91,6 +93,23 @@ pub struct GitInitArgs {
     #[arg(long, conflicts_with = "colocate")]
     no_colocate: bool,
 
+    /// Object hash algorithm for the newly created Git repository.
+    ///
+    /// Corresponds to `git init`'s `--object-format` option. If not given, the
+    /// [git.object-hash config] determines the default value.
+    ///
+    /// Note that the object hash cannot currently be changed for an existing
+    /// repo, and not all code forges support SHA-256 repositories yet. See also
+    /// Git's [hash-function-transition] document for an in-depth explanation of
+    /// the migration towards stronger hash functions.
+    ///
+    /// [git.object-hash config]:
+    ///     https://docs.jj-vcs.dev/latest/config/#default-object-hash-format
+    /// [hash-function-transition]:
+    ///     https://git-scm.com/docs/hash-function-transition
+    #[arg(long, value_enum, conflicts_with = "git_repo")]
+    object_hash: Option<ObjectHash>,
+
     /// Specifies a path to an **existing** git repository to be
     /// used as the backing git repo for the newly created `jj` repo.
     ///
@@ -101,7 +120,11 @@ pub struct GitInitArgs {
     ///
     /// This option is mutually exclusive with `--colocate`, and so if passed,
     /// turns colocation off.
-    #[arg(long, conflicts_with = "colocate", value_hint = clap::ValueHint::DirPath)]
+    #[arg(
+        long,
+        conflicts_with_all = ["colocate", "object_hash"],
+        value_hint = clap::ValueHint::DirPath,
+    )]
     git_repo: Option<String>,
 }
 
@@ -131,7 +154,19 @@ pub async fn cmd_git_init(
         args.colocate
     };
 
-    do_init(ui, command, &wc_path, colocate, args.git_repo.as_deref()).await?;
+    let object_hash = args.object_hash.map_or_else(
+        || command.settings().get::<ObjectHash>("git.object-hash"),
+        Result::Ok,
+    )?;
+    do_init(
+        ui,
+        command,
+        &wc_path,
+        colocate,
+        object_hash.into(),
+        args.git_repo.as_deref(),
+    )
+    .await?;
 
     let relative_wc_path = file_util::relative_path(cwd, &wc_path);
     writeln!(
@@ -148,6 +183,7 @@ async fn do_init(
     command: &CommandHelper,
     workspace_root: &Path,
     colocate: bool,
+    object_hash: gix::hash::Kind,
     git_repo: Option<&str>,
 ) -> Result<(), CommandError> {
     #[derive(Clone, Debug)]
@@ -200,7 +236,7 @@ async fn do_init(
     match &init_mode {
         GitInitMode::Colocate => {
             let (workspace, repo) =
-                Workspace::init_colocated_git(&settings, workspace_root).await?;
+                Workspace::init_colocated_git(&settings, workspace_root, object_hash).await?;
             let workspace_command = command.for_workable_repo(ui, workspace, repo)?;
             maybe_add_gitignore(&workspace_command)?;
         }
@@ -221,8 +257,9 @@ async fn do_init(
                 &config_env,
             )?;
             if !workspace_command.working_copy_shared_with_git() {
+                let workspace_name = workspace_command.workspace_name().to_owned();
                 let mut tx = workspace_command.start_transaction();
-                jj_lib::git::import_head(tx.repo_mut()).await?;
+                jj_lib::git::import_head(tx.repo_mut(), &workspace_name).await?;
                 if let Some(git_head_id) = tx.repo().view().git_head().as_normal().cloned() {
                     let git_head_commit = tx.repo().store().get_commit_async(&git_head_id).await?;
                     tx.check_out(&git_head_commit)?;
@@ -234,7 +271,7 @@ async fn do_init(
             print_trackable_remote_bookmarks(ui, workspace_command.repo().view())?;
         }
         GitInitMode::Internal => {
-            Workspace::init_internal_git(&settings, workspace_root).await?;
+            Workspace::init_internal_git(&settings, workspace_root, object_hash).await?;
         }
     }
     Ok(())
@@ -269,9 +306,8 @@ async fn init_git_refs(
         return Ok(repo);
     }
     if colocated {
-        // If git.auto-local-bookmark = true or
-        // remotes.<name>.auto-track-bookmarks is set, local bookmarks could be
-        // created for the imported remote branches.
+        // If remotes.<name>.auto-track-bookmarks is set, local bookmarks could
+        // be created for the imported remote branches.
         let stats = git::export_refs(tx.repo_mut())?;
         print_git_export_stats(ui, &stats)?;
     }
@@ -360,8 +396,8 @@ fn print_trackable_remote_bookmarks(ui: &Ui, view: &View) -> io::Result<()> {
             writeln!(
                 formatter.labeled("hint"),
                 "  jj bookmark track {name} --remote={remote}",
-                name = symbol.name.as_symbol(),
-                remote = symbol.remote.as_symbol()
+                name = shell_quote(&symbol.name.as_symbol().to_string()),
+                remote = shell_quote(&symbol.remote.as_symbol().to_string()),
             )?;
         }
     }

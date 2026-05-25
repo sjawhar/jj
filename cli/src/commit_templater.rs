@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -205,6 +207,11 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
 
     fn settings(&self) -> &UserSettings {
         self.repo.base_repo().settings()
+    }
+
+    fn current_dir(&self) -> &Path {
+        let RepoPathUiConverter::Fs { cwd, base: _ } = self.path_converter;
+        cwd
     }
 
     fn build_function(
@@ -1219,37 +1226,6 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
             Ok(out_property.into_dyn_wrapped())
         },
     );
-    // TODO: Remove in jj 0.43+
-    map.insert(
-        "git_refs",
-        |language, diagnostics, _build_ctx, self_property, function| {
-            diagnostics.add_warning(TemplateParseError::expression(
-                "commit.git_refs() is deprecated; use .remote_bookmarks()/tags() instead",
-                function.name_span,
-            ));
-            function.expect_no_arguments()?;
-            let index = language.keyword_cache.git_refs_index(language.repo).clone();
-            let out_property = self_property.map(move |commit| index.get(commit.id()).to_vec());
-            Ok(out_property.into_dyn_wrapped())
-        },
-    );
-    // TODO: Remove in jj 0.43+
-    map.insert(
-        "git_head",
-        |language, diagnostics, _build_ctx, self_property, function| {
-            diagnostics.add_warning(TemplateParseError::expression(
-                "commit.git_head() is deprecated; use .contained_in('first_parent(@)') instead",
-                function.name_span,
-            ));
-            function.expect_no_arguments()?;
-            let repo = language.repo;
-            let out_property = self_property.map(|commit| {
-                let target = repo.view().git_head();
-                target.added_ids().contains(commit.id())
-            });
-            Ok(out_property.into_dyn_wrapped())
-        },
-    );
     map.insert(
         "divergent",
         |language, _diagnostics, _build_ctx, self_property, function| {
@@ -1779,40 +1755,26 @@ impl WorkspaceRef {
         &self.target
     }
 
-    /// Returns the root path of the workspace.
-    fn root(&self, path_converter: &RepoPathUiConverter) -> Result<String, TemplatePropertyError> {
+    /// Returns the root path of the workspace if it is recorded and can be
+    /// resolved.
+    fn root(
+        &self,
+        path_converter: &RepoPathUiConverter,
+    ) -> Result<Option<PathBuf>, TemplatePropertyError> {
         let RepoPathUiConverter::Fs { cwd: _, base } = path_converter;
         // TODO: Stop reconstructing the workspace loader here once we've
         // decided which object should own the workspace store.
         let workspace_loader = DefaultWorkspaceLoaderFactory.create(base)?;
         let repo_path = workspace_loader.repo_path().to_owned();
         let workspace_store = SimpleWorkspaceStore::load(&repo_path)?;
-        let workspace_path = workspace_store
+        // Workspaces created before jj 0.38.0 may not have a recorded path. List
+        // templates should also keep rendering if a recorded path is stale or
+        // unavailable. Use `jj workspace root --name` for strict path diagnostics.
+        let path = workspace_store
             .get_workspace_path(self.name())?
-            .ok_or_else(|| {
-                TemplatePropertyError(
-                    format!(
-                        "Workspace has no recorded path: {}",
-                        self.name().as_symbol()
-                    )
-                    .into(),
-                )
-            })?;
-        let full_path = repo_path.join(workspace_path);
-        let path = dunce::canonicalize(&full_path).map_err(|err| {
-            TemplatePropertyError(
-                format!(
-                    "Failed to resolve workspace root: {}: {}: {err}",
-                    self.name().as_symbol(),
-                    full_path.display()
-                )
-                .into(),
-            )
-        })?;
-        // TODO: Return PathBuf once the templater has a filesystem path type.
-        path.into_os_string()
-            .into_string()
-            .map_err(|_| TemplatePropertyError("Invalid UTF-8 sequence in path".into()))
+            .map(|workspace_path| repo_path.join(workspace_path))
+            .and_then(|path| dunce::canonicalize(path).ok());
+        Ok(path)
     }
 }
 
@@ -2110,11 +2072,7 @@ fn builtin_repo_path_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, R
             // `RepoPathUiConverter` because absolute paths only make sense for
             // filesystem paths. Other cases should fail here.
             let out_property = self_property.and_then(move |path| match path_converter {
-                RepoPathUiConverter::Fs { cwd: _, base } => path
-                    .to_fs_path(base)?
-                    .into_os_string()
-                    .into_string()
-                    .map_err(|_| TemplatePropertyError("Invalid UTF-8 sequence in path".into())),
+                RepoPathUiConverter::Fs { cwd: _, base } => Ok(path.to_fs_path(base)?),
             });
             Ok(out_property.into_dyn_wrapped())
         },
@@ -3043,8 +3001,6 @@ fn builtin_trailer_list_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo
 #[cfg(test)]
 mod tests {
     use std::path::Component;
-    use std::path::Path;
-    use std::path::PathBuf;
 
     use jj_lib::config::ConfigLayer;
     use jj_lib::config::ConfigSource;
@@ -3126,7 +3082,6 @@ mod tests {
                 date_pattern_context: chrono::DateTime::UNIX_EPOCH.fixed_offset().into(),
                 default_ignored_remote: None,
                 fileset_aliases_map: &self.fileset_aliases_map,
-                use_glob_by_default: true,
                 extensions: &self.revset_extensions,
                 workspace: Some(RevsetWorkspaceContext {
                     path_converter: &self.path_converter,

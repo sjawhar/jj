@@ -428,6 +428,20 @@ The following methods are defined.
 * `.domain() -> String`: the part of the email after the first `@` or the empty
   string.
 
+### `FsPath` type
+
+_Conversion: `Boolean`: no, `Serialize`: yes, `Template`: yes_
+
+A filesystem path. Paths can contain bytes that are not valid UTF-8. Rendering
+and path formatting methods preserve those bytes. Serialization with `json()`
+follows Rust's `Path` serialization, which can reject non-UTF-8 paths.
+
+The following methods are defined.
+
+* `.absolute() -> FsPath`: Return an absolute filesystem path.
+* `.relative() -> FsPath`: Return the path relative to the current working
+  directory.
+
 ### `Integer` type
 
 _Conversion: `Boolean`: no, `Serialize`: yes, `Template`: yes_
@@ -537,8 +551,7 @@ _Conversion: `Boolean`: no, `Serialize`: yes, `Template`: yes_
 A slash-separated path relative to the repository root. The following methods
 are defined.
 
-* `.absolute() -> String`: Format as absolute path using platform-native
-  separator.
+* `.absolute() -> FsPath`: Absolute filesystem path.
 * `.display() -> String`: Format path for display. The formatted path uses
   platform-native separator, and is relative to the current working directory.
 * `.parent() -> Option<RepoPath>`: Parent directory path.
@@ -788,7 +801,12 @@ The following methods are defined.
 
 * `.name() -> RefSymbol`: Returns the workspace name as a symbol.
 * `.target() -> Commit`: Returns the working-copy commit of this workspace.
-* `.root() -> Template`: Returns the absolute path to the workspace root.
+* `.root() -> Option<FsPath>`: Returns the workspace root path, if the root path
+  is recorded and can be resolved.
+
+  This is optional because workspaces created before jj 0.38.0 did not record
+  workspace root paths, and a recorded path can also become stale if the
+  workspace directory is moved or deleted.
 
 ## Color labels
 
@@ -857,6 +875,8 @@ concat(
   format_field("Change ID", change_id),
 )
 '''
+'format_field(key, value)' = 'key ++ ": " ++ value ++ "\n"'
+'json:x' = 'json(x) ++ "\n"'
 ```
 
 ### Alias descriptions
@@ -875,9 +895,6 @@ You can also use the dotted key syntax:
 [template-aliases]
 sh.definition = 'commit_id.short()'
 sh.doc = 'Short commit ID'
-```
-'format_field(key, value)' = 'key ++ ": " ++ value ++ "\n"'
-'json:x' = 'json(x) ++ "\n"'
 ```
 
 ## Examples

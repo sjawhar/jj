@@ -4,6 +4,8 @@ updates:
   directory: "/"
   schedule:
     interval: "weekly"
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
   commit-message:
     prefix: "cargo:"
@@ -15,6 +17,8 @@ updates:
   directory: "/"
   schedule:
     interval: "weekly"
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
   commit-message:
     prefix: "github:"
@@ -22,10 +26,25 @@ updates:
     github-dependencies:
       patterns:
       - "*"
+- package-ecosystem: "nix"
+  directory: "/"
+  schedule:
+    interval: "weekly"
+  cooldown:
+    default-days: 7
+  open-pull-requests-limit: 10
+  commit-message:
+    prefix: "nix:"
+  groups:
+    nix-dependencies:
+      patterns:
+      - "*"
 - package-ecosystem: "npm"
   directory: "/"
   schedule:
     interval: "weekly"
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
   commit-message:
     prefix: "npm:"

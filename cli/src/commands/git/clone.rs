@@ -21,7 +21,6 @@ use std::path::Path;
 use itertools::Itertools as _;
 use jj_lib::file_util;
 use jj_lib::git;
-use jj_lib::git::FetchTagsOverride;
 use jj_lib::git::GitFetch;
 use jj_lib::git::GitFetchRefExpression;
 use jj_lib::git::GitImportOptions;
@@ -35,6 +34,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::str_util::StringExpression;
 use jj_lib::workspace::Workspace;
 
+use super::ObjectHash;
 use super::RepoPresets;
 use super::write_repo_presets;
 use crate::cli_util::CommandHelper;
@@ -43,7 +43,6 @@ use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
-use crate::commands::git::FetchTagsMode;
 use crate::commands::git::maybe_add_gitignore;
 use crate::config::ConfigEnv;
 use crate::git_util::GitSubprocessUi;
@@ -109,13 +108,6 @@ pub struct GitCloneArgs {
     #[arg(long)]
     depth: Option<NonZeroU32>,
 
-    /// Configure when to fetch tags
-    ///
-    /// Unless otherwise specified, the initial clone will fetch all tags,
-    /// while all subsequent fetches will only fetch included tags.
-    #[arg(long, value_enum)]
-    fetch_tags: Option<FetchTagsMode>,
-
     /// Name of the branch to fetch and use as the parent of the working-copy
     /// change (can be repeated)
     ///
@@ -147,8 +139,24 @@ pub struct GitCloneArgs {
     /// [logical operators]:
     ///     https://docs.jj-vcs.dev/latest/revsets/#string-patterns
     #[arg(long = "tag", short, value_name = "TAG")]
-    #[arg(hide = true)] // TODO: unhide when this gets stabilized (#7528)
     tags: Option<Vec<String>>,
+
+    /// Object hash algorithm for the local Git repository.
+    ///
+    /// *Must* match the remote's hash algorithm, otherwise the operation will
+    /// fail. Most existing repositories today still use the classic SHA-1
+    /// format, which is also the default if not configured otherwise by the
+    /// [git.object-hash config].
+    ///
+    /// See also Git's [hash-function-transition] document for an in-depth
+    /// explanation of the migration towards stronger hash functions.
+    ///
+    /// [git.object-hash config]:
+    ///     https://docs.jj-vcs.dev/latest/config/#default-object-hash-format
+    /// [hash-function-transition]:
+    ///     https://git-scm.com/docs/hash-function-transition
+    #[arg(long, value_enum)]
+    object_hash: Option<ObjectHash>,
 }
 
 fn clone_destination_for_source(source: &str) -> Option<&str> {
@@ -201,6 +209,10 @@ pub async fn cmd_git_clone(
         Some(texts) => Some(parse_union_name_patterns(ui, texts)?),
         None => is_specific.then(StringExpression::none),
     };
+    let object_hash = args.object_hash.map_or_else(
+        || command.settings().get::<ObjectHash>("git.object-hash"),
+        Result::Ok,
+    )?;
 
     // Canonicalize because fs::remove_dir_all() doesn't seem to like e.g.
     // `/some/path/.`
@@ -208,8 +220,14 @@ pub async fn cmd_git_clone(
         .map_err(|err| user_error_with_message(format!("Failed to create {wc_path_str}"), err))?;
 
     let clone_result: Result<_, CommandError> = async {
-        let (workspace_command, config_env) =
-            init_workspace(ui, command, &canonical_wc_path, colocate).await?;
+        let (workspace_command, config_env) = init_workspace(
+            ui,
+            command,
+            &canonical_wc_path,
+            colocate,
+            object_hash.into(),
+        )
+        .await?;
         let remote_settings = workspace_command.settings().remote_settings()?;
         let bookmark = if let Some(expr) = &specific_bookmark_expr {
             expr.clone()
@@ -219,36 +237,22 @@ pub async fn cmd_git_clone(
         } else {
             StringExpression::all()
         };
-        let (tag, no_implicit_tags) = if let Some(expr) = specific_tag_expr {
-            (expr, true)
+        let tag = if let Some(expr) = specific_tag_expr {
+            expr
         } else if let Some(expr) = parse_remote_fetch_tags(ui, &remote_settings, remote_name)? {
-            (expr, true)
+            expr
         } else {
-            // TODO: disable implicit fetching and set this to "all" (#7528)
-            (StringExpression::none(), false)
+            StringExpression::all()
         };
-        let mut workspace_command = configure_remote(
-            ui,
-            command,
-            workspace_command,
-            remote_name,
-            &source,
-            // If not explicitly specified on the CLI, configure the remote for only fetching
-            // included tags for future fetches.
-            args.fetch_tags.unwrap_or(FetchTagsMode::Included),
-        )
-        .await?;
+        let mut workspace_command =
+            configure_remote(ui, command, workspace_command, remote_name, &source).await?;
         let ref_expr = GitFetchRefExpression { bookmark, tag };
-        // Disable implicit tag fetching if patterns are explicitly set. None
-        // will be the default when this feature gets stabilized. (#7528)
-        let default_fetch_tags = no_implicit_tags.then_some(FetchTagsMode::None);
         let default_branch = fetch_new_remote(
             ui,
             &mut workspace_command,
             remote_name,
             &ref_expr,
             args.depth,
-            args.fetch_tags.or(default_fetch_tags),
         )
         .await?;
         Ok((workspace_command, default_branch, config_env))
@@ -323,12 +327,13 @@ async fn init_workspace(
     command: &CommandHelper,
     wc_path: &Path,
     colocate: bool,
+    object_hash: gix::hash::Kind,
 ) -> Result<(WorkspaceCommandHelper, ConfigEnv), CommandError> {
     let (settings, config_env) = command.settings_for_new_workspace(ui, wc_path)?;
     let (workspace, repo) = if colocate {
-        Workspace::init_colocated_git(&settings, wc_path).await?
+        Workspace::init_colocated_git(&settings, wc_path, object_hash).await?
     } else {
-        Workspace::init_internal_git(&settings, wc_path).await?
+        Workspace::init_internal_git(&settings, wc_path, object_hash).await?
     };
     let workspace_command = command.for_workable_repo(ui, workspace, repo)?;
     maybe_add_gitignore(&workspace_command)?;
@@ -341,16 +346,9 @@ async fn configure_remote(
     mut workspace_command: WorkspaceCommandHelper,
     remote_name: &RemoteName,
     source: &str,
-    fetch_tags: FetchTagsMode,
 ) -> Result<WorkspaceCommandHelper, CommandError> {
     let mut tx = workspace_command.start_transaction();
-    git::add_remote(
-        tx.repo_mut(),
-        remote_name,
-        source,
-        None,
-        fetch_tags.as_fetch_tags(),
-    )?;
+    git::add_remote(tx.repo_mut(), remote_name, source, None)?;
     tx.finish(ui, format!("add git remote {}", remote_name.as_symbol()))
         .await?;
     // Reload workspace to apply new remote configuration to
@@ -373,7 +371,6 @@ async fn fetch_new_remote(
     remote_name: &RemoteName,
     ref_expr: &GitFetchRefExpression,
     depth: Option<NonZeroU32>,
-    fetch_tags: Option<FetchTagsMode>,
 ) -> Result<(Option<RefNameBuf>, bool), CommandError> {
     writeln!(
         ui.status(),
@@ -402,20 +399,6 @@ async fn fetch_new_remote(
             fetch_refspecs,
             &mut GitSubprocessUi::new(ui),
             depth,
-            match fetch_tags {
-                // If not explicitly specified on the CLI, override the remote
-                // configuration and fetch all tags by default since this is
-                // the Git default behavior.
-                None => Some(FetchTagsOverride::AllTags),
-
-                // Technically by this point the remote should already be
-                // configured based on the CLI parameters so we shouldn't *need*
-                // to apply an override here but all the cases are expanded here
-                // for clarity.
-                Some(FetchTagsMode::All) => Some(FetchTagsOverride::AllTags),
-                Some(FetchTagsMode::None) => Some(FetchTagsOverride::NoTags),
-                Some(FetchTagsMode::Included) => None,
-            },
         )?;
 
         let import_stats = git_fetch.import_refs().await?;
@@ -471,13 +454,6 @@ async fn fetch_new_remote(
         tx.repo_mut().track_remote_bookmark(remote_symbol)?;
     }
     print_git_import_stats(ui, &tx, &import_stats)?;
-    if git_settings.auto_local_bookmark && !should_track_default {
-        writeln!(
-            ui.hint_default(),
-            "`git.track-default-bookmark-on-clone=false` has no effect if \
-             `git.auto-local-bookmark` is enabled."
-        )?;
-    }
     tx.finish(ui, "fetch from git remote into empty repo")
         .await?;
     Ok((working_branch.map(ToOwned::to_owned), working_is_default))

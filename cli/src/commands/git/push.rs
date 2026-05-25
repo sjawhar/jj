@@ -85,17 +85,18 @@ use crate::ui::Ui;
 
 /// Push to a Git remote
 ///
-/// By default, pushes tracking bookmarks pointing to
-/// `remote_bookmarks(remote=<remote>)..@`. Use `--bookmark` to push specific
-/// bookmarks. Use `--all` to push all bookmarks. Use `--change` to generate
-/// bookmark names based on the change IDs of specific commits.
+/// By default, pushes tracking bookmarks and tags pointing to
+/// `remote_bookmarks(remote=<remote>)..@`. Use `--bookmark`/`--tag` to push
+/// specific bookmarks or tags. Use `--all` to push all bookmarks and tags. Use
+/// `--change` to generate bookmark names based on the change IDs of specific
+/// commits.
 ///
-/// When pushing a bookmark, the command pushes all commits in the range from
-/// the remote's current position up to and including the bookmark's target
-/// commit. Any descendant commits beyond the bookmark are not pushed.
+/// When pushing a bookmark or tag, the command pushes all commits in the range
+/// from the remote's current position up to and including its target
+/// commit. Any descendant commits beyond the reference are not pushed.
 ///
-/// If the local bookmark has changed from the last fetch, push will update the
-/// remote bookmark to the new position after passing safety checks. This is
+/// If the local reference has changed from the last fetch, push will update the
+/// remote reference to the new position after passing safety checks. This is
 /// similar to `git push --force-with-lease` - the remote is updated only if its
 /// current state matches what Jujutsu last fetched.
 ///
@@ -152,37 +153,29 @@ pub struct GitPushArgs {
     /// [string pattern syntax]:
     ///     https://docs.jj-vcs.dev/latest/revsets/#string-patterns
     #[arg(long, short, group = "specific")]
-    #[arg(hide = true)] // TODO: unhide when this gets stabilized (#7528)
     tag: Vec<String>,
 
-    /// Push all bookmarks (including new bookmarks)
+    /// Push all bookmarks and tags (including new ones)
     #[arg(long, group = "what")]
     all: bool,
 
-    /// Push all tracked bookmarks
+    /// Push all tracked bookmarks and tags
     ///
-    /// This usually means that the bookmark was already pushed to or fetched
-    /// from the [relevant remote].
+    /// This usually means that the bookmark or tag was already pushed to or
+    /// fetched from the [relevant remote].
     ///
     /// [relevant remote]:
     ///     https://docs.jj-vcs.dev/latest/bookmarks#remotes-and-tracked-bookmarks
     #[arg(long, group = "what")]
     tracked: bool,
 
-    /// Push all deleted bookmarks
+    /// Push all deleted bookmarks and tags
     ///
-    /// Only tracked bookmarks can be successfully deleted on the remote. A
-    /// warning will be printed if any untracked bookmarks on the remote
-    /// correspond to missing local bookmarks.
+    /// Only tracked bookmarks and tags can be successfully deleted on the
+    /// remote. A warning will be printed if any untracked bookmarks or tags on
+    /// the remote correspond to missing local bookmarks or tags.
     #[arg(long, conflicts_with = "specific")]
     deleted: bool,
-
-    // TODO: Delete in jj 0.42.0+
-    /// Allow pushing new bookmarks
-    ///
-    /// Newly-created remote bookmarks will be tracked automatically.
-    #[arg(long, short = 'N', hide = true, conflicts_with = "what")]
-    allow_new: bool,
 
     /// Allow pushing commits with empty descriptions
     #[arg(long)]
@@ -196,7 +189,11 @@ pub struct GitPushArgs {
     #[arg(long)]
     allow_private: bool,
 
-    /// Push bookmarks pointing to these commits (can be repeated)
+    /// Allow pushing commits that contain conflicts
+    #[arg(long)]
+    allow_conflicts: bool,
+
+    /// Push bookmarks and tags pointing to these commits (can be repeated)
     #[arg(
         long = "revision",
         short,
@@ -273,13 +270,6 @@ pub async fn cmd_git_push(
     command: &CommandHelper,
     args: &GitPushArgs,
 ) -> Result<(), CommandError> {
-    if args.allow_new {
-        writeln!(
-            ui.warning_default(),
-            "--allow-new is deprecated, track bookmarks manually or configure \
-             remotes.<name>.auto-track-bookmarks instead."
-        )?;
-    }
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let default_remote;
@@ -311,8 +301,7 @@ pub async fn cmd_git_push(
         }
         for (name, targets) in view.local_remote_tags(remote) {
             let remote_symbol = name.to_remote_symbol(remote);
-            // TODO: push untracked tags when remote tags get stabilized (#7528)
-            let allow_new = false;
+            let allow_new = true; // implied by --all
             match classify_tag_update(remote_symbol, targets, allow_new, args.deleted) {
                 Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
                     Ok(()) => ref_updates.tags.push((name.to_owned(), update)),
@@ -454,8 +443,6 @@ pub async fn cmd_git_push(
         }
 
         let view = tx.repo().view();
-        // TODO: Delete in jj 0.42.0+
-        let allow_new = args.allow_new || tx.settings().get("git.push-new-bookmarks")?;
         let bookmarks_by_name = find_bookmarks_to_push(ui, view, &args.bookmark, remote)?;
         for &(name, targets) in &bookmarks_by_name {
             if !seen_bookmarks.insert(name) {
@@ -465,7 +452,7 @@ pub async fn cmd_git_push(
             // Override allow_new if the bookmark is not tracked with any remote
             // already. The user has specified --bookmark, so their intent which
             // bookmarks to push is clear.
-            let allow_new = allow_new || !has_tracked_remote_bookmarks(tx.repo(), name);
+            let allow_new = !has_tracked_remote_bookmarks(tx.repo(), name);
             let allow_delete = true; // named explicitly, allow delete without --delete
             match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
                 Ok(Some(update)) => ref_updates.bookmarks.push((name.to_owned(), update)),
@@ -521,6 +508,7 @@ pub async fn cmd_git_push(
                 continue;
             }
             let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false;
             let allow_delete = false;
             match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
                 Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
@@ -536,6 +524,7 @@ pub async fn cmd_git_push(
                 continue;
             }
             let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false;
             let allow_delete = false;
             match classify_tag_update(remote_symbol, targets, allow_new, allow_delete) {
                 Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
@@ -677,6 +666,7 @@ struct CommitsValidator<'repo> {
     immutable_heads: Arc<ResolvedRevsetExpression>,
     private_commits: Option<(String, Box<RevsetContainingFn<'repo>>)>,
     allow_empty_description: bool,
+    allow_conflicts: bool,
 }
 
 impl<'repo> CommitsValidator<'repo> {
@@ -713,6 +703,7 @@ impl<'repo> CommitsValidator<'repo> {
             immutable_heads,
             private_commits,
             allow_empty_description: args.allow_empty_description,
+            allow_conflicts: args.allow_conflicts,
         })
     }
 
@@ -757,7 +748,7 @@ impl<'repo> CommitsValidator<'repo> {
             {
                 reasons.push("has no author and/or committer set");
             }
-            if commit.has_conflict() {
+            if commit.has_conflict() && !self.allow_conflicts {
                 reasons.push("has conflicts");
             }
             if let Some((revset_str, is_private)) = &self.private_commits
@@ -882,12 +873,12 @@ async fn sign_commits_before_push(
         let num_updated_signatures = commit_ids.len();
         writeln!(
             formatter,
-            "Updated signatures of {num_updated_signatures} commits"
+            "Updated signatures of {num_updated_signatures} commits."
         )?;
         if num_rebased_descendants > 0 {
             writeln!(
                 formatter,
-                "Rebased {num_rebased_descendants} descendant commits"
+                "Rebased {num_rebased_descendants} descendant commits."
             )?;
         }
     }
@@ -1039,8 +1030,6 @@ fn classify_bookmark_update(
                 remote = remote_symbol.remote.as_symbol()
             )),
         }),
-        // TODO: deprecate --allow-new and make classify_bookmark_push_action()
-        // reject untracked remote?
         RefPushAction::Update(_) if !targets.remote_ref.is_tracked() && !allow_new => {
             Err(RejectedRefUpdateReason {
                 message: format!("Refusing to create new remote bookmark {remote_symbol}"),

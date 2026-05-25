@@ -57,7 +57,7 @@ fn test_tag_set_delete() {
     Warning: Target revision is empty.
     Created 1 tags pointing to rlvkpnrz bbc74930 (empty) (no description set)
     Moved 1 tags to rlvkpnrz bbc74930 (empty) (no description set)
-    Warning: The working-copy commit in workspace 'default' became immutable, so a new commit has been created on top of it.
+    Warning: The working-copy commit became immutable; a new commit has been created on top of it.
     Working copy  (@) now at: yqosqzyt 13cbd515 (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz bbc74930 (empty) (no description set)
     [EOF]
@@ -84,16 +84,20 @@ fn test_tag_set_delete() {
     [EOF]
     ");
 
-    let output = work_dir.run_jj(["tag", "set", "--allow-move", "-r@-", "baz"]);
+    let output = work_dir.run_jj(["tag", "set", "--allow-move", "-r@", "baz"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Warning: Target revision is empty.
-    Nothing changed.
+    Moved 1 tags to yqosqzyt 13cbd515 (empty) (no description set)
+    Warning: The working-copy commit became immutable; a new commit has been created on top of it.
+    Working copy  (@) now at: kpqxywon cca3d7af (empty) (no description set)
+    Parent commit (@-)      : yqosqzyt 13cbd515 (empty) (no description set)
     [EOF]
     ");
     insta::assert_snapshot!(get_log_output(&work_dir), @"
-    @  13cbd51558a6
-    ◆  bbc749308d7f baz
+    @  cca3d7af9d98
+    ◆  13cbd51558a6 baz
+    ◆  bbc749308d7f
     ◆  b876c5f49546 bar
     ◆  000000000000
     [EOF]
@@ -106,7 +110,8 @@ fn test_tag_set_delete() {
     [EOF]
     ");
     insta::assert_snapshot!(get_log_output(&work_dir), @"
-    @  13cbd51558a6
+    @  cca3d7af9d98
+    ○  13cbd51558a6
     ○  bbc749308d7f
     ○  b876c5f49546
     ◆  000000000000

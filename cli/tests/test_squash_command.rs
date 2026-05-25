@@ -74,9 +74,9 @@ fn test_squash() {
     // Can squash a given commit into its parent
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     let output = work_dir.run_jj(["squash", "-r", "b"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 441a7a3a c | (no description set)
     Parent commit (@-)      : qpvuntsm 105931bf a b | (no description set)
     [EOF]
@@ -199,9 +199,9 @@ fn test_squash_partial() -> TestResult {
     // into the parent
     std::fs::write(&edit_script, "dump JJ-INSTRUCTIONS instrs")?;
     let output = work_dir.run_jj(["squash", "-r", "b", "-i"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 34484d82 c | (no description set)
     Parent commit (@-)      : qpvuntsm 3141e675 a b | (no description set)
     [EOF]
@@ -238,9 +238,9 @@ fn test_squash_partial() -> TestResult {
     work_dir.run_jj(["op", "restore", &start_op_id]).success();
     std::fs::write(&edit_script, "reset file1")?;
     let output = work_dir.run_jj(["squash", "-r", "b", "-i"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: mzvwutvl 37e1a0ef c | (no description set)
     Parent commit (@-)      : kkmpptxz b41e789d b | (no description set)
     [EOF]
@@ -278,9 +278,9 @@ fn test_squash_partial() -> TestResult {
     // Clear the script so we know it won't be used even without -i
     std::fs::write(&edit_script, "")?;
     let output = work_dir.run_jj(["squash", "-r", "b", "file2"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: mzvwutvl 72ff256c c | (no description set)
     Parent commit (@-)      : kkmpptxz dd056a92 b | (no description set)
     [EOF]
@@ -349,9 +349,9 @@ fn test_squash_partial() -> TestResult {
     work_dir.write_file("file3", "foo\n");
     std::fs::write(&edit_script, "reset file1")?;
     let output = work_dir.run_jj(["squash", "-i", "file1", "file3"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 3615d80e c | (no description set)
     Parent commit (@-)      : kkmpptxz 037106c4 b | (no description set)
     [EOF]
@@ -426,9 +426,9 @@ fn test_squash_keep_emptied() {
     ");
 
     let output = work_dir.run_jj(["squash", "-r", "b", "--keep-emptied"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: mzvwutvl 093590e0 c | (no description set)
     Parent commit (@-)      : kkmpptxz 357946cf b | (empty) (no description set)
     [EOF]
@@ -583,9 +583,9 @@ fn test_squash_from_to() {
     // Can squash from descendant
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     let output = work_dir.run_jj(["squash", "--from", "e", "--into", "d"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kmkuslsw 1bc21d4e f | (no description set)
     Parent commit (@-)      : vruxwmqv 8b6b080a d e | (no description set)
     [EOF]
@@ -805,9 +805,9 @@ fn test_squash_from_to_partial() -> TestResult {
     // Clear the script so we know it won't be used
     std::fs::write(&edit_script, "")?;
     let output = work_dir.run_jj(["squash", "--from", "c", "--into", "b", "file1"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     [EOF]
     ");
     insta::assert_snapshot!(get_log_output(&work_dir), @"
@@ -905,9 +905,9 @@ fn test_squash_from_multiple() {
 
     // Squash a few commits sideways
     let output = work_dir.run_jj(["squash", "--from=b", "--from=c", "--into=d"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: kpqxywon f584da5f f | (no description set)
     Parent commit (@-)      : yostqsxw 6fbe5593 e | (no description set)
     New conflicts appeared in 1 commits:
@@ -951,9 +951,9 @@ fn test_squash_from_multiple() {
     // Squash a few commits up an down
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     let output = work_dir.run_jj(["squash", "--from=b|c|f", "--into=e"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: xznxytkn ec32238b (empty) (no description set)
     Parent commit (@-)      : yostqsxw 5298eef6 e f | (no description set)
     [EOF]
@@ -1051,9 +1051,9 @@ fn test_squash_from_multiple_partial() {
 
     // Partially squash a few commits sideways
     let output = work_dir.run_jj(["squash", "--from=b|c", "--into=d", "file1"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: kpqxywon 9113246b f | (no description set)
     Parent commit (@-)      : yostqsxw f069c595 e | (no description set)
     New conflicts appeared in 1 commits:
@@ -1118,9 +1118,9 @@ fn test_squash_from_multiple_partial() {
     // Partially squash a few commits up an down
     work_dir.run_jj(["op", "restore", &setup_opid]).success();
     let output = work_dir.run_jj(["squash", "--from=b|c|f", "--into=e", "file1"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: kpqxywon b5a40c15 f | (no description set)
     Parent commit (@-)      : yostqsxw 5dea187c e | (no description set)
     [EOF]
@@ -1880,10 +1880,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-before",
         "qpvuntsmwlqt",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit kpqxywon f87660dd file 3&4
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: vzqnnsmr 35736bd0 (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 4c273fe2 bm2 bm3 bm4 | file2
     [EOF]
@@ -1913,10 +1913,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-after",
         "qpvuntsmwlqt",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit lylxulpl 43cf43eb file 3&4
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: rsllmpnm 42df41a1 (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 3a4b2e8a bm2 bm3 bm4 | file2
     [EOF]
@@ -1979,10 +1979,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-after",
         "zsuskulnrvyr",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit nmzmmopx c7558c47 file 3&4
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: pwyqokvy 525d9441 (empty) (no description set)
     Parent commit (@-)      : nmzmmopx c7558c47 file 3&4
     [EOF]
@@ -2012,10 +2012,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-before",
         "zsuskulnrvyr",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit nlrtlrxv c5286eac bm4 | file 3&4
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: plymsszl faf348e7 (empty) (no description set)
     Parent commit (@-)      : nlrtlrxv c5286eac bm4 | file 3&4
     [EOF]
@@ -2079,10 +2079,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-before",
         "qpvuntsmwlqt",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit pkstwlsy 41510a56 file 3&4
-    Rebased 3 descendant commits
+    Rebased 3 descendant commits.
     Working copy  (@) now at: mzvwutvl 3d11750f (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 8ed73d06 bm2 bm3 bm4 | file2
     [EOF]
@@ -2124,31 +2124,31 @@ fn test_squash_to_new_commit() -> TestResult {
     insta::assert_snapshot!(output, @"
     ○    pkstwlsy test.user@example.com 2001-02-03 08:05:35 41510a56
     ├─╮  file 3&4
-    │ │  -- operation 3d6e647dccb7 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
+    │ │  -- operation 026f4f6709a5 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
     │ ○  zsuskuln/0 test.user@example.com 2001-02-03 08:05:35 a5bc761f (hidden)
     │ │  file4
-    │ │  -- operation 3d6e647dccb7 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
+    │ │  -- operation 026f4f6709a5 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
     │ ○  zsuskuln/4 test.user@example.com 2001-02-03 08:05:11 38778966 (hidden)
     │ │  file4
-    │ │  -- operation 9ca0f4771551 commit 89a30a7539466ed176c1ef122a020fd9cb15848e
+    │ │  -- operation 3c3c237dae08 commit 89a30a7539466ed176c1ef122a020fd9cb15848e
     │ ○  zsuskuln/5 test.user@example.com 2001-02-03 08:05:11 89a30a75 (hidden)
     │ │  (no description set)
-    │ │  -- operation 26b29f385618 snapshot working copy
+    │ │  -- operation 8d98ff7c076c snapshot working copy
     │ ○  zsuskuln/6 test.user@example.com 2001-02-03 08:05:10 bbf04d26 (hidden)
     │    (empty) (no description set)
-    │    -- operation fc5403fc3984 commit c23c424826221bc4fdee9487926595324e50ee95
+    │    -- operation 500bbee268a2 commit c23c424826221bc4fdee9487926595324e50ee95
     ○  kkmpptxz/0 test.user@example.com 2001-02-03 08:05:35 ce3b0a58 (hidden)
     │  file3
-    │  -- operation 3d6e647dccb7 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
+    │  -- operation 026f4f6709a5 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
     ○  kkmpptxz/3 test.user@example.com 2001-02-03 08:05:10 0d254956 (hidden)
     │  file3
-    │  -- operation fc5403fc3984 commit c23c424826221bc4fdee9487926595324e50ee95
+    │  -- operation 500bbee268a2 commit c23c424826221bc4fdee9487926595324e50ee95
     ○  kkmpptxz/4 test.user@example.com 2001-02-03 08:05:10 c23c4248 (hidden)
     │  (no description set)
-    │  -- operation c5043d80534d snapshot working copy
+    │  -- operation 385c607f1340 snapshot working copy
     ○  kkmpptxz/5 test.user@example.com 2001-02-03 08:05:09 c1272e87 (hidden)
        (empty) (no description set)
-       -- operation 4eb3252f7fd7 commit cb58ff1c6f1af92f827661e7275941ceb4d910c5
+       -- operation 1fe18b105580 commit cb58ff1c6f1af92f827661e7275941ceb4d910c5
     [EOF]
     ");
 
@@ -2163,10 +2163,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "qpvuntsmwlqt",
         "--use-destination-message",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit soqnvnyz bf2d3b81 (no description set)
-    Rebased 3 descendant commits
+    Rebased 3 descendant commits.
     Working copy  (@) now at: mzvwutvl 9ebad59e (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 0c770834 bm2 bm3 bm4 | file2
     [EOF]
@@ -2194,10 +2194,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "qpvuntsmwlqt",
         "--use-destination-message",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit nsrwusvy c2183685 (empty) (no description set)
-    Rebased 5 descendant commits
+    Rebased 5 descendant commits.
     Working copy  (@) now at: mzvwutvl cb96ecf9 (empty) (no description set)
     Parent commit (@-)      : zsuskuln 97edce13 bm4 | file4
     [EOF]
@@ -2222,7 +2222,7 @@ fn test_squash_to_new_commit() -> TestResult {
     insta::assert_snapshot!(output, @"
     ○  nsrwusvy test.user@example.com 2001-02-03 08:05:42 c2183685
        (empty) (no description set)
-       -- operation 29b5af212226 squash 0 commits
+       -- operation 3094a76484ad squash 0 commits
     [EOF]
     ");
 
@@ -2237,11 +2237,11 @@ fn test_squash_to_new_commit() -> TestResult {
         "--use-destination-message",
         "no file",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Warning: No matching entries for paths: no file
     Created new commit wtlqussy 7eff41c8 (empty) (no description set)
-    Rebased 5 descendant commits
+    Rebased 5 descendant commits.
     Working copy  (@) now at: mzvwutvl cf8a98c4 (empty) (no description set)
     Parent commit (@-)      : zsuskuln 461e8bb9 bm4 | file4
     [EOF]
@@ -2266,7 +2266,7 @@ fn test_squash_to_new_commit() -> TestResult {
     insta::assert_snapshot!(output, @"
     ○  wtlqussy test.user@example.com 2001-02-03 08:05:46 7eff41c8
        (empty) (no description set)
-       -- operation f5c12bfd0cbc squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
+       -- operation 2dfbda8259b2 squash commit 0d254956d33ed5bb11d93eb795c5e514aadc81b5 and 1 more
     [EOF]
     ");
 
@@ -2313,10 +2313,10 @@ fn test_squash_to_new_commit() -> TestResult {
     insta::assert_snapshot!(output, @"
     ○  pyoswmwk test.user@example.com 2001-02-03 08:05:50 991d0644
     │  (empty) (no description set)
-    │  -- operation 587bcc3abdef squash commit f5e47d019271a392eb7f92a6b2e9f8cf41d97049
+    │  -- operation c4d2417e58a7 squash commit f5e47d019271a392eb7f92a6b2e9f8cf41d97049
     ○  szrrkvty/0 test.user@example.com 2001-02-03 08:05:50 f5e47d01 (hidden)
        (empty) (no description set)
-       -- operation 4096cc584a23 new empty commit
+       -- operation dcf228dfaf3f new empty commit
     [EOF]
     ");
 
@@ -2333,10 +2333,10 @@ fn test_squash_to_new_commit() -> TestResult {
         "--insert-before",
         "rlvkpnrzqnoo",
     ]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Created new commit vkywoywq 96673776 file 3&4
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: rsmzzqvr e37e3e4a (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 8044909c bm2 bm3 bm4 | file2
     [EOF]
@@ -2370,10 +2370,10 @@ fn test_squash_to_new_commit() -> TestResult {
     ◆  zzzzzzzzzzzz
     [EOF]
     ");
-    insta::assert_snapshot!(work_dir.run_jj(["squash", "--before", "rlvkpnrzqnoo"]), @"
+    insta::assert_snapshot!(work_dir.run_jj(["squash", "--before", "rlvkpnrzqnoo"]), @r"
     ------- stderr -------
     Created new commit wxzmtyol bc0392dc file3
-    Rebased 2 descendant commits
+    Rebased 2 descendant commits.
     Working copy  (@) now at: musouqkq 1841cc81 (empty) (no description set)
     Parent commit (@-)      : rlvkpnrz 264a43af bm2 bm3 | file2
     [EOF]

@@ -143,8 +143,8 @@ commit_id = "ansi-color-81"
 
 If you use a string value for a color, as in the examples above, it will be used
 for the foreground color. You can also set the background color, reverse colors
-(swap foreground and background), or make the text bold, dim, italic, or
-underlined. For that, you need to use a table:
+(swap foreground and background), or make the text bold, dim, italic,
+underlined, or crossed-out. For that, you need to use a table:
 
 ```toml
 [colors]
@@ -1910,6 +1910,17 @@ For example, the following could be used to run `jj` without loading any user co
 ```bash
 JJ_CONFIG= jj log       # Ignores any settings specified in the config file.
 ```
+
+### System config files
+
+On unix-like platforms, system-wide `jj` configurations are by default loaded in
+the following precedence order (with later configs overriding earlier ones).
+
+- `/etc/jj/config.toml`
+- `/etc/jj/conf.d/*.toml`
+
+These configs can be overridden by [the user config files], and will be disabled
+in favor of the `JJ_CONFIG` environment variable if it is set.
 
 ### JSON Schema Support
 

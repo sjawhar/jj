@@ -58,8 +58,8 @@ fn test_workspaces_add_second_and_third_workspace() {
     main_dir.run_jj(["commit", "-m", "initial"]).success();
 
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
     [EOF]
     ");
 
@@ -94,9 +94,9 @@ fn test_workspaces_add_second_and_third_workspace() {
 
     // Both workspaces show up when we list them
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
-    second: rzvqmyuk bcc858e1 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    second: ../secondary rzvqmyuk bcc858e1 (empty) (no description set)
     [EOF]
     ");
 
@@ -262,7 +262,7 @@ fn test_workspaces_add_second_workspace_on_merge() {
 
     let output = main_dir.run_jj(["workspace", "list"]);
     insta::assert_snapshot!(output, @"
-    default: zsuskuln 46ed31b6 (empty) merge
+    default: . zsuskuln 46ed31b6 (empty) merge
     [EOF]
     ");
 
@@ -414,7 +414,7 @@ fn test_workspaces_add_workspace_at_revision() {
 
     let output = main_dir.run_jj(["workspace", "list"]);
     insta::assert_snapshot!(output, @"
-    default: kkmpptxz 5ac9178d (empty) (no description set)
+    default: . kkmpptxz 5ac9178d (empty) (no description set)
     [EOF]
     ");
 
@@ -537,8 +537,8 @@ fn test_workspaces_add_workspace_from_subdir() {
     main_dir.run_jj(["commit", "-m", "initial"]).success();
 
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 0ba0ff35 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 0ba0ff35 (empty) (no description set)
     [EOF]
     ");
 
@@ -555,9 +555,9 @@ fn test_workspaces_add_workspace_from_subdir() {
 
     // Both workspaces show up when we list them
     let output = secondary_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 0ba0ff35 (empty) (no description set)
-    secondary: rzvqmyuk dea1be10 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: ../main rlvkpnrz 0ba0ff35 (empty) (no description set)
+    secondary: . rzvqmyuk dea1be10 (empty) (no description set)
     [EOF]
     ");
 }
@@ -586,8 +586,8 @@ fn test_workspaces_add_workspace_in_current_workspace() {
     // Workspace created despite warning
     let output = main_dir.run_jj(["workspace", "list"]);
     insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
-    secondary: pmmvwywv 058f604d (empty) (no description set)
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    secondary: secondary pmmvwywv 058f604d (empty) (no description set)
     [EOF]
     ");
 
@@ -605,9 +605,9 @@ fn test_workspaces_add_workspace_in_current_workspace() {
     // Both workspaces created
     let output = main_dir.run_jj(["workspace", "list"]);
     insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
-    secondary: pmmvwywv 058f604d (empty) (no description set)
-    third: zxsnswpr 1c1effec (empty) (no description set)
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    secondary: secondary pmmvwywv 058f604d (empty) (no description set)
+    third: third zxsnswpr 1c1effec (empty) (no description set)
     [EOF]
     ");
 
@@ -639,9 +639,9 @@ fn test_workspace_add_override_path_in_store() {
 
     // Both workspaces show up when we list them
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
-    second: pmmvwywv 058f604d (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    second: ../secondary pmmvwywv 058f604d (empty) (no description set)
     [EOF]
     ");
 
@@ -649,14 +649,14 @@ fn test_workspace_add_override_path_in_store() {
     let output = main_dir.run_jj(["operation", "restore", "@--"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Restored to operation: 98ef745836d5 (2001-02-03 08:05:08) commit 006bd1130b84e90ab082adeabd7409270d5a86da
+    Restored to operation: c5bfc0be8306 (2001-02-03 08:05:08) commit 006bd1130b84e90ab082adeabd7409270d5a86da
     [EOF]
     ");
 
     // Only default workspace show up when we list them
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
     [EOF]
     ");
 
@@ -673,9 +673,9 @@ fn test_workspace_add_override_path_in_store() {
 
     // Both workspaces show up when we list them
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz 504e3d8c (empty) (no description set)
-    second: spxsnpux 96ef6c50 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    second: ../tertiary spxsnpux 96ef6c50 (empty) (no description set)
     [EOF]
     ");
 
@@ -718,9 +718,9 @@ fn test_workspaces_conflicting_edits() {
     // Squash the changes from the main workspace into the initial commit (before
     // running any command in the secondary workspace
     let output = main_dir.run_jj(["squash"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 3a9b690d (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     [EOF]
@@ -738,7 +738,7 @@ fn test_workspaces_conflicting_edits() {
     let output = secondary_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 58f8ef773e05).
+    Error: The working copy is stale (not updated since operation 112d1427e3d3).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -748,7 +748,7 @@ fn test_workspaces_conflicting_edits() {
     let output = secondary_dir.run_jj(["log"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 58f8ef773e05).
+    Error: The working copy is stale (not updated since operation 112d1427e3d3).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -758,10 +758,10 @@ fn test_workspaces_conflicting_edits() {
     // Since there was an uncommitted change in the working copy, it should
     // have been committed first (causing divergence)
     let output = secondary_dir.run_jj(["workspace", "update-stale"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Concurrent modification detected, resolving automatically.
-    Rebased 1 descendant commits onto commits rewritten by other operation
+    Rebased 1 descendant commits onto commits rewritten by other operation.
     Working copy  (@) now at: pmmvwywv/2 90f3d42e (divergent) (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     Added 0 files, modified 1 files, removed 0 files
@@ -819,9 +819,9 @@ fn test_workspaces_updated_by_other() {
     // Rewrite the check-out commit in one workspace.
     main_dir.write_file("file", "changed in main\n");
     let output = main_dir.run_jj(["squash"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 3a9b690d (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     [EOF]
@@ -839,7 +839,7 @@ fn test_workspaces_updated_by_other() {
     let output = secondary_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 58f8ef773e05).
+    Error: The working copy is stale (not updated since operation 112d1427e3d3).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -896,9 +896,9 @@ fn test_workspaces_updated_by_other_automatic() {
     // Rewrite the check-out commit in one workspace.
     main_dir.write_file("file", "changed in main\n");
     let output = main_dir.run_jj(["squash"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 3a9b690d (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     [EOF]
@@ -969,9 +969,9 @@ fn test_workspaces_updated_by_other_with_changes_in_working_copy_automatic() {
     // Rewrite all commits from one workspace.
     main_dir.write_file("file", "changed in main\n");
     let output = main_dir.run_jj(["squash"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Rebased 1 descendant commits
+    Rebased 1 descendant commits.
     Working copy  (@) now at: mzvwutvl 3a9b690d (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     [EOF]
@@ -990,10 +990,10 @@ fn test_workspaces_updated_by_other_with_changes_in_working_copy_automatic() {
     // The first working copy gets automatically updated.
     secondary_dir.write_file("file", "modified contents\n");
     let output = secondary_dir.run_jj(["describe", "-m", "modified"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Concurrent modification detected, resolving automatically.
-    Rebased 1 descendant commits onto commits rewritten by other operation
+    Rebased 1 descendant commits onto commits rewritten by other operation.
     Working copy  (@) now at: pmmvwywv/2 90f3d42e (divergent) (empty) (no description set)
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     Added 0 files, modified 1 files, removed 0 files
@@ -1089,14 +1089,14 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
     ]);
     insta::allow_duplicates! {
         insta::assert_snapshot!(output, @"
-        @  2dea766382 abandon commit de90575a14d8b9198dc0930f9de4a69f846ded36
-        ○  0d3faebd8c create initial working-copy commit in workspace secondary
-        ○  200ba564cb add workspace 'secondary'
-        ○  b34eafb924 new empty commit
-        ○  c883929a6b snapshot working copy
-        ○  bd7b1cfa98 new empty commit
-        ○  4509e20d8c snapshot working copy
-        ○  90267f31f9 add workspace 'default'
+        @  999625274f abandon commit de90575a14d8b9198dc0930f9de4a69f846ded36
+        ○  82854b4f68 create initial working-copy commit in workspace secondary
+        ○  5761a0283b add workspace 'secondary'
+        ○  9d91c47f71 new empty commit
+        ○  5d825bd295 snapshot working copy
+        ○  f6770a3428 new empty commit
+        ○  09cf7d1cf3 snapshot working copy
+        ○  e39dc28890 add workspace 'default'
         ○  0000000000
         [EOF]
         ");
@@ -1131,7 +1131,7 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         Parent commit (@-): rzvqmyuk 891f0006 (empty) (no description set)
         [EOF]
         ------- stderr -------
-        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0d3faebd8cf4f0e39ea3eab47f22c9cdbcdaa54d95e79a86a0dab4ebe3b0377f69e1d64fa4661913c8c6af01dc0ebb5ad7c8b2bfa3d229827b2ba756d729e0bf of type operation not found
+        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 82854b4f6803b9a5729be4028aa68b075c4c5c2e289ca04146a3a3ce2bcd836556dc5d7db6203777f0a0f059797ba7b689de79e359669d57bb94b91236b58028 of type operation not found
         Created and checked out recovery commit 866928d1e0fd
         [EOF]
         ");
@@ -1149,7 +1149,7 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         let output = secondary_dir.run_jj(["workspace", "update-stale"]);
         insta::assert_snapshot!(output, @"
         ------- stderr -------
-        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0d3faebd8cf4f0e39ea3eab47f22c9cdbcdaa54d95e79a86a0dab4ebe3b0377f69e1d64fa4661913c8c6af01dc0ebb5ad7c8b2bfa3d229827b2ba756d729e0bf of type operation not found
+        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 82854b4f6803b9a5729be4028aa68b075c4c5c2e289ca04146a3a3ce2bcd836556dc5d7db6203777f0a0f059797ba7b689de79e359669d57bb94b91236b58028 of type operation not found
         Created and checked out recovery commit 866928d1e0fd
         [EOF]
         ");
@@ -1200,20 +1200,20 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         insta::assert_snapshot!(output, @"
         @  kmkuslsw test.user@example.com 2001-02-03 08:05:18 secondary@ 18851b39
         │  RECOVERY COMMIT FROM `jj workspace update-stale`
-        │  -- operation a35d39d101f4 snapshot working copy
+        │  -- operation 1d9f35c8ff54 snapshot working copy
         ○  kmkuslsw/1 test.user@example.com 2001-02-03 08:05:18 866928d1 (hidden)
            (empty) RECOVERY COMMIT FROM `jj workspace update-stale`
-           -- operation 754c2986ff83 recovery commit
+           -- operation 64b34ec7908c recovery commit
         [EOF]
         ");
     } else {
         insta::assert_snapshot!(output, @"
         @  kmkuslsw test.user@example.com 2001-02-03 08:05:18 secondary@ 18851b39
         │  RECOVERY COMMIT FROM `jj workspace update-stale`
-        │  -- operation 3ae899f26750 snapshot working copy
+        │  -- operation bb5fe5e623a9 snapshot working copy
         ○  kmkuslsw/1 test.user@example.com 2001-02-03 08:05:18 866928d1 (hidden)
            (empty) RECOVERY COMMIT FROM `jj workspace update-stale`
-           -- operation 754c2986ff83 recovery commit
+           -- operation 64b34ec7908c recovery commit
         [EOF]
         ");
     }
@@ -1226,9 +1226,9 @@ fn test_workspaces_update_stale_noop() {
     let main_dir = test_env.work_dir("main");
 
     let output = main_dir.run_jj(["workspace", "update-stale"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Attempted recovery, but the working copy is not stale
+    Attempted recovery, but the working copy is not stale.
     [EOF]
     ");
 
@@ -1271,8 +1271,8 @@ fn test_workspaces_unpublished_operation_same_tree() {
     let output = main_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Internal error: The repo was loaded at operation 8627c7508be4, which seems to be a sibling of the working copy's operation eceacbdafd84
-    Hint: Run `jj op integrate eceacbdafd84` to add the working copy's operation to the operation log.
+    Internal error: The repo was loaded at operation 4f9c1f05fdf1, which seems to be a sibling of the working copy's operation 69a858721990
+    Hint: Run `jj op integrate 69a858721990` to add the working copy's operation to the operation log.
     [EOF]
     [exit status: 255]
     ");
@@ -1309,10 +1309,10 @@ fn test_workspaces_update_stale_snapshot() {
     // operations, but should be resolved cleanly.
     secondary_dir.write_file("file", "changed in second\n");
     let output = secondary_dir.run_jj(["workspace", "update-stale"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Concurrent modification detected, resolving automatically.
-    Attempted recovery, but the working copy is not stale
+    Attempted recovery, but the working copy is not stale.
     [EOF]
     ");
 
@@ -1354,8 +1354,9 @@ fn test_colocated_workspace_update_stale() {
         .run_jj(["bookmark", "set", "-rsubject('old book1')", "book1"])
         .success();
 
+    // Use --no-colocate to keep secondary non-colocated for this test
     main_dir
-        .run_jj(["workspace", "add", "../secondary"])
+        .run_jj(["workspace", "add", "--no-colocate", "../secondary"])
         .success();
 
     // Rewrite the check-out commit from the secondary workspace.
@@ -1399,7 +1400,7 @@ fn test_colocated_workspace_update_stale() {
     let output = main_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 8ab980a3d398).
+    Error: The working copy is stale (not updated since operation e552d87b13fb).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -1471,8 +1472,8 @@ fn test_workspaces_forget() {
 
     // When listing workspaces, only the secondary workspace shows up
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    secondary: pmmvwywv 31da1455 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    secondary: ../secondary pmmvwywv 31da1455 (empty) (no description set)
     [EOF]
     ");
 
@@ -1586,10 +1587,10 @@ fn test_workspaces_forget_multi_transaction() {
 
     // there should be three workspaces
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz f6bf8819 (empty) (no description set)
-    second: pmmvwywv 31da1455 (empty) (no description set)
-    third: rzvqmyuk bf5b5b4d (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz f6bf8819 (empty) (no description set)
+    second: ../second pmmvwywv 31da1455 (empty) (no description set)
+    third: ../third rzvqmyuk bf5b5b4d (empty) (no description set)
     [EOF]
     ");
 
@@ -1598,15 +1599,15 @@ fn test_workspaces_forget_multi_transaction() {
         .run_jj(["workspace", "forget", "second", "third", "fourth"])
         .success();
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz f6bf8819 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz f6bf8819 (empty) (no description set)
     [EOF]
     ");
 
     // the op log should have the multiple valid workspaces forgotten in a single tx
     let output = main_dir.run_jj(["op", "log", "--limit", "1"]);
     insta::assert_snapshot!(output, @"
-    @  90493ae75198 test-username@host.example.com default@ 2001-02-03 04:05:12.000 +07:00 - 2001-02-03 04:05:12.000 +07:00
+    @  56637f98c5d4 test-username@host.example.com default@ 2001-02-03 04:05:12.000 +07:00 - 2001-02-03 04:05:12.000 +07:00
     │  forget workspaces second, third
     │  args: jj workspace forget second third fourth
     [EOF]
@@ -1617,8 +1618,8 @@ fn test_workspaces_forget_multi_transaction() {
 
     // finally, there should be three workspaces at the end
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: rlvkpnrz f6bf8819 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . rlvkpnrz f6bf8819 (empty) (no description set)
     second: pmmvwywv 31da1455 (empty) (no description set)
     third: rzvqmyuk bf5b5b4d (empty) (no description set)
     [EOF]
@@ -1643,11 +1644,11 @@ fn test_workspaces_forget_abandon_commits() {
 
     // there should be four workspaces, three of which are at the same empty commit
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: qpvuntsm 006bd113 (no description set)
-    fourth: uuqppmxq 94f41578 (empty) (no description set)
-    second: uuqppmxq 94f41578 (empty) (no description set)
-    third: uuqppmxq 94f41578 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . qpvuntsm 006bd113 (no description set)
+    fourth: ../fourth uuqppmxq 94f41578 (empty) (no description set)
+    second: ../second uuqppmxq 94f41578 (empty) (no description set)
+    third: ../third uuqppmxq 94f41578 (empty) (no description set)
     [EOF]
     ");
     insta::assert_snapshot!(get_log_output(&main_dir), @"
@@ -1756,6 +1757,22 @@ fn test_list_workspaces_template_root() {
     second: $TEST_ENV/secondary
     [EOF]
     ");
+
+    let template = r#"name ++ ": " ++ if(root, root ++ " " ++ root.relative()) ++ "\n""#;
+    let output = main_dir.run_jj(["workspace", "list", "-T", template]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: $TEST_ENV/main .
+    second: $TEST_ENV/secondary ../secondary
+    [EOF]
+    ");
+
+    let template = r#"name ++ ": " ++ if(root, root.relative()) ++ "\n""#;
+    let output = main_dir.run_jj(["workspace", "list", "-T", template]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: .
+    second: ../secondary
+    [EOF]
+    ");
 }
 
 #[test]
@@ -1770,18 +1787,25 @@ fn test_list_workspaces_template_root_unavailable() {
     std::fs::remove_dir_all(test_env.env_root().join("secondary")).unwrap();
 
     let template = r#"name ++ ": " ++ root ++ "\n""#;
-    let output = main_dir
-        .run_jj(["workspace", "list", "-T", template])
-        .normalize_backslash()
-        .normalize_stdout_with(|s| {
-            s.replace(
-                "The system cannot find the file specified.",
-                "No such file or directory",
-            )
-        });
-    insta::assert_snapshot!(output, @"
+    let output = main_dir.run_jj(["workspace", "list", "-T", template]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
     default: $TEST_ENV/main
-    second: <Error: Failed to resolve workspace root: second: $TEST_ENV/main/.jj/repo/../../../secondary: No such file or directory (os error 2)>
+    second: 
+    [EOF]
+    ");
+
+    let template = r#"name ++ ": " ++ if(root, root.relative()) ++ "\n""#;
+    let output = main_dir.run_jj(["workspace", "list", "-T", template]);
+    insta::assert_snapshot!(output, @"
+    default: .
+    second: 
+    [EOF]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "list"]);
+    insta::assert_snapshot!(output, @"
+    default: . qpvuntsm e8849ae1 (empty) (no description set)
+    second: uuqppmxq 94f41578 (empty) (no description set)
     [EOF]
     ");
 }
@@ -1853,9 +1877,9 @@ fn test_workspaces_relative_path() -> TestResult {
     ");
 
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: qpvuntsm e8849ae1 (empty) (no description set)
-    secondary: uuqppmxq 94f41578 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . qpvuntsm e8849ae1 (empty) (no description set)
+    secondary: ../secondary uuqppmxq 94f41578 (empty) (no description set)
     [EOF]
     ");
 
@@ -1912,10 +1936,10 @@ fn test_debug_snapshot() {
     work_dir.run_jj(["debug", "snapshot"]).success();
     let output = work_dir.run_jj(["op", "log"]);
     insta::assert_snapshot!(output, @"
-    @  a60628738654 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
+    @  3c84df1da721 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
     │  snapshot working copy
     │  args: jj debug snapshot
-    ○  90267f31f904 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
+    ○  e39dc288903d test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
     │  add workspace 'default'
     ○  000000000000 root()
     [EOF]
@@ -1923,13 +1947,13 @@ fn test_debug_snapshot() {
     work_dir.run_jj(["describe", "-m", "initial"]).success();
     let output = work_dir.run_jj(["op", "log"]);
     insta::assert_snapshot!(output, @"
-    @  e6e34553de88 test-username@host.example.com default@ 2001-02-03 04:05:10.000 +07:00 - 2001-02-03 04:05:10.000 +07:00
+    @  afd1de5b1f69 test-username@host.example.com default@ 2001-02-03 04:05:10.000 +07:00 - 2001-02-03 04:05:10.000 +07:00
     │  describe commit 006bd1130b84e90ab082adeabd7409270d5a86da
     │  args: jj describe -m initial
-    ○  a60628738654 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
+    ○  3c84df1da721 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
     │  snapshot working copy
     │  args: jj debug snapshot
-    ○  90267f31f904 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
+    ○  e39dc288903d test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
     │  add workspace 'default'
     ○  000000000000 root()
     [EOF]
@@ -1998,9 +2022,9 @@ fn test_workspaces_rename_workspace() {
 
     // Both workspaces show up when we list them
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: qpvuntsm e8849ae1 (empty) (no description set)
-    second: uuqppmxq 94f41578 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . qpvuntsm e8849ae1 (empty) (no description set)
+    second: ../secondary uuqppmxq 94f41578 (empty) (no description set)
     [EOF]
     ");
 
@@ -2008,9 +2032,9 @@ fn test_workspaces_rename_workspace() {
     insta::assert_snapshot!(output, @"");
 
     let output = main_dir.run_jj(["workspace", "list"]);
-    insta::assert_snapshot!(output, @"
-    default: qpvuntsm e8849ae1 (empty) (no description set)
-    third: uuqppmxq 94f41578 (empty) (no description set)
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    default: . qpvuntsm e8849ae1 (empty) (no description set)
+    third: ../secondary uuqppmxq 94f41578 (empty) (no description set)
     [EOF]
     ");
 
@@ -2069,6 +2093,12 @@ fn test_workspaces_rename_workspace_from_before_workspace_store() {
     Error: Workspace has no recorded path: third
     [EOF]
     [exit status: 1]
+    ");
+
+    let output = main_dir.run_jj(["workspace", "list", "-T", r#"name ++ ": " ++ root ++ "\n""#]);
+    insta::assert_snapshot!(output, @"
+    third: 
+    [EOF]
     ");
 }
 
