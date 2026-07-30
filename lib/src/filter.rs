@@ -16,7 +16,6 @@
 //! working copy, similar to the filter gitattributes feature.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -32,8 +31,9 @@ use async_trait::async_trait;
 use bstr::BString;
 use bstr::ByteSlice as _;
 use itertools::Itertools as _;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt as _;
+use futures::AsyncRead;
+use futures::io::Cursor;
+use futures::AsyncReadExt as _;
 
 use crate::command_config::CommandNameAndArgs;
 use crate::config::ConfigGetError;
@@ -462,7 +462,7 @@ impl ProcessAsyncAdapter for StdChildAsyncAdapter {
 
         let stdin_rx = match child.stdin.take() {
             Some(mut child_stdin) => {
-                let (stdin_tx, stdin_rx) = tokio::sync::oneshot::channel::<()>();
+                let (stdin_tx, stdin_rx) = futures::channel::oneshot::channel::<()>();
                 let worker_thread_name = self
                     .worker_thread_name_prefix
                     .as_ref()
@@ -504,7 +504,7 @@ impl ProcessAsyncAdapter for StdChildAsyncAdapter {
         };
 
         let child = Arc::new(Mutex::new(Some(child)));
-        let (output_tx, output_rx) = tokio::sync::oneshot::channel();
+        let (output_tx, output_rx) = futures::channel::oneshot::channel();
         let worker_thread_name = self
             .worker_thread_name_prefix
             .as_ref()

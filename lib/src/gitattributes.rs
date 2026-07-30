@@ -37,14 +37,15 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bstr::BStr;
+use futures::AsyncRead;
+use futures::AsyncReadExt as _;
+use futures::io::AllowStdIo;
+use futures::lock::Mutex as AsyncMutex;
 use gix_attributes::glob::pattern::Case;
 use gix_attributes::search::Outcome;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt as _;
-use tokio::sync::OnceCell;
 
+use crate::backend::MergedTreeValueExt as _;
 use crate::backend::TreeValue;
-use crate::file_util::BlockingAsyncReader;
 use crate::merge::SameChange;
 use crate::merged_tree::MergedTree;
 use crate::repo_path::RepoPath;
@@ -316,7 +317,7 @@ impl FileLoader for DiskFileLoader {
                 });
             }
         };
-        Ok(Some(Box::new(BlockingAsyncReader::new(file)) as Box<_>))
+        Ok(Some(Box::new(AllowStdIo::new(file)) as Box<_>))
     }
 }
 
@@ -347,7 +348,7 @@ pub struct GitAttributes {
     /// [`GitAttributesNode`] object, and the cache key is the path to the
     /// folder, e.g., `foo`. This allows files under the same folder properly
     /// share the same cache entry.
-    node_cache: Mutex<HashMap<RepoPathBuf, Arc<OnceCell<Arc<GitAttributesNode>>>>>,
+    node_cache: Mutex<HashMap<RepoPathBuf, Arc<AsyncMutex<Option<Arc<GitAttributesNode>>>>>>,
     file_loaders: Box<[Arc<dyn FileLoader>]>,
 }
 
@@ -442,13 +443,18 @@ impl GitAttributes {
     async fn get_node(&self, path: &RepoPath) -> Result<Arc<GitAttributesNode>> {
         let node = match self.node_cache.lock().unwrap().entry(path.to_owned()) {
             Entry::Occupied(node) => node.get().clone(),
-            Entry::Vacant(node) => Arc::clone(node.insert(Arc::new(OnceCell::new()))),
+            Entry::Vacant(node) => Arc::clone(node.insert(Arc::new(AsyncMutex::new(None)))),
         };
-        // We perform the actual initialization without the lock held for better
-        // parallelism.
-        node.get_or_try_init(|| self.initialize_node(path))
-            .await
-            .cloned()
+        // We perform the actual initialization without the map lock held for better
+        // parallelism. The per-node lock is what makes it happen once; on error the
+        // slot stays empty so a later call retries, as get_or_try_init did.
+        let mut slot = node.lock().await;
+        if let Some(node) = slot.as_ref() {
+            return Ok(node.clone());
+        }
+        let initialized = self.initialize_node(path).await?;
+        *slot = Some(Arc::clone(&initialized));
+        Ok(initialized)
     }
 
     /// Query the states of git attributes associated to the `path`.
@@ -556,10 +562,10 @@ impl GitAttributes {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::pin::Pin;
+        use std::pin::Pin;
     use std::task::Poll;
 
+    use futures::io::Cursor;
     use gix_attributes::state::ValueRef;
     use indoc::indoc;
     use itertools::Itertools as _;
@@ -842,8 +848,8 @@ mod tests {
             fn poll_read(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
-                _buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
+                _buf: &mut [u8],
+            ) -> Poll<std::io::Result<usize>> {
                 Poll::Ready(Err(std::io::Error::other("test error")))
             }
         }
