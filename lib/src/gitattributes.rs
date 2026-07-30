@@ -40,9 +40,9 @@ use bstr::BStr;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::io::AllowStdIo;
+use futures::lock::Mutex as AsyncMutex;
 use gix_attributes::glob::pattern::Case;
 use gix_attributes::search::Outcome;
-use tokio::sync::OnceCell;
 
 use crate::backend::TreeValue;
 use crate::merge::SameChange;
@@ -347,7 +347,7 @@ pub struct GitAttributes {
     /// [`GitAttributesNode`] object, and the cache key is the path to the
     /// folder, e.g., `foo`. This allows files under the same folder properly
     /// share the same cache entry.
-    node_cache: Mutex<HashMap<RepoPathBuf, Arc<OnceCell<Arc<GitAttributesNode>>>>>,
+    node_cache: Mutex<HashMap<RepoPathBuf, Arc<AsyncMutex<Option<Arc<GitAttributesNode>>>>>>,
     file_loaders: Box<[Arc<dyn FileLoader>]>,
 }
 
@@ -442,13 +442,18 @@ impl GitAttributes {
     async fn get_node(&self, path: &RepoPath) -> Result<Arc<GitAttributesNode>> {
         let node = match self.node_cache.lock().unwrap().entry(path.to_owned()) {
             Entry::Occupied(node) => node.get().clone(),
-            Entry::Vacant(node) => Arc::clone(node.insert(Arc::new(OnceCell::new()))),
+            Entry::Vacant(node) => Arc::clone(node.insert(Arc::new(AsyncMutex::new(None)))),
         };
-        // We perform the actual initialization without the lock held for better
-        // parallelism.
-        node.get_or_try_init(|| self.initialize_node(path))
-            .await
-            .cloned()
+        // We perform the actual initialization without the map lock held for better
+        // parallelism. The per-node lock is what makes it happen once; on error the
+        // slot stays empty so a later call retries, as get_or_try_init did.
+        let mut slot = node.lock().await;
+        if let Some(node) = slot.as_ref() {
+            return Ok(node.clone());
+        }
+        let initialized = self.initialize_node(path).await?;
+        *slot = Some(Arc::clone(&initialized));
+        Ok(initialized)
     }
 
     /// Query the states of git attributes associated to the `path`.

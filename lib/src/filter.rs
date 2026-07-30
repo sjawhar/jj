@@ -462,7 +462,7 @@ impl ProcessAsyncAdapter for StdChildAsyncAdapter {
 
         let stdin_rx = match child.stdin.take() {
             Some(mut child_stdin) => {
-                let (stdin_tx, stdin_rx) = tokio::sync::oneshot::channel::<()>();
+                let (stdin_tx, stdin_rx) = futures::channel::oneshot::channel::<()>();
                 let worker_thread_name = self
                     .worker_thread_name_prefix
                     .as_ref()
@@ -504,7 +504,7 @@ impl ProcessAsyncAdapter for StdChildAsyncAdapter {
         };
 
         let child = Arc::new(Mutex::new(Some(child)));
-        let (output_tx, output_rx) = tokio::sync::oneshot::channel();
+        let (output_tx, output_rx) = futures::channel::oneshot::channel();
         let worker_thread_name = self
             .worker_thread_name_prefix
             .as_ref()
