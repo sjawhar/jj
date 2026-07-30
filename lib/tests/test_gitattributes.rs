@@ -17,6 +17,8 @@ use jj_lib::repo_path::RepoPathComponent;
 use jj_lib::settings::UserSettings;
 use jj_lib::tree::Tree;
 use jj_lib::working_copy::WorkingCopyFreshness;
+use futures::AsyncReadExt as _;
+use jj_lib::backend::MergedTreeValueExt as _;
 use pollster::FutureExt as _;
 use test_case::test_case;
 use testutils::TestRepo;
@@ -29,7 +31,6 @@ use testutils::create_single_tree;
 use testutils::create_tree;
 use testutils::empty_snapshot_options;
 use testutils::repo_path;
-use tokio::io::AsyncReadExt as _;
 
 #[test_case(|repo, path, contents| {
     vec![create_single_tree(repo, &[(path, contents)])]
@@ -619,6 +620,7 @@ fn test_gitattr_filter_update_required_filter_failed() {
         test_workspace
             .workspace
             .start_working_copy_mutation()
+            .block_on()
             .unwrap()
             .locked_wc(),
         &commit,
@@ -636,6 +638,7 @@ fn test_gitattr_filter_update_required_filter_failed() {
         test_workspace
             .workspace
             .start_working_copy_mutation()
+            .block_on()
             .unwrap()
             .locked_wc(),
         &commit,
