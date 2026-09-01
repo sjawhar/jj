@@ -21,6 +21,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* Snapshotting with `fsmonitor.backend = "watchman"` no longer silently
+  reports a clean working copy when Watchman resolves the working copy to a
+  watch of an enclosing directory that cannot see it (e.g. a workspace inside
+  a directory listed in the enclosing root's `ignore_dirs` Watchman
+  configuration). jj now verifies visibility and creates a dedicated watch of
+  the working copy root when needed.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights
