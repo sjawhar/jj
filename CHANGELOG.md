@@ -68,6 +68,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed bugs
 
+* Snapshotting with `fsmonitor.backend = "watchman"` no longer silently
+  reports a clean working copy when Watchman resolves the working copy to a
+  watch of an enclosing directory that cannot see it (e.g. a workspace inside
+  a directory listed in the enclosing root's `ignore_dirs` Watchman
+  configuration). jj now verifies visibility and creates a dedicated watch of
+  the working copy root when needed.
+
 * Recursive alias definitions are detected more precisely. jj can now expand
   aliases that are simply repeated. For example, with the alias `jj = []`, the
   command `jj jj jj` will resolve to `jj`. Aliases can also fall back to the
