@@ -2804,6 +2804,90 @@ fn test_fsmonitor() -> TestResult {
     Ok(())
 }
 
+/// `reset()`, `recover()` and a checkout that skips a file record file states
+/// without looking at the files on disk. A filesystem monitor only reports what
+/// changed since its clock, so the clock must be cleared to make the next
+/// snapshot scan the whole working copy.
+#[test]
+fn test_fsmonitor_clock_reset_by_reset_recover_and_skipped_checkout() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let tree_state_path = state_path.join("tree_state");
+    let watchman_clock = working_copy_proto::WatchmanClock {
+        watchman_clock: Some(
+            working_copy_proto::watchman_clock::WatchmanClock::StringClock("c:1:1".to_string()),
+        ),
+    };
+    // Seeds the tree state with a clock from an earlier monitor query, runs
+    // `update` on it, and returns the clock saved afterwards.
+    let saved_clock_after = |update: &dyn Fn(&mut TreeState)| -> TestResult<_> {
+        let mut proto =
+            working_copy_proto::TreeState::decode(std::fs::read(&tree_state_path)?.as_slice())?;
+        proto.watchman_clock = Some(watchman_clock.clone());
+        std::fs::write(&tree_state_path, proto.encode_to_vec())?;
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &tree_state_settings,
+        )?;
+        update(&mut tree_state);
+        tree_state.save()?;
+        let proto =
+            working_copy_proto::TreeState::decode(std::fs::read(&tree_state_path)?.as_slice())?;
+        Ok(proto.watchman_clock)
+    };
+    let reset = |tree: &MergedTree| {
+        saved_clock_after(&|tree_state| tree_state.reset(tree).block_on().unwrap())
+    };
+    let recover = |tree: &MergedTree| {
+        saved_clock_after(&|tree_state| tree_state.recover(tree).block_on().unwrap())
+    };
+    let check_out = |tree: &MergedTree, expected_skipped_files: u32| {
+        saved_clock_after(&|tree_state| {
+            let stats = tree_state.check_out(tree).unwrap();
+            assert_eq!(stats.skipped_files, expected_skipped_files);
+        })
+    };
+
+    let file_path = repo_path("file");
+    let tree1 = create_tree(repo, &[(file_path, "1\n")]);
+    let tree2 = create_tree(repo, &[(file_path, "2\n")]);
+    let empty_tree = repo.store().empty_merged_tree();
+
+    // A reset that changes no file state keeps the clock.
+    assert_eq!(reset(&empty_tree)?, Some(watchman_clock.clone()));
+    // A reset that adds or modifies a file records a placeholder for it.
+    assert_eq!(reset(&tree1)?, None);
+    assert_eq!(reset(&tree2)?, None);
+    // A reset that removes a file drops its state, but the file may still be
+    // on disk.
+    assert_eq!(reset(&empty_tree)?, None);
+
+    // A checkout that writes every file keeps the clock.
+    assert_eq!(check_out(&tree1, 0)?, Some(watchman_clock.clone()));
+    // Recovery drops every file state, even when the new tree is empty.
+    assert_eq!(recover(&empty_tree)?, None);
+    // A checkout that skips a file records a placeholder for it.
+    let disk_path = file_path.to_fs_path_unchecked(&workspace_root);
+    std::fs::remove_file(&disk_path)?;
+    std::fs::create_dir(&disk_path)?;
+    assert_eq!(check_out(&tree2, 1)?, None);
+    Ok(())
+}
+
 #[test]
 fn track_ignored_with_flag_and_fsmonitor() -> TestResult {
     let test_repo = TestRepo::init();

@@ -21,6 +21,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* With `fsmonitor.backend = "watchman"`, local modifications were no longer
+  detected after Git HEAD moved without the working copy being rewritten
+  (for example after `git reset --soft` or `git update-ref HEAD` in a
+  colocated repository). The next snapshot after such a reset now scans the
+  whole working copy.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights

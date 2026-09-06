@@ -2594,6 +2594,12 @@ impl TreeState {
 
         self.file_states
             .merge_in(changed_file_states, &deleted_files);
+        if stats.skipped_files > 0 {
+            // Skipped files are recorded as placeholders. Make the next
+            // snapshot scan everything since the filesystem monitor may not
+            // report them as changed.
+            self.watchman_clock = None;
+        }
         Ok(stats)
     }
 
@@ -2646,6 +2652,12 @@ impl TreeState {
                 changed_file_states.push((path, file_state));
             }
         }
+        if !changed_file_states.is_empty() || !deleted_files.is_empty() {
+            // The file states were updated without looking at the files on
+            // disk. Make the next snapshot scan everything since the
+            // filesystem monitor may not report them as changed.
+            self.watchman_clock = None;
+        }
         self.file_states
             .merge_in(changed_file_states, &deleted_files);
         self.tree = new_tree.clone();
@@ -2654,6 +2666,10 @@ impl TreeState {
 
     pub async fn recover(&mut self, new_tree: &MergedTree) -> Result<(), ResetError> {
         self.file_states.clear();
+        // The file states are dropped without looking at the files on disk,
+        // even if the new tree is empty. Make the next snapshot scan
+        // everything.
+        self.watchman_clock = None;
         self.tree = self.store.empty_merged_tree();
         self.reset(new_tree).await
     }
