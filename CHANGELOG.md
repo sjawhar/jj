@@ -28,6 +28,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed bugs
 
+* With `fsmonitor.backend = "watchman"`, local modifications were no longer
+  detected after Git HEAD moved without the working copy being rewritten
+  (for example after `git reset --soft` or `git update-ref HEAD` in a
+  colocated repository). Snapshots now re-examine every file whose recorded
+  state was reset, whether or not the monitor reports it as changed.
+
+* In a repository with several colocated workspaces, a `jj` command in one
+  workspace no longer waits for a snapshot or checkout in progress in another
+  workspace. The lock that serializes Git HEAD import/export is now
+  per-workspace, matching the state it guards.
+
+* `jj workspace forget` no longer leaves a workspace without a recorded path
+  when the operation fails to commit (or the process is killed while
+  committing). Such a workspace stayed in `jj workspace list` but
+  `jj workspace root --name` failed with "Workspace has no recorded path".
+
 ## [0.45.1] - 2026-09-03
 
 This release fixes an error that prevented the new jj-core crate from being
@@ -89,6 +105,13 @@ None
 
 * [The default `immutable_heads()` set](docs/config.md#set-of-immutable-commits)
   now includes `untracked_remote_tags()`.
+
+* Snapshotting with `fsmonitor.backend = "watchman"` no longer silently
+  reports a clean working copy when Watchman resolves the working copy to a
+  watch of an enclosing directory that cannot see it (e.g. a workspace inside
+  a directory listed in the enclosing root's `ignore_dirs` Watchman
+  configuration). jj now verifies visibility and creates a dedicated watch of
+  the working copy root when needed.
 
 * `jj arrange` now scrolls the viewport to keep the selected commit visible
   when the commit stack is taller than the terminal.
@@ -690,6 +713,13 @@ None
   revisions by default (defined by `revsets.op-diff-changes-in`). A new flag,
   `--show-changes-in`, can be used to override this. [#6083](https://github.com/jj-vcs/jj/issues/6083)
 
+* Added `git.filter` settings for configuring gitattributes clean/smudge filters.
+  When `git.filter.enabled = true`, jj runs configured filter drivers during
+  snapshot (clean) and working copy update (smudge). The filter driver command
+  supports string, array, and structured `{ env, command }` forms, and
+  interpolates `$path` with the repo-relative file path. This enables Git LFS
+  and other gitattributes filter integrations in colocated repositories.
+  ([Issue #80](https://github.com/jj-vcs/jj/issues/80))
 ### Fixed bugs
 
 * `.gitignore` with UTF-8 BOM can now be parsed correctly.

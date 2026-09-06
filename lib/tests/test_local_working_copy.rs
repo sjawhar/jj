@@ -64,7 +64,6 @@ use jj_lib::secret_backend::SecretBackend;
 use jj_lib::tree_builder::TreeBuilder;
 use jj_lib::tree_merge::MergeOptions;
 use jj_lib::working_copy::CheckoutError;
-use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy as _;
@@ -420,7 +419,10 @@ fn test_checkout_no_op() -> TestResult {
     // Update to commit2 (same tree as commit1)
     let new_op_id = OperationId::from_bytes(b"whatever");
     let stats = ws.check_out(new_op_id.clone(), None, &commit2).block_on()?;
-    assert_eq!(stats, CheckoutStats::default());
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 0);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
 
     // The tree state is unchanged but the recorded operation id is updated.
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
@@ -678,15 +680,10 @@ fn test_conflicting_changes_on_disk() -> TestResult {
     let stats = ws
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 0,
-            added_files: 3,
-            removed_files: 0,
-            skipped_files: 3
-        }
-    );
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 3);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 3);
 
     assert_eq!(
         std::fs::read_to_string(file_file_path.to_fs_path_unchecked(&workspace_root)).ok(),
@@ -902,15 +899,10 @@ fn test_materialize_snapshot_conflicted_files() -> TestResult {
     let stats = ws
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 0,
-            added_files: 2,
-            removed_files: 0,
-            skipped_files: 0
-        }
-    );
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 2);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
 
     // Even though the tree-level conflict is a 3-sided conflict, each file is
     // materialized as a 2-sided conflict.
@@ -1076,13 +1068,10 @@ fn test_materialize_snapshot_unchanged_conflicts() -> TestResult {
         .workspace
         .check_out(repo.op_id().clone(), None, &commit_with_labels)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 1,
-            ..CheckoutStats::default()
-        }
-    );
+    assert_eq!(stats.updated_files, 1);
+    assert_eq!(stats.added_files, 0);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
     let materialized_content = std::fs::read_to_string(&disk_path)?;
     insta::assert_snapshot!(materialized_content, @r"
     line 1
@@ -2801,6 +2790,73 @@ fn test_fsmonitor() -> TestResult {
         file "path/to/nested" (6209060941cd770c8d46): "nested\n"
     "#);
     tree_state.save()?;
+    Ok(())
+}
+
+/// A file state left as a placeholder by `reset()` (as importing a moved Git
+/// HEAD does, without touching the working copy) must be re-examined by the
+/// next snapshot even when the filesystem monitor reports no change for it.
+#[test]
+fn test_fsmonitor_reexamines_reset_file_states() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let file_path = repo_path("file");
+    testutils::write_working_copy_file(&workspace_root, file_path, "modified\n");
+
+    let snapshot = |paths: &[&RepoPath]| {
+        let changed_files = paths
+            .iter()
+            .map(|p| p.to_fs_path_unchecked(Path::new("")))
+            .collect();
+        let settings = TreeStateSettings {
+            fsmonitor_settings: FsmonitorSettings::Test { changed_files },
+            ..tree_state_settings.clone()
+        };
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &settings,
+        )
+        .unwrap();
+        let (is_dirty, _) = tree_state
+            .snapshot(&empty_snapshot_options())
+            .block_on()
+            .unwrap();
+        (is_dirty, tree_state)
+    };
+
+    // The monitor reports the file, so the snapshot records its contents.
+    let (_, mut tree_state) = snapshot(&[file_path]);
+    let tree_with_modification = tree_state.current_tree().clone();
+    assert_tree_eq!(
+        tree_with_modification,
+        create_tree(repo, &[(file_path, "modified\n")])
+    );
+
+    // Reset to a tree with other contents for the file without touching the
+    // working copy, leaving a placeholder file state behind.
+    let committed_tree = create_tree(repo, &[(file_path, "committed\n")]);
+    tree_state.reset(&committed_tree).block_on()?;
+    tree_state.save()?;
+
+    // The monitor has seen no change since its clock, but the reset file
+    // must be stat'ed again, which finds the modification.
+    let (is_dirty, tree_state) = snapshot(&[]);
+    assert!(is_dirty);
+    assert_tree_eq!(*tree_state.current_tree(), tree_with_modification);
     Ok(())
 }
 

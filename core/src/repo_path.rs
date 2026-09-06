@@ -83,6 +83,9 @@ impl RepoPathComponent {
     #[ref_cast_custom]
     const fn new_unchecked(value: &str) -> &Self;
 
+    /// The `.gitattributes` file name.
+    pub const DOT_GITATTRIBUTES: &Self = Self::new_unchecked(".gitattributes");
+
     /// Returns the underlying string representation.
     pub fn as_internal_str(&self) -> &str {
         &self.value
