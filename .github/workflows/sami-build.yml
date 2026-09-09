@@ -58,6 +58,10 @@ jobs:
 
       - name: Install packages
         run: |
+          # The runner image ships a Google Chrome apt source that nothing here
+          # installs from; its mirror intermittently serves a Hash Sum mismatch
+          # that fails `apt-get update` outright (2026-09-09, both Linux jobs).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
