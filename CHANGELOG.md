@@ -21,6 +21,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* `jj workspace forget` and `jj workspace remove` no longer run `git worktree
+  prune` on the whole repository, which could unregister another workspace's
+  Git worktree if its directory was unreadable at that moment. Only that
+  workspace's own worktree is removed.
+
+* `jj workspace forget` no longer deletes a workspace's `.git` file when it is
+  not a linked Git worktree of the repository, such as in the default workspace
+  of a repository created with `git init --separate-git-dir`.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights

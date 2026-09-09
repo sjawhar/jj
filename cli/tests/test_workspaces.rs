@@ -2535,6 +2535,91 @@ fn test_workspaces_add_forget_colocated() {
     assert_eq!(local_branches(&main_repo), [] as [String; 0]);
 }
 
+/// A `.git` file that is not a linked worktree of the repository, such as the
+/// default workspace's in a repository created with `--separate-git-dir`, is
+/// not ours to disconnect: forgetting the workspace leaves it in place and
+/// only warns.
+#[test]
+fn test_workspaces_forget_colocated_keeps_separate_git_dir_gitlink() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    let output = std::process::Command::new("git")
+        .args(["init", "--quiet", "--separate-git-dir", "repo.git", "main"])
+        .current_dir(test_env.env_root())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let main_dir = test_env.work_dir("main");
+    main_dir.run_jj(["git", "init", "--colocate"]).success();
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    assert!(main_dir.root().join(".git").is_file());
+
+    let secondary_dir = test_env.work_dir("secondary");
+    let output = secondary_dir.run_jj(["workspace", "forget", "default"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove Git worktree for "$TEST_ENV/main".
+    Caused by: $TEST_ENV/main is not a linked worktree of this repository
+    [EOF]
+    "#);
+    assert!(main_dir.root().join(".git").is_file());
+    let main_repo = git::open(main_dir.root());
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+}
+
+/// Forgetting one workspace must not disconnect another whose directory is
+/// momentarily unreadable. `git worktree prune` would: it drops the metadata
+/// of every worktree it cannot stat, and that worktree then silently loses
+/// its colocation while jj keeps using it.
+#[cfg(unix)]
+#[test]
+fn test_workspaces_forget_colocated_leaves_unreadable_sibling_registered() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    std::fs::create_dir(test_env.env_root().join("blocked")).unwrap();
+    main_dir
+        .run_jj(["workspace", "add", "../blocked/sibling"])
+        .success();
+    let main_repo = git::open(test_env.env_root().join("main"));
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary", "sibling"]);
+
+    // Git cannot stat `blocked/sibling` while `blocked` is unreadable, which
+    // is exactly when `git worktree prune` would discard it.
+    let blocked = test_env.env_root().join("blocked");
+    let readable = std::fs::metadata(&blocked).unwrap().permissions();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = main_dir.run_jj(["workspace", "forget", "secondary"]);
+    std::fs::set_permissions(&blocked, readable).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Removed Git worktree for "$TEST_ENV/secondary".
+    [EOF]
+    "#);
+
+    assert_eq!(git_worktree_ids(&main_repo), ["sibling"]);
+    let sibling_repo = git::open(test_env.env_root().join("blocked/sibling"));
+    assert!(
+        sibling_repo.head_id().is_ok(),
+        "sibling worktree still resolves HEAD"
+    );
+}
+
 #[test]
 fn test_workspaces_add_colocated_at_revision() {
     let test_env = TestEnvironment::default();
