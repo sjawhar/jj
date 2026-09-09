@@ -1945,6 +1945,17 @@ impl GitResetHeadError {
 
 /// Sets Git HEAD to the parent of the given working-copy commit and resets
 /// the Git index.
+///
+/// The HEAD ref is written last, after the fallible index reset. Writing the
+/// ref is an immediate on-disk side effect that the caller's transaction
+/// cannot roll back, whereas `mut_repo` is only updated in memory: if a later
+/// step failed, the command would abort with the view still naming the old
+/// HEAD and the worktree already moved to the new one. The next command in
+/// that workspace sees the mismatch and imports the new HEAD, which checks out
+/// a fresh working-copy commit and leaves the previous one — with its
+/// description and any bookmarks — behind. Ordering the ref write last makes
+/// the only surviving failure mode a stale index, which `git status` shows and
+/// the next `reset_head` repairs.
 pub async fn reset_head(
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
@@ -1962,10 +1973,13 @@ pub async fn reset_head(
     } else {
         RefTarget::absent()
     };
-
-    // If the first parent of the working copy has changed, reset the Git HEAD.
     let old_head_target = mut_repo.git_head(workspace_name);
-    if *old_head_target != new_head_target {
+    // Resolved here, while the old target is still borrowed from the view, and
+    // applied after the index reset. The Git import/export lock is held across
+    // the whole function, so no other jj process moves HEAD in between.
+    let head_move = if *old_head_target == new_head_target {
+        None
+    } else {
         let expected_ref = if let Some(id) = old_head_target.as_normal() {
             // We have to check the actual HEAD state because we don't record a
             // symbolic ref as such.
@@ -1983,10 +1997,8 @@ pub async fn reset_head(
             gix::refs::transaction::PreviousValue::MustExist
         };
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
-        update_git_head(&git_repo, expected_ref, new_oid)
-            .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
-        mut_repo.set_git_head_target(workspace_name, new_head_target);
-    }
+        Some((expected_ref, new_oid))
+    };
 
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
     // up.
@@ -1994,7 +2006,14 @@ pub async fn reset_head(
         clear_operation_state(&git_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, &git_repo, wc_commit).await?;
+
+    if let Some((expected_ref, new_oid)) = head_move {
+        update_git_head(&git_repo, expected_ref, new_oid)
+            .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
+        mut_repo.set_git_head_target(workspace_name, new_head_target);
+    }
+    Ok(())
 }
 
 // TODO: Polish and upstream this to `gix`.
