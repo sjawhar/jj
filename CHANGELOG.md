@@ -21,6 +21,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* `jj workspace forget`, `jj workspace remove` and `jj git colocation disable`
+  now fail when a workspace's Git worktree could not be disconnected (for
+  example because its directory is read-only), instead of printing a warning
+  and continuing with the worktree still registered in Git. The workspace is
+  still forgotten by `jj workspace forget` and `jj workspace remove`, and the
+  latter still deletes every workspace directory it can. The error explains
+  how to disconnect the leftover worktree without deleting the workspace's
+  files.
+
 * `jj workspace forget` and `jj workspace remove` no longer run `git worktree
   prune` on the whole repository, which could unregister another workspace's
   Git worktree if its directory was unreadable at that moment. Only that

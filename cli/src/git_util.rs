@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::iter;
 use std::mem;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -57,6 +58,7 @@ use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::print_error_sources;
 use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
 use crate::formatter::Formatter;
 use crate::formatter::FormatterExt as _;
 use crate::revset_util::parse_remote_auto_track_bookmarks_map;
@@ -565,29 +567,91 @@ pub fn print_push_stats(ui: &Ui, stats: &GitPushStats) -> io::Result<()> {
 
 /// Disconnects the Git worktree backing a jj workspace, if there is one.
 ///
-/// The workspace has already been forgotten by the time this runs, and a
-/// leftover gitlink or stale worktree metadata isn't worth failing the command
-/// over, so errors are reported as warnings.
+/// A worktree that could not be disconnected is an error: Git keeps it
+/// registered, and the caller must not report a clean disconnect. The hint
+/// explains how to finish disconnecting it without deleting the workspace's
+/// files, which `git worktree remove` would do. A `.git` file that is not a
+/// linked worktree of this repository is left alone with a warning: Git has
+/// nothing registered for it.
 pub fn unlink_git_worktree(
     ui: &Ui,
     store: &Arc<Store>,
     worktree_path: &Path,
 ) -> Result<(), CommandError> {
     match git::unlink_worktree(store, worktree_path) {
-        Ok(false) => {}
-        Ok(true) => writeln!(
-            ui.status(),
-            r#"Removed Git worktree for "{}"."#,
-            worktree_path.display()
-        )?,
-        Err(err) => {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            writeln!(
+                ui.status(),
+                r#"Removed Git worktree for "{}"."#,
+                worktree_path.display()
+            )?;
+            Ok(())
+        }
+        Err(err @ git::GitUnlinkWorktreeError::NotALinkedWorktree(_)) => {
             writeln!(
                 ui.warning_default(),
                 r#"Failed to remove Git worktree for "{}"."#,
                 worktree_path.display()
             )?;
             print_error_sources(ui, Some(&err))?;
+            Ok(())
         }
+        Err(err) => {
+            let hint = match &err {
+                git::GitUnlinkWorktreeError::ReadGitLink(_)
+                | git::GitUnlinkWorktreeError::RemoveGitLink(_)
+                | git::GitUnlinkWorktreeError::Git(_) => Some(format!(
+                    "Git still has this worktree registered. Delete \"{}\" and run `git worktree \
+                     prune` to disconnect it.",
+                    worktree_path.join(".git").display()
+                )),
+                git::GitUnlinkWorktreeError::RemoveMetadata(_) => Some(
+                    "The gitlink has been removed. Run `git worktree prune` to drop the stale \
+                     worktree metadata."
+                        .to_owned(),
+                ),
+                git::GitUnlinkWorktreeError::NotALinkedWorktree(_)
+                | git::GitUnlinkWorktreeError::UnexpectedBackend(_) => None,
+            };
+            let err = user_error_with_message(
+                format!(
+                    r#"Failed to remove Git worktree for "{}""#,
+                    worktree_path.display()
+                ),
+                err,
+            );
+            Err(match hint {
+                Some(hint) => err.hinted(hint),
+                None => err,
+            })
+        }
+    }
+}
+
+/// Disconnects the Git worktrees backing several jj workspaces.
+///
+/// Every worktree is attempted before failing on any of them, so one
+/// unreadable directory does not leave the others linked as well. Every
+/// failure is reported; the first one is returned.
+pub fn unlink_git_worktrees(
+    ui: &Ui,
+    store: &Arc<Store>,
+    worktree_paths: &[PathBuf],
+) -> Result<(), CommandError> {
+    let mut first_error = None;
+    for path in worktree_paths {
+        if let Err(err) = unlink_git_worktree(ui, store, path) {
+            if first_error.is_some() {
+                writeln!(ui.warning_default(), "{}", err.error)?;
+                print_error_sources(ui, err.error.source())?;
+            } else {
+                first_error = Some(err);
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
     Ok(())
 }

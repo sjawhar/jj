@@ -1811,6 +1811,57 @@ fn test_workspaces_remove_colocated() {
     assert_eq!(git_worktree_ids(&main_repo), [] as [String; 0]);
 }
 
+/// When the Git worktree cannot be disconnected, `workspace remove` must fail
+/// (the workspace itself is still removed from jj) instead of printing a
+/// warning and exiting 0 with the worktree left registered.
+#[test]
+#[cfg(unix)]
+fn test_workspaces_remove_colocated_fails_when_worktree_stays_linked() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let main_repo = git::open(main_dir.root());
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+
+    // The gitlink cannot be removed, and neither can the directory: it is
+    // read-only.
+    let secondary = test_env.env_root().join("secondary");
+    let writable = std::fs::metadata(&secondary).unwrap().permissions();
+    std::fs::set_permissions(&secondary, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = main_dir.run_jj(["workspace", "remove", "secondary"]);
+    std::fs::set_permissions(&secondary, writable).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove workspace directory "$TEST_ENV/secondary".
+    Caused by: Permission denied (os error 13)
+    Error: Failed to remove Git worktree for "$TEST_ENV/secondary"
+    Caused by:
+    1: Failed to remove .git gitlink file
+    2: Cannot access $TEST_ENV/secondary/.git
+    3: Permission denied (os error 13)
+    Hint: Git still has this worktree registered. Delete "$TEST_ENV/secondary/.git" and run `git worktree prune` to disconnect it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    // The workspace is gone from jj, the worktree is still registered in Git.
+    let output = main_dir.run_jj(["workspace", "list"]);
+    insta::assert_snapshot!(output, @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    [EOF]
+    ");
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+}
+
 #[test]
 fn test_workspaces_remove_requires_writable_working_copy() {
     let test_env = TestEnvironment::default();
@@ -2618,6 +2669,145 @@ fn test_workspaces_forget_colocated_leaves_unreadable_sibling_registered() {
         sibling_repo.head_id().is_ok(),
         "sibling worktree still resolves HEAD"
     );
+}
+
+/// When the Git worktree cannot be disconnected, `workspace forget` must fail
+/// (the workspace itself is still forgotten) instead of printing a warning and
+/// exiting 0 with the worktree left registered.
+#[test]
+#[cfg(unix)]
+fn test_workspaces_forget_colocated_fails_when_worktree_stays_linked() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let main_repo = git::open(main_dir.root());
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+
+    // The gitlink cannot be removed: its directory is read-only.
+    let secondary = test_env.env_root().join("secondary");
+    let writable = std::fs::metadata(&secondary).unwrap().permissions();
+    std::fs::set_permissions(&secondary, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = main_dir.run_jj(["workspace", "forget", "secondary"]);
+    std::fs::set_permissions(&secondary, writable.clone()).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Error: Failed to remove Git worktree for "$TEST_ENV/secondary"
+    Caused by:
+    1: Failed to remove .git gitlink file
+    2: Cannot access $TEST_ENV/secondary/.git
+    3: Permission denied (os error 13)
+    Hint: Git still has this worktree registered. Delete "$TEST_ENV/secondary/.git" and run `git worktree prune` to disconnect it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    // The workspace is gone from jj, the worktree is still registered in Git.
+    let output = main_dir.run_jj(["workspace", "list"]);
+    insta::assert_snapshot!(output, @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    [EOF]
+    ");
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+
+    // A worktree directory that cannot even be inspected is an error too, not
+    // a silent "nothing to do".
+    main_dir
+        .run_jj(["workspace", "add", "../tertiary"])
+        .success();
+    let tertiary = test_env.env_root().join("tertiary");
+    std::fs::set_permissions(&tertiary, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = main_dir.run_jj(["workspace", "forget", "tertiary"]);
+    std::fs::set_permissions(&tertiary, writable.clone()).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Error: Failed to remove Git worktree for "$TEST_ENV/tertiary"
+    Caused by:
+    1: Failed to read .git gitlink file
+    2: Cannot access $TEST_ENV/tertiary/.git
+    3: Permission denied (os error 13)
+    Hint: Git still has this worktree registered. Delete "$TEST_ENV/tertiary/.git" and run `git worktree prune` to disconnect it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary", "tertiary"]);
+
+    // The hinted recipe disconnects the leftover worktree and keeps the
+    // workspace's files, unlike `git worktree remove`.
+    std::fs::remove_file(secondary.join(".git")).unwrap();
+    std::fs::remove_file(tertiary.join(".git")).unwrap();
+    let output = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(git_worktree_ids(&main_repo).is_empty());
+    assert!(secondary.join("file").exists());
+    assert!(tertiary.join("file").exists());
+
+    // Forgetting several workspaces reports every worktree that could not be
+    // disconnected, not just the first.
+    for name in ["fourth", "fifth"] {
+        main_dir
+            .run_jj(["workspace", "add", &format!("../{name}")])
+            .success();
+        let dir = test_env.env_root().join(name);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let output = main_dir.run_jj(["workspace", "forget", "fourth", "fifth"]);
+    for name in ["fourth", "fifth"] {
+        let dir = test_env.env_root().join(name);
+        std::fs::set_permissions(&dir, writable.clone()).unwrap();
+    }
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove Git worktree for "$TEST_ENV/fifth"
+    Caused by:
+    1: Failed to remove .git gitlink file
+    2: Cannot access $TEST_ENV/fifth/.git
+    3: Permission denied (os error 13)
+    Error: Failed to remove Git worktree for "$TEST_ENV/fourth"
+    Caused by:
+    1: Failed to remove .git gitlink file
+    2: Cannot access $TEST_ENV/fourth/.git
+    3: Permission denied (os error 13)
+    Hint: Git still has this worktree registered. Delete "$TEST_ENV/fourth/.git" and run `git worktree prune` to disconnect it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    assert_eq!(git_worktree_ids(&main_repo), ["fifth", "fourth"]);
+
+    // A workspace whose parent directory is unreadable cannot even have its
+    // path resolved; that must not read as "no worktree" either.
+    std::fs::create_dir(test_env.env_root().join("blocked")).unwrap();
+    main_dir
+        .run_jj(["workspace", "add", "../blocked/sixth"])
+        .success();
+    let blocked = test_env.env_root().join("blocked");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = main_dir.run_jj(["workspace", "forget", "sixth"]);
+    std::fs::set_permissions(&blocked, writable).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Error: Failed to remove Git worktree for "$TEST_ENV/blocked/sixth"
+    Caused by:
+    1: Failed to read .git gitlink file
+    2: Cannot access $TEST_ENV/blocked/sixth/.git
+    3: Permission denied (os error 13)
+    Hint: Git still has this worktree registered. Delete "$TEST_ENV/blocked/sixth/.git" and run `git worktree prune` to disconnect it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    assert_eq!(git_worktree_ids(&main_repo), ["fifth", "fourth", "sixth"]);
 }
 
 #[test]
