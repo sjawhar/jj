@@ -28,6 +28,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed bugs
 
+* In a colocated repository, a `jj` command no longer replaces the working-copy
+  commit when the view's recorded Git HEAD was lost but on-disk HEAD still
+  points at the working-copy commit's parent (as happens when an operation was
+  written by a tool embedding a jj-lib too old to know per-workspace Git
+  HEADs). The target is re-recorded without a checkout.
+
+* Reconciling concurrent operations no longer deletes a workspace's recorded
+  Git HEAD when one operation's view merely lacks the entry (as when written by
+  a tool embedding a jj-lib too old to know per-workspace Git HEADs) while the
+  workspace itself survives. A genuine `jj workspace forget` still removes it.
+
 * With `fsmonitor.backend = "watchman"`, local modifications were no longer
   detected after Git HEAD moved without the working copy being rewritten
   (for example after `git reset --soft` or `git update-ref HEAD` in a
