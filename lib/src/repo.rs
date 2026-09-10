@@ -2032,12 +2032,49 @@ impl MutableRepo {
             self.merge_remote_tag(symbol, base_ref, other_ref).await?;
         }
 
+        // A view written by a client too old to know per-workspace Git HEADs
+        // (the field predates jj-lib 0.45.0) drops every `git_heads` entry
+        // while its workspaces survive. Treat such an absence as no
+        // information rather than as a deletion: a genuine workspace removal
+        // also removes the workspace's working-copy commit
+        // (`View::remove_workspace`). The cost is that a concurrent
+        // transition to an unborn HEAD in a surviving workspace is not
+        // propagated; the next import in that workspace re-records it.
         let changed_git_heads = diff_named_ref_targets(base.all_git_heads(), other.all_git_heads());
         for (workspace, (base_target, other_target)) in changed_git_heads {
+            if base_target.is_present()
+                && other_target.is_absent()
+                && other.get_wc_commit_id(workspace).is_some()
+            {
+                // `other` lost the entry, not the workspace: it contributes no
+                // change. If `self` lost it the same way, the base still knows
+                // the target.
+                let self_target = self.view().git_head(workspace);
+                if self_target.is_absent() && self.view().get_wc_commit_id(workspace).is_some() {
+                    self.set_git_head_target(workspace, base_target.clone());
+                }
+                continue;
+            }
             let self_target = self.view().git_head(workspace);
             let new_target =
                 merge_ref_targets(self.index(), self_target, base_target, other_target).await?;
             self.set_git_head_target(workspace, new_target);
+        }
+        // The mirrored ordering: `self` is the view that lost its entries, and
+        // for a workspace where `base` and `other` agree the loop above never
+        // runs.
+        let restored: Vec<_> = other
+            .all_git_heads()
+            .iter()
+            .filter(|&(workspace, other_target)| {
+                base.git_head(workspace) == other_target
+                    && self.view().git_head(workspace).is_absent()
+                    && self.view().get_wc_commit_id(workspace).is_some()
+            })
+            .map(|(workspace, target)| (workspace.clone(), target.clone()))
+            .collect();
+        for (workspace, target) in restored {
+            self.set_git_head_target(&workspace, target);
         }
 
         Ok(())
