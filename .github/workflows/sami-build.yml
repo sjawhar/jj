@@ -58,10 +58,6 @@ jobs:
 
       - name: Install packages
         run: |
-          # The runner image ships a Google Chrome apt source that nothing here
-          # installs from; its mirror intermittently serves a Hash Sum mismatch
-          # that fails `apt-get update` outright (2026-09-09, both Linux jobs).
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
@@ -161,11 +157,21 @@ jobs:
           path: ${{ steps.package.outputs.asset }}
 
   build-windows:
-    name: Build win-x86_64
+    name: Build ${{ matrix.build }}
     if: github.repository == 'sjawhar/jj'
     needs: version
-    runs-on: windows-2022
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: win-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - build: win-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
@@ -180,19 +186,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          target: x86_64-pc-windows-msvc
+          target: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --target x86_64-pc-windows-msvc --release -p jj-cli
+        run: cargo build --target ${{ matrix.target }} --release -p jj-cli
 
       - name: Package binary
         id: package
         shell: bash
         run: |
           tag="${{ needs.version.outputs.tag }}"
-          staging="jj-${tag}-x86_64-pc-windows-msvc"
+          staging="jj-${tag}-${{ matrix.target }}"
           mkdir "$staging"
-          cp "target/x86_64-pc-windows-msvc/release/jj.exe" "$staging/"
+          cp "target/${{ matrix.target }}/release/jj.exe" "$staging/"
           cd "$staging"
           7z a "../$staging.zip" .
           echo "asset=${staging}.zip" >> "$GITHUB_OUTPUT"
@@ -200,7 +206,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jj-x86_64-pc-windows-msvc
+          name: jj-${{ matrix.target }}
           path: ${{ steps.package.outputs.asset }}
 
   release:
