@@ -307,6 +307,15 @@ impl GitSubprocessContext {
     /// insists on naming a branch (it rejects `--detach` and `--no-checkout`),
     /// but leaves that branch unborn, so the caller can move HEAD off it
     /// before anyone sees the worktree.
+    ///
+    /// The worktree is created locked: jj owns its whole lifecycle (this is
+    /// the only place a linked worktree is created, and
+    /// [`unlink_worktree()`](super::git::unlink_worktree) is the only place
+    /// one is removed), so nothing else — least of all a bare
+    /// `git worktree prune` run from a sibling checkout of the same
+    /// repository — should ever unregister it. The lock's reason names jj as
+    /// the owner and how the worktree actually gets removed, for anyone who
+    /// runs `git worktree list` and wonders why it is locked.
     pub(crate) fn spawn_worktree_add(
         &self,
         destination: &Path,
@@ -318,7 +327,17 @@ impl GitSubprocessContext {
         // repositories. Silently ignored by git versions that don't support
         // it.
         command.args(["-c", "worktree.useRelativePaths=true"]);
-        command.args(["worktree", "add", "--orphan", "-b", branch_name, "--"]);
+        command.args([
+            "worktree",
+            "add",
+            "--orphan",
+            "-b",
+            branch_name,
+            "--lock",
+            "--reason",
+            "jj workspace; removed by jj workspace forget",
+            "--",
+        ]);
         command.arg(destination);
 
         let output = wait_with_output(self.spawn_cmd(command)?)?;

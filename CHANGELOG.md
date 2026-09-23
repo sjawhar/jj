@@ -28,6 +28,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed bugs
 
+* The Git worktree `jj workspace add` creates for a new colocated workspace
+  is now created locked, naming jj as the owner. A `git worktree prune` run
+  elsewhere -- from a sibling checkout of the same repository, or by another
+  tool -- no longer unregisters a live jj workspace's Git worktree just
+  because its directory was momentarily inaccessible or missing.
+  `jj workspace forget` still removes the locked registration.
+
 ## [0.45.1] - 2026-09-03
 
 This release fixes an error that prevented the new jj-core crate from being

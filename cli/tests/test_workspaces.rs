@@ -2276,6 +2276,82 @@ fn test_workspaces_forget_colocated_leaves_unreadable_sibling_registered() {
     );
 }
 
+/// A worktree jj creates for a workspace must survive a bare
+/// `git worktree prune` run against the repository -- the same command that
+/// silently drops any other worktree whose directory momentarily can't be
+/// seen (e.g. from another checkout of the same repository that cannot see
+/// this one's directory). `git worktree add --lock` at creation is what
+/// protects it: nothing but `jj workspace forget` may remove the
+/// registration.
+#[test]
+fn test_workspaces_add_colocated_worktree_survives_bare_prune() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let main_repo = git::open(test_env.env_root().join("main"));
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+
+    // Delete the worktree's directory entirely -- exactly what an
+    // *unlocked* worktree would leave prunable.
+    std::fs::remove_dir_all(test_env.env_root().join("secondary")).unwrap();
+    let prune_status = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(test_env.env_root().join("main"))
+        .status()
+        .unwrap();
+    assert!(prune_status.success());
+
+    // The registration survives: jj locked it, so `prune` skipped it.
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+}
+
+/// `jj workspace forget` must still remove the Git worktree registration it
+/// created locked (see
+/// `test_workspaces_add_colocated_worktree_survives_bare_prune`). Forgetting
+/// targets exactly the one worktree's metadata directory rather than
+/// pruning, so the lock -- meant to stop everything else -- does not stop
+/// jj's own cleanup.
+#[test]
+fn test_workspaces_forget_colocated_removes_locked_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let main_repo = git::open(test_env.env_root().join("main"));
+    assert_eq!(git_worktree_ids(&main_repo), ["secondary"]);
+    let lock_file = test_env
+        .env_root()
+        .join("main/.git/worktrees/secondary/locked");
+    assert!(
+        lock_file.is_file(),
+        "workspace add locks the Git worktree it creates"
+    );
+
+    main_dir
+        .run_jj(["workspace", "forget", "secondary"])
+        .success();
+
+    assert_eq!(git_worktree_ids(&main_repo), [] as [String; 0]);
+    assert!(!lock_file.parent().unwrap().exists());
+}
+
 #[test]
 fn test_workspaces_add_colocated_at_revision() {
     let test_env = TestEnvironment::default();

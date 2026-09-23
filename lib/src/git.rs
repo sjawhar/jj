@@ -1845,6 +1845,14 @@ impl GitCreateWorktreeError {
 /// HEAD at the parent of the new working-copy commit. Git is only responsible
 /// for the `.git` gitlink and the worktree bookkeeping under
 /// `.git/worktrees/`.
+///
+/// The worktree is created locked (`git worktree add --lock`): jj is the
+/// only thing that creates or removes these worktrees, so a lock keeps
+/// anything else — in particular a bare `git worktree prune` run from a
+/// colocated checkout elsewhere on disk — from unregistering one out from
+/// under a live jj workspace. [`unlink_worktree()`] removes the lock along
+/// with the rest of the worktree's bookkeeping when jj itself is done with
+/// it.
 pub fn create_worktree(
     store: &Store,
     subprocess_options: GitSubprocessOptions,
