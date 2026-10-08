@@ -677,6 +677,45 @@ fn test_git_colocation_disable_child_workspace_fails_when_not_a_linked_worktree(
     ");
 }
 
+/// A child workspace whose `.git` is a symlink to its gitlink file is really
+/// converted: the symlink is followed, as Git follows it, instead of being
+/// read as "no worktree" while the workspace stays colocated.
+#[test]
+#[cfg(unix)]
+fn test_git_colocation_disable_child_workspace_follows_symlinked_gitlink() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let secondary_dir = test_env.work_dir("secondary");
+    let secondary = test_env.env_root().join("secondary");
+    let gitlink = test_env.env_root().join("secondary.gitlink");
+    std::fs::rename(secondary.join(".git"), &gitlink).unwrap();
+    std::os::unix::fs::symlink(&gitlink, secondary.join(".git")).unwrap();
+
+    let output = secondary_dir.run_jj(["git", "colocation", "disable"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Removed Git worktree for "$TEST_ENV/secondary".
+    Workspace successfully converted into a non-colocated Jujutsu/Git workspace.
+    [EOF]
+    "#);
+    assert!(secondary.join(".git").symlink_metadata().is_err());
+    let output = secondary_dir.run_jj(["git", "colocation", "status", "--quiet"]);
+    insta::assert_snapshot!(output, @"
+    Workspace 'secondary' is currently not colocated with Git.
+    Last imported/exported Git HEAD: (none)
+    [EOF]
+    ");
+}
+
 #[test]
 fn test_git_colocation_enable_child_workspace_with_existing_git_dir() -> TestResult {
     let test_env = TestEnvironment::default();

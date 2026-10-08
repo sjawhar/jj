@@ -645,8 +645,7 @@ fn unlink_git_worktree_error(
 ) -> CommandError {
     let hint = match &err {
         git::GitUnlinkWorktreeError::ReadGitLink(_)
-        | git::GitUnlinkWorktreeError::RemoveGitLink(_)
-        | git::GitUnlinkWorktreeError::Git(_) => Some(format!(
+        | git::GitUnlinkWorktreeError::RemoveGitLink(_) => Some(format!(
             "Git still has this worktree registered. Delete \"{}\" and run `git worktree prune` \
              to disconnect it.",
             worktree_path.join(".git").display()
@@ -657,6 +656,7 @@ fn unlink_git_worktree_error(
                 .to_owned(),
         ),
         git::GitUnlinkWorktreeError::NotALinkedWorktree(_)
+        | git::GitUnlinkWorktreeError::Git(_)
         | git::GitUnlinkWorktreeError::UnexpectedBackend(_) => None,
     };
     let err = user_error_with_message(

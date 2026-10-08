@@ -47,6 +47,7 @@ use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
 use crate::file_util::is_empty_dir;
 use crate::git_backend::GitBackend;
+use crate::git_backend::GitRepoAtWorkdirError;
 use crate::git_subprocess::GitFetchStatus;
 pub use crate::git_subprocess::GitProgress;
 pub use crate::git_subprocess::GitSidebandLineTerminator;
@@ -1967,7 +1968,9 @@ pub enum GitUnlinkWorktreeError {
 /// cases, so callers must surface the failure rather than report a clean
 /// disconnect. The exception is [`GitUnlinkWorktreeError::NotALinkedWorktree`]:
 /// the `.git` file names something other than a linked worktree of this
-/// repository, and it is left alone.
+/// repository, and it is left alone. A gitlink whose Git directory no longer
+/// exists has nothing registered either; it is removed and counts as
+/// disconnected.
 pub fn unlink_worktree(
     store: &Store,
     worktree_path: &Path,
@@ -1975,8 +1978,8 @@ pub fn unlink_worktree(
     let dot_git = worktree_path.join(".git");
     // A missing gitlink means there is no Git worktree to disconnect; any other
     // failure to look at it (unreadable directory) must surface, not read as
-    // "nothing to do".
-    match std::fs::symlink_metadata(&dot_git) {
+    // "nothing to do". A symlinked gitlink is followed, as Git does.
+    match std::fs::metadata(&dot_git) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => return Ok(false),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1988,9 +1991,27 @@ pub fn unlink_worktree(
         }
     }
     let git_backend = get_git_backend(store)?;
-    let worktree_repo = git_backend
-        .open_git_repo_at_workdir(worktree_path)
-        .map_err(|err| GitUnlinkWorktreeError::Git(err.into()))?;
+    let worktree_repo = match git_backend.open_git_repo_at_workdir(worktree_path) {
+        Ok(repo) => repo,
+        // The gitlink names a Git directory that no longer exists, as a
+        // repository-wide `git worktree prune` or `git gc` leaves behind. Git
+        // has nothing registered for it; only the dangling gitlink is left.
+        Err(GitRepoAtWorkdirError::NotFound { .. }) => {
+            std::fs::remove_file(&dot_git)
+                .context(&dot_git)
+                .map_err(GitUnlinkWorktreeError::RemoveGitLink)?;
+            return Ok(true);
+        }
+        // The gitlink belongs to another repository: not ours to disconnect.
+        Err(GitRepoAtWorkdirError::Unrelated { .. }) => {
+            return Err(GitUnlinkWorktreeError::NotALinkedWorktree(
+                worktree_path.to_owned(),
+            ));
+        }
+        Err(err @ GitRepoAtWorkdirError::Other(_)) => {
+            return Err(GitUnlinkWorktreeError::Git(err.into()));
+        }
+    };
     // For a linked worktree, gix's `git_dir()` is the admin directory the
     // gitlink names, `<common_dir>/worktrees/<name>`. Anything else — the main
     // worktree, a submodule's gitlink — is not ours to disconnect. gix reports
