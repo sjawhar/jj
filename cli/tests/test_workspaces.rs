@@ -2784,6 +2784,134 @@ fn test_workspaces_forget_colocated_follows_symlinked_gitlink() {
     assert!(secondary.join(".git").symlink_metadata().is_err());
 }
 
+/// A workspace whose `.git` was copied from another workspace's names that
+/// workspace's record under `.git/worktrees/`. `workspace forget` leaves it
+/// alone with a warning: removing the record it names would disconnect the
+/// other workspace.
+#[test]
+fn test_workspaces_forget_colocated_keeps_worktree_of_copied_gitlink() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let main_repo = git::open(main_dir.root());
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    for name in ["copy", "sibling"] {
+        main_dir
+            .run_jj(["workspace", "add", &format!("../{name}")])
+            .success();
+    }
+    let copy = test_env.env_root().join("copy");
+    let sibling = test_env.env_root().join("sibling");
+    std::fs::copy(sibling.join(".git"), copy.join(".git")).unwrap();
+    assert_eq!(git_worktree_ids(&main_repo), ["copy", "sibling"]);
+
+    let output = main_dir.run_jj(["workspace", "forget", "copy"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove Git worktree for "$TEST_ENV/copy".
+    Caused by: $TEST_ENV/copy is not a linked worktree of this repository
+    [EOF]
+    "#);
+    assert_eq!(git_worktree_ids(&main_repo), ["copy", "sibling"]);
+    assert_eq!(
+        std::fs::read(copy.join(".git")).unwrap(),
+        std::fs::read(sibling.join(".git")).unwrap()
+    );
+    assert!(
+        git::open(&sibling).head_id().is_ok(),
+        "sibling worktree still resolves HEAD"
+    );
+}
+
+/// A `.git` that is a symlink to another workspace's gitlink names that
+/// workspace's record just as a copy does: `workspace forget` leaves both
+/// alone.
+#[test]
+#[cfg(unix)]
+fn test_workspaces_forget_colocated_keeps_worktree_of_symlinked_sibling_gitlink() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let main_repo = git::open(main_dir.root());
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    for name in ["link", "sibling"] {
+        main_dir
+            .run_jj(["workspace", "add", &format!("../{name}")])
+            .success();
+    }
+    let link = test_env.env_root().join("link");
+    let sibling = test_env.env_root().join("sibling");
+    std::fs::remove_file(link.join(".git")).unwrap();
+    std::os::unix::fs::symlink(sibling.join(".git"), link.join(".git")).unwrap();
+
+    let output = main_dir.run_jj(["workspace", "forget", "link"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove Git worktree for "$TEST_ENV/link".
+    Caused by: $TEST_ENV/link is not a linked worktree of this repository
+    [EOF]
+    "#);
+    assert_eq!(git_worktree_ids(&main_repo), ["link", "sibling"]);
+    assert!(link.join(".git").symlink_metadata().unwrap().is_symlink());
+    assert!(sibling.join(".git").is_file());
+    assert!(
+        git::open(&sibling).head_id().is_ok(),
+        "sibling worktree still resolves HEAD"
+    );
+}
+
+/// A worktree whose record under `.git/worktrees/` is already gone has nothing
+/// registered in Git even when its dangling gitlink cannot be removed:
+/// `workspace forget` warns instead of failing with a hint that Git still has
+/// it registered.
+#[test]
+#[cfg(unix)]
+fn test_workspaces_forget_colocated_pruned_worktree_metadata_in_read_only_dir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let main_repo = git::open(main_dir.root());
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["workspace", "add", "../pruned"]).success();
+    std::fs::remove_dir_all(main_dir.root().join(".git/worktrees/pruned")).unwrap();
+    assert_eq!(git_worktree_ids(&main_repo), [] as [String; 0]);
+
+    let pruned = test_env.env_root().join("pruned");
+    let writable = std::fs::metadata(&pruned).unwrap().permissions();
+    std::fs::set_permissions(&pruned, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = main_dir.run_jj(["workspace", "forget", "pruned"]);
+    std::fs::set_permissions(&pruned, writable).unwrap();
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Warning: Failed to remove Git worktree for "$TEST_ENV/pruned".
+    Caused by:
+    1: Failed to remove .git gitlink file whose Git directory no longer exists
+    2: Cannot access $TEST_ENV/pruned/.git
+    3: Permission denied (os error 13)
+    [EOF]
+    "#);
+    let output = main_dir.run_jj(["workspace", "list"]);
+    insta::assert_snapshot!(output, @"
+    default: . rlvkpnrz 504e3d8c (empty) (no description set)
+    [EOF]
+    ");
+    assert!(pruned.join(".git").is_file());
+}
+
 /// When the Git worktree cannot be disconnected, `workspace forget` must fail
 /// (the workspace itself is still forgotten) instead of printing a warning and
 /// exiting 0 with the worktree left registered.

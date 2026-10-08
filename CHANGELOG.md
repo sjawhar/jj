@@ -37,7 +37,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 * `jj workspace forget` no longer deletes a workspace's `.git` file when it is
   not a linked Git worktree of the repository, such as in the default workspace
-  of a repository created with `git init --separate-git-dir`.
+  of a repository created with `git init --separate-git-dir`, or when it was
+  copied from, or is a symlink to, another workspace's `.git` file.
 
 ## [0.46.0] - 2026-10-07
 

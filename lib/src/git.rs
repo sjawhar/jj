@@ -1937,6 +1937,10 @@ pub enum GitUnlinkWorktreeError {
     ReadGitLink(#[source] PathError),
     #[error("Failed to remove .git gitlink file")]
     RemoveGitLink(#[source] PathError),
+    #[error("Failed to remove .git gitlink file whose Git directory no longer exists")]
+    RemoveStaleGitLink(#[source] PathError),
+    #[error("Failed to read Git worktree metadata")]
+    ReadMetadata(#[source] PathError),
     #[error("Failed to remove Git worktree metadata")]
     RemoveMetadata(#[source] PathError),
     #[error("{0} is not a linked worktree of this repository")]
@@ -1960,17 +1964,22 @@ pub enum GitUnlinkWorktreeError {
 /// remove the metadata of every worktree whose directory happens to be
 /// unreadable at that moment — on a network mount, mid-`chmod`, or being
 /// moved — and those worktrees then silently lose their Git colocation while
-/// jj keeps using them.
+/// jj keeps using them. The metadata directory the gitlink names is removed
+/// only if its `gitdir` file points back at this worktree's `.git`: a gitlink
+/// copied from another worktree, or a symlink to another worktree's gitlink,
+/// names that worktree's metadata.
 ///
 /// The gitlink is removed before the bookkeeping, so an error means either
 /// that nothing was done, or that the worktree is already disconnected and
 /// only stale metadata remains. Git still has the worktree registered in both
 /// cases, so callers must surface the failure rather than report a clean
-/// disconnect. The exception is [`GitUnlinkWorktreeError::NotALinkedWorktree`]:
-/// the `.git` file names something other than a linked worktree of this
-/// repository, and it is left alone. A gitlink whose Git directory no longer
-/// exists has nothing registered either; it is removed and counts as
-/// disconnected.
+/// disconnect. The exceptions are [`GitUnlinkWorktreeError::NotALinkedWorktree`]:
+/// the `.git` file names something other than this worktree's metadata in
+/// this repository, and it is left alone; and
+/// [`GitUnlinkWorktreeError::RemoveStaleGitLink`]: the gitlink's Git directory
+/// no longer exists, so Git has nothing registered for it, but the gitlink
+/// could not be removed. A gitlink whose Git directory no longer exists is
+/// otherwise removed and counts as disconnected.
 pub fn unlink_worktree(
     store: &Store,
     worktree_path: &Path,
@@ -1999,7 +2008,7 @@ pub fn unlink_worktree(
         Err(GitRepoAtWorkdirError::NotFound { .. }) => {
             std::fs::remove_file(&dot_git)
                 .context(&dot_git)
-                .map_err(GitUnlinkWorktreeError::RemoveGitLink)?;
+                .map_err(GitUnlinkWorktreeError::RemoveStaleGitLink)?;
             return Ok(true);
         }
         // The gitlink belongs to another repository: not ours to disconnect.
@@ -2027,7 +2036,7 @@ pub fn unlink_worktree(
         (Some(Ok(parent)), Ok(worktrees_dir)) => parent == worktrees_dir,
         _ => false,
     };
-    if !is_linked {
+    if !is_linked || !is_own_worktree_metadata(worktree_path, &metadata_dir)? {
         return Err(GitUnlinkWorktreeError::NotALinkedWorktree(
             worktree_path.to_owned(),
         ));
@@ -2041,6 +2050,49 @@ pub fn unlink_worktree(
         .context(&metadata_dir)
         .map_err(GitUnlinkWorktreeError::RemoveMetadata)?;
     Ok(true)
+}
+
+/// Whether the linked worktree metadata directory `metadata_dir` belongs to
+/// the worktree at `worktree_path`.
+///
+/// Git records the path of the worktree's `.git` in `<metadata_dir>/gitdir`:
+/// absolute, or relative to `metadata_dir` with `worktree.useRelativePaths`.
+/// Only the directories are canonicalized, not the `.git` entry itself, so a
+/// `.git` that is a symlink to another worktree's gitlink does not match that
+/// worktree's record. A missing record, or one naming a directory that cannot
+/// be resolved, is not this worktree's.
+fn is_own_worktree_metadata(
+    worktree_path: &Path,
+    metadata_dir: &Path,
+) -> Result<bool, GitUnlinkWorktreeError> {
+    let gitdir_file = metadata_dir.join("gitdir");
+    let recorded = match std::fs::read(&gitdir_file) {
+        Ok(recorded) => recorded,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(GitUnlinkWorktreeError::ReadMetadata(PathError {
+                path: gitdir_file,
+                source,
+            }));
+        }
+    };
+    let Ok(recorded) = crate::file_util::path_from_bytes(recorded.trim_ascii_end()) else {
+        return Ok(false);
+    };
+    let recorded = metadata_dir.join(recorded);
+    let (Some(recorded_dir), Some(recorded_name)) = (recorded.parent(), recorded.file_name())
+    else {
+        return Ok(false);
+    };
+    match (
+        dunce::canonicalize(recorded_dir),
+        dunce::canonicalize(worktree_path),
+    ) {
+        (Ok(recorded_dir), Ok(worktree_dir)) => {
+            Ok(recorded_name == ".git" && recorded_dir == worktree_dir)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Debug, Error)]

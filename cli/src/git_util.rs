@@ -571,8 +571,9 @@ pub fn print_push_stats(ui: &Ui, stats: &GitPushStats) -> io::Result<()> {
 /// registered, and the caller must not report a clean disconnect. The hint
 /// explains how to finish disconnecting it without deleting the workspace's
 /// files, which `git worktree remove` would do. A `.git` file that is not a
-/// linked worktree of this repository is an error as well: it is left alone,
-/// so the workspace stays colocated through it.
+/// linked worktree of this repository, or names another worktree's metadata,
+/// is an error as well: it is left alone, so the workspace stays colocated
+/// through it.
 pub fn unlink_git_worktree(
     ui: &Ui,
     store: &Arc<Store>,
@@ -590,8 +591,10 @@ pub fn unlink_git_worktree(
 /// unreadable directory does not leave the others linked as well. Every
 /// failure is reported; the first one is returned. A `.git` file that is not a
 /// linked worktree of this repository, such as the default workspace's in a
-/// repository created with `git init --separate-git-dir`, is left alone with a
-/// warning: Git has nothing registered for it.
+/// repository created with `git init --separate-git-dir` or one copied from
+/// another workspace, is left alone with a warning: it does not link this
+/// workspace's own worktree. So is a `.git` file whose Git directory no longer
+/// exists but which cannot be removed: Git has nothing registered for it.
 pub fn unlink_git_worktrees(
     ui: &Ui,
     store: &Arc<Store>,
@@ -604,7 +607,10 @@ pub fn unlink_git_worktrees(
                 print_unlinked_git_worktree(ui, path, unlinked)?;
                 continue;
             }
-            Err(err @ git::GitUnlinkWorktreeError::NotALinkedWorktree(_)) => {
+            Err(
+                err @ (git::GitUnlinkWorktreeError::NotALinkedWorktree(_)
+                | git::GitUnlinkWorktreeError::RemoveStaleGitLink(_)),
+            ) => {
                 writeln!(
                     ui.warning_default(),
                     r#"Failed to remove Git worktree for "{}"."#,
@@ -656,6 +662,8 @@ fn unlink_git_worktree_error(
                 .to_owned(),
         ),
         git::GitUnlinkWorktreeError::NotALinkedWorktree(_)
+        | git::GitUnlinkWorktreeError::RemoveStaleGitLink(_)
+        | git::GitUnlinkWorktreeError::ReadMetadata(_)
         | git::GitUnlinkWorktreeError::Git(_)
         | git::GitUnlinkWorktreeError::UnexpectedBackend(_) => None,
     };
