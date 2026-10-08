@@ -687,6 +687,7 @@ impl CommandHelper {
                         {
                             let workspace_name = workspace_command.env.workspace_name();
                             let workspace_root = workspace_command.env.workspace_root();
+                            let sparse_patterns = locked_ws.locked_wc().sparse_patterns()?.to_vec();
                             let mut tx =
                                 start_repo_transaction(repo, workspace_name, self.string_args());
                             try_reset_git_head(
@@ -695,6 +696,7 @@ impl CommandHelper {
                                 workspace_name,
                                 workspace_root,
                                 &desired_wc_commit,
+                                &sparse_patterns,
                                 git_import_export_lock,
                             )
                             .await?;
@@ -2190,12 +2192,18 @@ to the current parents may contain changes from multiple commits.
                 let workspace_root = self.env.workspace_root();
                 if wc_immutable {
                     // New working-copy commit is created on top. Reset Git HEAD and index.
+                    let sparse_patterns = locked_ws
+                        .locked_wc()
+                        .sparse_patterns()
+                        .map_err(snapshot_command_error)?
+                        .to_vec();
                     try_reset_git_head(
                         ui,
                         mut_repo,
                         &workspace_name,
                         workspace_root,
                         &new_wc_commit,
+                        &sparse_patterns,
                         git_import_export_lock,
                     )
                     .await
@@ -2395,12 +2403,14 @@ to the current parents may contain changes from multiple commits.
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
             if let Some(wc_commit) = &maybe_new_wc_commit {
+                let sparse_patterns = self.working_copy().sparse_patterns()?.to_vec();
                 try_reset_git_head(
                     ui,
                     tx.repo_mut(),
                     self.workspace_name(),
                     self.workspace_root(),
                     wc_commit,
+                    &sparse_patterns,
                     git_import_export_lock,
                 )
                 .await?;
@@ -2733,6 +2743,7 @@ async fn try_reset_git_head(
     workspace_name: &WorkspaceName,
     workspace_root: &Path,
     wc_commit: &Commit,
+    sparse_patterns: &[RepoPathBuf],
     _git_import_export_lock: &GitImportExportLock,
 ) -> Result<(), CommandError> {
     use std::error::Error as _;
@@ -2742,7 +2753,15 @@ async fn try_reset_git_head(
     // This can still fail if HEAD was updated concurrently by another JJ process
     // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
     // case, the actual state will be imported on the next snapshot.
-    match jj_lib::git::reset_head(mut_repo, workspace_name, workspace_root, wc_commit).await {
+    match jj_lib::git::reset_head(
+        mut_repo,
+        workspace_name,
+        workspace_root,
+        wc_commit,
+        sparse_patterns,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
             writeln!(ui.warning_default(), "{err}")?;

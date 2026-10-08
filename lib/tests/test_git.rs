@@ -82,6 +82,7 @@ use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::MutableRepo;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing_factory::signer_from_settings;
 use jj_lib::str_util::StringExpression;
@@ -233,7 +234,15 @@ fn reset_head(
 ) -> Result<(), GitResetHeadError> {
     let workspace_name = workspace.workspace_name();
     let workspace_root = workspace.workspace_root();
-    git::reset_head(mut_repo, workspace_name, workspace_root, wc_commit).block_on()
+    let sparse_patterns = workspace.working_copy().sparse_patterns().unwrap();
+    git::reset_head(
+        mut_repo,
+        workspace_name,
+        workspace_root,
+        wc_commit,
+        sparse_patterns,
+    )
+    .block_on()
 }
 
 /// Fetches and imports all refs with the default configuration.
@@ -3879,6 +3888,99 @@ fn test_reset_head_with_index_no_conflict() -> TestResult {
     Unconflicted some/dir/executable-file Mode(FILE | FILE_EXECUTABLE)
     Unconflicted some/dir/normal-file Mode(FILE)
     Unconflicted some/dir/symlink Mode(SYMLINK)
+    ");
+    Ok(())
+}
+
+/// Each index entry's path, prefixed `S ` when it is marked skip-worktree.
+fn get_index_skip_worktree(workspace_root: &Path) -> String {
+    let git_repo = gix::open(workspace_root).unwrap();
+    let index = git_repo.index().unwrap();
+    index
+        .entries()
+        .iter()
+        .map(|entry| {
+            let skip = entry
+                .flags
+                .contains(gix::index::entry::Flags::SKIP_WORKTREE);
+            format!(
+                "{} {}\n",
+                if skip { "S" } else { "-" },
+                entry.path_in(index.path_backing())
+            )
+        })
+        .join("")
+}
+
+#[test]
+fn test_reset_head_marks_paths_outside_sparse_patterns_skip_worktree() -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let workspace_root = test_workspace.workspace.workspace_root();
+
+    let mut tx = repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+    let tree = testutils::create_tree(
+        repo,
+        &[
+            (repo_path("kept/file"), "kept\n"),
+            (repo_path("left-out/file"), "left out\n"),
+            (repo_path("top"), "top\n"),
+        ],
+    );
+    let parent_commit = mut_repo
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree.clone())
+        .write_unwrap();
+    let wc_commit = mut_repo
+        .new_commit(vec![parent_commit.id().clone()], tree)
+        .write_unwrap();
+
+    let patterns = [repo_path("kept").to_owned(), repo_path("top").to_owned()];
+    git::reset_head(
+        mut_repo,
+        test_workspace.workspace.workspace_name(),
+        workspace_root,
+        &wc_commit,
+        &patterns,
+    )
+    .block_on()?;
+    insta::assert_snapshot!(get_index_skip_worktree(workspace_root), @"
+    - kept/file
+    S left-out/file
+    - top
+    ");
+
+    // Patterns that change after the reset update the marks in place.
+    git::update_index_sparse_patterns(repo.store(), workspace_root, &[RepoPathBuf::root()])?;
+    insta::assert_snapshot!(get_index_skip_worktree(workspace_root), @"
+    - kept/file
+    - left-out/file
+    - top
+    ");
+    git::update_index_sparse_patterns(
+        repo.store(),
+        workspace_root,
+        &[repo_path("kept").to_owned()],
+    )?;
+    insta::assert_snapshot!(get_index_skip_worktree(workspace_root), @"
+    - kept/file
+    S left-out/file
+    S top
+    ");
+
+    // With every path in the patterns, nothing is marked.
+    git::reset_head(
+        mut_repo,
+        test_workspace.workspace.workspace_name(),
+        workspace_root,
+        &wc_commit,
+        &[RepoPathBuf::root()],
+    )
+    .block_on()?;
+    insta::assert_snapshot!(get_index_skip_worktree(workspace_root), @"
+    - kept/file
+    - left-out/file
+    - top
     ");
     Ok(())
 }

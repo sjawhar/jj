@@ -1980,6 +1980,55 @@ fn test_git_colocated_operation_cleanup() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_git_colocated_sparse_paths_are_skip_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    let git_status = |work_dir: &TestWorkDir| -> TestResult<String> {
+        let output = std::process::Command::new("git")
+            .current_dir(work_dir.root())
+            .args(["status", "--porcelain=v1"])
+            .output()?;
+        assert!(output.status.success());
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    work_dir.write_file("kept/file", "kept\n");
+    work_dir.write_file("left-out/file", "left out\n");
+    work_dir.run_jj(["commit", "-m", "base"]).success();
+
+    // Git skips the path the working copy leaves out instead of reporting it
+    // deleted, once the patterns change and after every later HEAD reset.
+    work_dir
+        .run_jj(["sparse", "set", "--clear", "--add", "kept"])
+        .success();
+    assert!(!work_dir.root().join("left-out").exists());
+    insta::assert_snapshot!(git_status(&work_dir)?, @"");
+    work_dir.run_jj(["describe", "-m", "wip"]).success();
+    insta::assert_snapshot!(git_status(&work_dir)?, @"");
+    work_dir.run_jj(["new"]).success();
+    insta::assert_snapshot!(git_status(&work_dir)?, @"");
+
+    // A change inside the patterns is still Git's to see.
+    work_dir.write_file("kept/file", "edited\n");
+    work_dir.run_jj(["status"]).success();
+    insta::assert_snapshot!(git_status(&work_dir)?, @" M kept/file");
+
+    // A path added back to the patterns is Git's to see again at once.
+    work_dir
+        .run_jj(["sparse", "set", "--add", "left-out"])
+        .success();
+    work_dir.write_file("left-out/file", "edited\n");
+    insta::assert_snapshot!(git_status(&work_dir)?, @"
+     M kept/file
+     M left-out/file
+    ");
+    Ok(())
+}
+
 #[must_use]
 fn get_bookmark_output(work_dir: &TestWorkDir) -> CommandOutput {
     // --quiet to suppress deleted bookmarks hint

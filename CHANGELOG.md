@@ -21,6 +21,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* In a colocated workspace with sparse patterns, Git no longer reports the
+  files outside the patterns as deleted, and `git add -A` no longer stages
+  their deletion: jj marks their Git index entries skip-worktree when it resets
+  the index and when `jj sparse` changes the patterns.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights

@@ -55,6 +55,8 @@ use crate::git_subprocess::GitSubprocessContext;
 use crate::git_subprocess::GitSubprocessError;
 use crate::index::IndexError;
 use crate::matchers::EverythingMatcher;
+use crate::matchers::Matcher as _;
+use crate::matchers::PrefixMatcher;
 use crate::merge::Diff;
 use crate::merged_tree::MergedTree;
 use crate::merged_tree::TreeDiffEntry;
@@ -77,6 +79,7 @@ use crate::ref_name::WorkspaceName;
 use crate::repo::MutableRepo;
 use crate::repo::Repo;
 use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::revset::ResolvedRevsetExpression;
 use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
@@ -1995,11 +1998,16 @@ impl GitResetHeadError {
 
 /// Sets Git HEAD to the parent of the given working-copy commit and resets
 /// the Git index.
+///
+/// `sparse_patterns` are the workspace's sparse patterns: every index entry
+/// outside them is marked skip-worktree, so Git skips the files the working
+/// copy doesn't check out instead of reporting them as deleted.
 pub async fn reset_head(
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
     workspace_root: &Path,
     wc_commit: &Commit,
+    sparse_patterns: &[RepoPathBuf],
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(mut_repo.store())?;
     let git_repo = git_backend
@@ -2044,7 +2052,7 @@ pub async fn reset_head(
         clear_operation_state(&git_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, &git_repo, wc_commit, sparse_patterns).await
 }
 
 // TODO: Polish and upstream this to `gix`.
@@ -2084,6 +2092,7 @@ async fn reset_index(
     repo: &dyn Repo,
     git_repo: &gix::Repository,
     wc_commit: &Commit,
+    sparse_patterns: &[RepoPathBuf],
 ) -> Result<(), GitResetHeadError> {
     let parent_tree = wc_commit.parent_tree(repo).await?;
     // Use the merged parent tree as the Git index, allowing `git diff` to show the
@@ -2111,6 +2120,7 @@ async fn reset_index(
 
     let wc_tree = wc_commit.tree();
     update_intent_to_add_impl(git_repo, &mut index, &parent_tree, &wc_tree).await?;
+    set_skip_worktree(&mut index, sparse_patterns);
 
     // Match entries in the new index with entries in the old index, and copy stat
     // information if the entry didn't change.
@@ -2132,6 +2142,62 @@ async fn reset_index(
     index
         .write(gix::index::write::Options::default())
         .map_err(GitResetHeadError::from_git)
+}
+
+/// Updates the Git index of the colocated workspace at `workspace_root` after
+/// its sparse patterns change: every entry outside `sparse_patterns` is marked
+/// skip-worktree and every entry inside them is cleared of the mark, as
+/// [`reset_head()`] does. The index is written only if an entry changed.
+pub fn update_index_sparse_patterns(
+    store: &Store,
+    workspace_root: &Path,
+    sparse_patterns: &[RepoPathBuf],
+) -> Result<(), GitResetHeadError> {
+    let git_backend = get_git_backend(store)?;
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitResetHeadError::from_git)?;
+    let mut index = git_repo
+        .index_or_empty()
+        .map_err(GitResetHeadError::from_git)?;
+    let mut_index = Arc::make_mut(&mut index);
+    if set_skip_worktree(mut_index, sparse_patterns) {
+        mut_index
+            .write(gix::index::write::Options::default())
+            .map_err(GitResetHeadError::from_git)?;
+    }
+    Ok(())
+}
+
+/// Marks each entry of `index` outside `sparse_patterns` skip-worktree and
+/// clears the mark from each entry inside them, the state Git's own sparse
+/// checkout leaves: Git then neither reports a file the working copy leaves
+/// out as deleted nor stages its deletion. Returns whether any entry changed.
+fn set_skip_worktree(index: &mut gix::index::File, sparse_patterns: &[RepoPathBuf]) -> bool {
+    use gix::index::entry::Flags;
+    let everything = sparse_patterns.iter().any(|pattern| pattern.is_root());
+    let matcher = PrefixMatcher::new(sparse_patterns);
+    let mut changed = false;
+    for (entry, path) in index.entries_mut_with_paths() {
+        // A path jj can't represent was never checked out by jj either way;
+        // leave it as Git sees it.
+        let skip = !everything
+            && std::str::from_utf8(path)
+                .ok()
+                .and_then(|path| RepoPath::from_internal_string(path).ok())
+                .is_some_and(|path| !matcher.matches(path));
+        if entry.flags.contains(Flags::SKIP_WORKTREE) == skip {
+            continue;
+        }
+        changed = true;
+        entry.flags.set(Flags::SKIP_WORKTREE, skip);
+        // The extended flags are written only when `EXTENDED` is set.
+        let extended = entry
+            .flags
+            .intersects(Flags::SKIP_WORKTREE | Flags::INTENT_TO_ADD);
+        entry.flags.set(Flags::EXTENDED, extended);
+    }
+    changed
 }
 
 fn build_index_from_merged_tree(
