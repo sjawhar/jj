@@ -21,6 +21,62 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 
+* Snapshotting with `fsmonitor.backend = "watchman"` no longer silently
+  reports a clean working copy when Watchman resolves the working copy to a
+  watch of an enclosing directory that cannot see it (e.g. a workspace inside
+  a directory listed in the enclosing root's `ignore_dirs` Watchman
+  configuration). jj now verifies visibility and creates a dedicated watch of
+  the working copy root when needed.
+
+* With `fsmonitor.backend = "watchman"`, local modifications were no longer
+  detected after Git HEAD moved without the working copy being rewritten
+  (for example after `git reset --soft` or `git update-ref HEAD` in a
+  colocated repository). The next snapshot after such a reset now scans the
+  whole working copy.
+
+* In a colocated repository, Git HEAD is no longer moved when resetting the
+  Git index fails (for example because another process holds
+  `.git/index.lock`). Previously the next command could import the moved HEAD
+  and replace the workspace's working-copy commit with a fresh one, leaving the
+  previous commit's description and bookmarks behind on the previous commit.
+  [#7530](https://github.com/jj-vcs/jj/issues/7530)
+
+* In a colocated repository, `jj` no longer fails with `Could not acquire lock
+  for index file` when another process (such as `git status` run by an editor
+  or a prompt) briefly holds `.git/index.lock`. It now waits up to one second
+  for the lock; a lock that is never released still fails.
+  [#7530](https://github.com/jj-vcs/jj/issues/7530)
+
+* In a colocated repository, a `jj` command no longer replaces the working-copy
+  commit when the view's recorded Git HEAD was lost but on-disk HEAD still
+  points at the working-copy commit's parent (as happens when an operation was
+  written by a tool embedding a jj-lib too old to know per-workspace Git
+  HEADs). The target is re-recorded without a checkout.
+
+* Reconciling concurrent operations no longer deletes a workspace's recorded
+  Git HEAD when one operation's view merely lacks the entry (as when written by
+  a tool embedding a jj-lib too old to know per-workspace Git HEADs) while the
+  workspace itself survives. A genuine `jj workspace forget` still removes it.
+
+* `jj workspace forget`, `jj workspace remove` and `jj git colocation disable`
+  now fail when a workspace's Git worktree could not be disconnected (for
+  example because its directory is read-only), instead of printing a warning
+  and continuing with the worktree still registered in Git. The workspace is
+  still forgotten by `jj workspace forget` and `jj workspace remove`, and the
+  latter still deletes every workspace directory it can. The error explains
+  how to disconnect the leftover worktree without deleting the workspace's
+  files.
+
+* `jj workspace forget` and `jj workspace remove` no longer run `git worktree
+  prune` on the whole repository, which could unregister another workspace's
+  Git worktree if its directory was unreadable at that moment. Only that
+  workspace's own worktree is removed.
+
+* `jj workspace forget` no longer deletes a workspace's `.git` file when it is
+  not a linked Git worktree of the repository, such as in the default workspace
+  of a repository created with `git init --separate-git-dir`, or when it was
+  copied from, or is a symlink to, another workspace's `.git` file.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights
@@ -854,6 +910,13 @@ None
   revisions by default (defined by `revsets.op-diff-changes-in`). A new flag,
   `--show-changes-in`, can be used to override this. [#6083](https://github.com/jj-vcs/jj/issues/6083)
 
+* Added `git.filter` settings for configuring gitattributes clean/smudge filters.
+  When `git.filter.enabled = true`, jj runs configured filter drivers during
+  snapshot (clean) and working copy update (smudge). The filter driver command
+  supports string, array, and structured `{ env, command }` forms, and
+  interpolates `$path` with the repo-relative file path. This enables Git LFS
+  and other gitattributes filter integrations in colocated repositories.
+  ([Issue #80](https://github.com/jj-vcs/jj/issues/80))
 ### Fixed bugs
 
 * `.gitignore` with UTF-8 BOM can now be parsed correctly.

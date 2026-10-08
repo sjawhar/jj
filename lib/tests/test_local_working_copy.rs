@@ -64,7 +64,6 @@ use jj_lib::secret_backend::SecretBackend;
 use jj_lib::tree_builder::TreeBuilder;
 use jj_lib::tree_merge::MergeOptions;
 use jj_lib::working_copy::CheckoutError;
-use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy as _;
@@ -420,7 +419,10 @@ fn test_checkout_no_op() -> TestResult {
     // Update to commit2 (same tree as commit1)
     let new_op_id = OperationId::from_bytes(b"whatever");
     let stats = ws.check_out(new_op_id.clone(), None, &commit2).block_on()?;
-    assert_eq!(stats, CheckoutStats::default());
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 0);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
 
     // The tree state is unchanged but the recorded operation id is updated.
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
@@ -678,15 +680,10 @@ fn test_conflicting_changes_on_disk() -> TestResult {
     let stats = ws
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 0,
-            added_files: 3,
-            removed_files: 0,
-            skipped_files: 3
-        }
-    );
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 3);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 3);
 
     assert_eq!(
         std::fs::read_to_string(file_file_path.to_fs_path_unchecked(&workspace_root)).ok(),
@@ -902,15 +899,10 @@ fn test_materialize_snapshot_conflicted_files() -> TestResult {
     let stats = ws
         .check_out(repo.op_id().clone(), None, &commit)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 0,
-            added_files: 2,
-            removed_files: 0,
-            skipped_files: 0
-        }
-    );
+    assert_eq!(stats.updated_files, 0);
+    assert_eq!(stats.added_files, 2);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
 
     // Even though the tree-level conflict is a 3-sided conflict, each file is
     // materialized as a 2-sided conflict.
@@ -1076,13 +1068,10 @@ fn test_materialize_snapshot_unchanged_conflicts() -> TestResult {
         .workspace
         .check_out(repo.op_id().clone(), None, &commit_with_labels)
         .block_on()?;
-    assert_eq!(
-        stats,
-        CheckoutStats {
-            updated_files: 1,
-            ..CheckoutStats::default()
-        }
-    );
+    assert_eq!(stats.updated_files, 1);
+    assert_eq!(stats.added_files, 0);
+    assert_eq!(stats.removed_files, 0);
+    assert_eq!(stats.skipped_files, 0);
     let materialized_content = std::fs::read_to_string(&disk_path)?;
     insta::assert_snapshot!(materialized_content, @r"
     line 1
@@ -2801,6 +2790,90 @@ fn test_fsmonitor() -> TestResult {
         file "path/to/nested" (6209060941cd770c8d46): "nested\n"
     "#);
     tree_state.save()?;
+    Ok(())
+}
+
+/// `reset()`, `recover()` and a checkout that skips a file record file states
+/// without looking at the files on disk. A filesystem monitor only reports what
+/// changed since its clock, so the clock must be cleared to make the next
+/// snapshot scan the whole working copy.
+#[test]
+fn test_fsmonitor_clock_reset_by_reset_recover_and_skipped_checkout() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let tree_state_path = state_path.join("tree_state");
+    let watchman_clock = working_copy_proto::WatchmanClock {
+        watchman_clock: Some(
+            working_copy_proto::watchman_clock::WatchmanClock::StringClock("c:1:1".to_string()),
+        ),
+    };
+    // Seeds the tree state with a clock from an earlier monitor query, runs
+    // `update` on it, and returns the clock saved afterwards.
+    let saved_clock_after = |update: &dyn Fn(&mut TreeState)| -> TestResult<_> {
+        let mut proto =
+            working_copy_proto::TreeState::decode(std::fs::read(&tree_state_path)?.as_slice())?;
+        proto.watchman_clock = Some(watchman_clock.clone());
+        std::fs::write(&tree_state_path, proto.encode_to_vec())?;
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &tree_state_settings,
+        )?;
+        update(&mut tree_state);
+        tree_state.save()?;
+        let proto =
+            working_copy_proto::TreeState::decode(std::fs::read(&tree_state_path)?.as_slice())?;
+        Ok(proto.watchman_clock)
+    };
+    let reset = |tree: &MergedTree| {
+        saved_clock_after(&|tree_state| tree_state.reset(tree).block_on().unwrap())
+    };
+    let recover = |tree: &MergedTree| {
+        saved_clock_after(&|tree_state| tree_state.recover(tree).block_on().unwrap())
+    };
+    let check_out = |tree: &MergedTree, expected_skipped_files: u32| {
+        saved_clock_after(&|tree_state| {
+            let stats = tree_state.check_out(tree).unwrap();
+            assert_eq!(stats.skipped_files, expected_skipped_files);
+        })
+    };
+
+    let file_path = repo_path("file");
+    let tree1 = create_tree(repo, &[(file_path, "1\n")]);
+    let tree2 = create_tree(repo, &[(file_path, "2\n")]);
+    let empty_tree = repo.store().empty_merged_tree();
+
+    // A reset that changes no file state keeps the clock.
+    assert_eq!(reset(&empty_tree)?, Some(watchman_clock.clone()));
+    // A reset that adds or modifies a file records a placeholder for it.
+    assert_eq!(reset(&tree1)?, None);
+    assert_eq!(reset(&tree2)?, None);
+    // A reset that removes a file drops its state, but the file may still be
+    // on disk.
+    assert_eq!(reset(&empty_tree)?, None);
+
+    // A checkout that writes every file keeps the clock.
+    assert_eq!(check_out(&tree1, 0)?, Some(watchman_clock.clone()));
+    // Recovery drops every file state, even when the new tree is empty.
+    assert_eq!(recover(&empty_tree)?, None);
+    // A checkout that skips a file records a placeholder for it.
+    let disk_path = file_path.to_fs_path_unchecked(&workspace_root);
+    std::fs::remove_file(&disk_path)?;
+    std::fs::create_dir(&disk_path)?;
+    assert_eq!(check_out(&tree2, 1)?, None);
     Ok(())
 }
 
