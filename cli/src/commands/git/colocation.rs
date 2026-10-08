@@ -257,13 +257,7 @@ async fn cmd_git_colocation_disable(
     let op_id = workspace_command.repo().op_id().clone();
 
     if is_child_workspace(&workspace_command) {
-        let subprocess_options = GitSubprocessOptions::from_settings(workspace_command.settings())?;
-        unlink_git_worktree(
-            ui,
-            workspace_command.repo().store(),
-            subprocess_options,
-            &workspace_root,
-        )?;
+        unlink_git_worktree(ui, workspace_command.repo().store(), &workspace_root)?;
         drop(workspace_command);
     } else {
         let git_store_path = workspace_command.repo_path().join("store").join("git");
@@ -343,8 +337,16 @@ async fn set_git_head_to_wc_parent(
 ) -> Result<(), CommandError> {
     let workspace_name = workspace_command.workspace_name().to_owned();
     let workspace_root = workspace_command.workspace_root().to_owned();
+    let sparse_patterns = workspace_command.working_copy().sparse_patterns()?.to_vec();
     let mut tx = workspace_command.start_transaction();
-    git::reset_head(tx.repo_mut(), &workspace_name, &workspace_root, wc_commit).await?;
+    git::reset_head(
+        tx.repo_mut(),
+        &workspace_name,
+        &workspace_root,
+        wc_commit,
+        &sparse_patterns,
+    )
+    .await?;
     if tx.repo().has_changes() {
         tx.finish(ui, "set git head to working copy parent").await?;
     }

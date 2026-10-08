@@ -14,8 +14,6 @@
 
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
-#[cfg(feature = "git")]
-use jj_lib::git::GitSubprocessOptions;
 use jj_lib::ref_name::WorkspaceNameBuf;
 #[cfg(feature = "git")]
 use jj_lib::repo::Repo as _;
@@ -28,7 +26,7 @@ use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::complete;
 #[cfg(feature = "git")]
-use crate::git_util::unlink_git_worktree;
+use crate::git_util::unlink_git_worktrees;
 use crate::ui::Ui;
 
 const USE_WORKSPACE_FORGET_HINT: &str =
@@ -159,14 +157,10 @@ pub async fn cmd_workspace_remove(
 
     workspace_store.forget(&remove_ws.iter().map(|ws| ws.as_ref()).collect_vec())?;
 
+    // A worktree that could not be disconnected fails the command, but only
+    // after every workspace directory has been attempted as well.
     #[cfg(feature = "git")]
-    {
-        let subprocess_options = GitSubprocessOptions::from_settings(workspace_command.settings())?;
-        let store = workspace_command.repo().store();
-        for path in &paths_to_remove {
-            unlink_git_worktree(ui, store, subprocess_options.clone(), path)?;
-        }
-    }
+    let unlinked = unlink_git_worktrees(ui, workspace_command.repo().store(), &paths_to_remove);
 
     for path in &paths_to_remove {
         if let Err(err) = std::fs::remove_dir_all(path) {
@@ -185,5 +179,7 @@ pub async fn cmd_workspace_remove(
         }
     }
 
+    #[cfg(feature = "git")]
+    unlinked?;
     Ok(())
 }

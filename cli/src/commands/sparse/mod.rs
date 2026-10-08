@@ -18,6 +18,8 @@ mod reset;
 mod set;
 
 use clap::Subcommand;
+#[cfg(feature = "git")]
+use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use tracing::instrument;
 
@@ -69,11 +71,22 @@ async fn update_sparse_patterns_with(
     let new_patterns = f(ui, locked_ws.locked_wc().sparse_patterns()?)?;
     let stats = locked_ws
         .locked_wc()
-        .set_sparse_patterns(new_patterns)
+        .set_sparse_patterns(new_patterns.clone())
         .await
         .map_err(|err| internal_error_with_message("Failed to update working copy paths", err))?;
     let operation_id = locked_ws.locked_wc().old_operation_id().clone();
     locked_ws.finish(operation_id).await?;
-    print_checkout_stats(ui, &stats, &wc_commit)?;
+    // A colocated workspace's Git index marks the paths outside the patterns
+    // skip-worktree (`jj_lib::git::reset_head()`), so Git agrees with the new
+    // patterns at once rather than at the next HEAD reset.
+    #[cfg(feature = "git")]
+    if workspace_command.working_copy_shared_with_git() {
+        jj_lib::git::update_index_sparse_patterns(
+            workspace_command.repo().store(),
+            workspace_command.workspace_root(),
+            &new_patterns,
+        )?;
+    }
+    print_checkout_stats(ui, &stats, &wc_commit, workspace_command.path_converter())?;
     Ok(())
 }

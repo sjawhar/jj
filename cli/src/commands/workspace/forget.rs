@@ -14,8 +14,6 @@
 
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
-#[cfg(feature = "git")]
-use jj_lib::git::GitSubprocessOptions;
 use jj_lib::ref_name::WorkspaceNameBuf;
 #[cfg(feature = "git")]
 use jj_lib::repo::Repo as _;
@@ -25,7 +23,7 @@ use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::complete;
 #[cfg(feature = "git")]
-use crate::git_util::unlink_git_worktree;
+use crate::git_util::unlink_git_worktrees;
 use crate::ui::Ui;
 
 /// Stop tracking a workspace's working-copy commit in the repo
@@ -83,8 +81,10 @@ pub async fn cmd_workspace_forget(
             .iter()
             .filter_map(|ws| {
                 let path = workspace_store.get_workspace_path(ws).ok().flatten()?;
-                // Omit unreachable paths
-                dunce::canonicalize(&path).ok()
+                // A path that cannot be canonicalized is kept as recorded, so
+                // that `unlink_git_worktree()` decides: a missing directory has
+                // no worktree to disconnect, an inaccessible one is an error.
+                Some(dunce::canonicalize(&path).unwrap_or(path))
             })
             .collect_vec()
     };
@@ -114,13 +114,7 @@ pub async fn cmd_workspace_forget(
     tx.finish(ui, description).await?;
 
     #[cfg(feature = "git")]
-    {
-        let subprocess_options = GitSubprocessOptions::from_settings(workspace_command.settings())?;
-        let store = workspace_command.repo().store();
-        for path in &workspace_paths {
-            unlink_git_worktree(ui, store, subprocess_options.clone(), path)?;
-        }
-    }
+    unlink_git_worktrees(ui, workspace_command.repo().store(), &workspace_paths)?;
 
     Ok(())
 }

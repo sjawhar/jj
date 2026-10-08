@@ -26,12 +26,14 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bstr::BStr;
 use bstr::BString;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
+use gix::error::ResultExt as _;
 use gix::refspec::Instruction;
 use itertools::Itertools as _;
 use tempfile::TempDir;
@@ -47,6 +49,7 @@ use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
 use crate::file_util::is_empty_dir;
 use crate::git_backend::GitBackend;
+use crate::git_backend::GitRepoAtWorkdirError;
 use crate::git_subprocess::GitFetchStatus;
 pub use crate::git_subprocess::GitProgress;
 pub use crate::git_subprocess::GitSidebandLineTerminator;
@@ -55,6 +58,8 @@ use crate::git_subprocess::GitSubprocessContext;
 use crate::git_subprocess::GitSubprocessError;
 use crate::index::IndexError;
 use crate::matchers::EverythingMatcher;
+use crate::matchers::Matcher as _;
+use crate::matchers::PrefixMatcher;
 use crate::merge::Diff;
 use crate::merged_tree::MergedTree;
 use crate::merged_tree::TreeDiffEntry;
@@ -77,6 +82,7 @@ use crate::ref_name::WorkspaceName;
 use crate::repo::MutableRepo;
 use crate::repo::Repo;
 use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::revset::ResolvedRevsetExpression;
 use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
@@ -1788,6 +1794,45 @@ fn update_git_head(
     expected_ref: gix::refs::transaction::PreviousValue,
     new_oid: Option<gix::ObjectId>,
 ) -> gix::Result<()> {
+    git_repo.edit_references(git_head_edits(expected_ref, new_oid))?;
+    Ok(())
+}
+
+/// Like [`update_git_head()`], but only locks HEAD and checks it against
+/// `expected_ref`. HEAD is written by `commit_git_head_update()`; dropping the
+/// transaction instead releases the lock and leaves HEAD alone.
+fn prepare_git_head_update(
+    git_repo: &gix::Repository,
+    expected_ref: gix::refs::transaction::PreviousValue,
+    new_oid: Option<gix::ObjectId>,
+) -> gix::Result<gix::refs::file::Transaction<'_, '_>> {
+    let (ref_lock_fail, packed_refs_lock_fail) = ref_lock_timeouts(git_repo)?;
+    let transaction = git_repo
+        .refs
+        .transaction()
+        .prepare(
+            git_head_edits(expected_ref, new_oid),
+            ref_lock_fail,
+            packed_refs_lock_fail,
+        )
+        .or_erased()?;
+    Ok(transaction)
+}
+
+fn commit_git_head_update(
+    git_repo: &gix::Repository,
+    head_update: gix::refs::file::Transaction<'_, '_>,
+) -> gix::Result<()> {
+    head_update
+        .commit(git_repo.committer().transpose()?)
+        .or_erased()?;
+    Ok(())
+}
+
+fn git_head_edits(
+    expected_ref: gix::refs::transaction::PreviousValue,
+    new_oid: Option<gix::ObjectId>,
+) -> Vec<gix::refs::transaction::RefEdit> {
     let mut ref_edits = Vec::new();
     let new_target = if let Some(oid) = new_oid {
         gix::refs::Target::Object(oid)
@@ -1818,8 +1863,33 @@ fn update_git_head(
         name: "HEAD".try_into().unwrap(),
         deref: false,
     });
-    git_repo.edit_references(ref_edits)?;
-    Ok(())
+    ref_edits
+}
+
+// TODO: Use gix's own reader once it's public.
+/// Reads `core.filesRefLockTimeout` and `core.packedRefsTimeout` the way
+/// `gix::Repository::edit_references()` does for a repository opened with
+/// strict config, as jj opens every repository: from trusted config sections
+/// only, using the defaults when a key is unset and failing when a value is
+/// invalid.
+fn ref_lock_timeouts(
+    git_repo: &gix::Repository,
+) -> gix::Result<(gix::lock::acquire::Fail, gix::lock::acquire::Fail)> {
+    use gix::config::tree::Core;
+    use gix::lock::acquire::Fail;
+    let config = git_repo.config_snapshot();
+    let timeout =
+        |key: &'static gix::config::tree::keys::LockTimeout, default_ms| -> gix::Result<Fail> {
+            let value = config
+                .plumbing()
+                .integer_filter(key, gix::config::section::is_trusted);
+            let default = Fail::AfterDurationWithBackoff(Duration::from_millis(default_ms));
+            Ok(key.try_into_lock_timeout(value)?.unwrap_or(default))
+        };
+    Ok((
+        timeout(&Core::FILES_REF_LOCK_TIMEOUT, 100)?,
+        timeout(&Core::PACKED_REFS_TIMEOUT, 1000)?,
+    ))
 }
 
 #[derive(Debug, Error)]
@@ -1932,10 +2002,20 @@ fn add_worktree_to_populated_dir(
 
 #[derive(Debug, Error)]
 pub enum GitUnlinkWorktreeError {
+    #[error("Failed to read .git gitlink file")]
+    ReadGitLink(#[source] PathError),
     #[error("Failed to remove .git gitlink file")]
     RemoveGitLink(#[source] PathError),
+    #[error("Failed to remove .git gitlink file whose Git directory no longer exists")]
+    RemoveStaleGitLink(#[source] PathError),
+    #[error("Failed to read Git worktree metadata")]
+    ReadMetadata(#[source] PathError),
+    #[error("Failed to remove Git worktree metadata")]
+    RemoveMetadata(#[source] PathError),
+    #[error("{0} is not a linked worktree of this repository")]
+    NotALinkedWorktree(PathBuf),
     #[error(transparent)]
-    Subprocess(#[from] GitSubprocessError),
+    Git(Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     UnexpectedBackend(#[from] UnexpectedGitBackendError),
 }
@@ -1945,34 +2025,143 @@ pub enum GitUnlinkWorktreeError {
 /// Returns `false` if there was no Git worktree to disconnect.
 ///
 /// The worktree directory and its contents are left in place: only the `.git`
-/// gitlink and Git's bookkeeping under `.git/worktrees/` are removed. This is
-/// the inverse of [`create_worktree()`], which likewise only sets those up.
+/// gitlink and Git's bookkeeping under `.git/worktrees/<name>` are removed.
+/// This is the inverse of [`create_worktree()`], which likewise only sets those
+/// up.
 ///
-/// The gitlink is removed before the bookkeeping is pruned, so an error means
-/// either that nothing was done, or that the worktree is already disconnected
-/// and only stale metadata remains. Neither is worth failing a command over,
-/// so callers may treat all errors as non-fatal.
+/// Only this worktree's bookkeeping is touched. `git worktree prune` would
+/// remove the metadata of every worktree whose directory happens to be
+/// unreadable at that moment — on a network mount, mid-`chmod`, or being
+/// moved — and those worktrees then silently lose their Git colocation while
+/// jj keeps using them. The metadata directory the gitlink names is removed
+/// only if its `gitdir` file points back at this worktree's `.git`: a gitlink
+/// copied from another worktree, or a symlink to another worktree's gitlink,
+/// names that worktree's metadata.
+///
+/// The gitlink is removed before the bookkeeping, so an error means either
+/// that nothing was done, or that the worktree is already disconnected and
+/// only stale metadata remains. Git still has the worktree registered in both
+/// cases, so callers must surface the failure rather than report a clean
+/// disconnect. The exceptions are [`GitUnlinkWorktreeError::NotALinkedWorktree`]:
+/// the `.git` file names something other than this worktree's metadata in
+/// this repository, and it is left alone; and
+/// [`GitUnlinkWorktreeError::RemoveStaleGitLink`]: the gitlink's Git directory
+/// no longer exists, so Git has nothing registered for it, but the gitlink
+/// could not be removed. A gitlink whose Git directory no longer exists is
+/// otherwise removed and counts as disconnected.
 pub fn unlink_worktree(
     store: &Store,
-    subprocess_options: GitSubprocessOptions,
     worktree_path: &Path,
 ) -> Result<bool, GitUnlinkWorktreeError> {
     let dot_git = worktree_path.join(".git");
-    if !dot_git.is_file() {
-        return Ok(false);
+    // A missing gitlink means there is no Git worktree to disconnect; any other
+    // failure to look at it (unreadable directory) must surface, not read as
+    // "nothing to do". A symlinked gitlink is followed, as Git does.
+    match std::fs::metadata(&dot_git) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(GitUnlinkWorktreeError::ReadGitLink(PathError {
+                path: dot_git,
+                source,
+            }));
+        }
     }
     let git_backend = get_git_backend(store)?;
+    let worktree_repo = match git_backend.open_git_repo_at_workdir(worktree_path) {
+        Ok(repo) => repo,
+        // The gitlink names a Git directory that no longer exists, as a
+        // repository-wide `git worktree prune` or `git gc` leaves behind. Git
+        // has nothing registered for it; only the dangling gitlink is left.
+        Err(GitRepoAtWorkdirError::NotFound { .. }) => {
+            std::fs::remove_file(&dot_git)
+                .context(&dot_git)
+                .map_err(GitUnlinkWorktreeError::RemoveStaleGitLink)?;
+            return Ok(true);
+        }
+        // The gitlink belongs to another repository: not ours to disconnect.
+        Err(GitRepoAtWorkdirError::Unrelated { .. }) => {
+            return Err(GitUnlinkWorktreeError::NotALinkedWorktree(
+                worktree_path.to_owned(),
+            ));
+        }
+        Err(err @ GitRepoAtWorkdirError::Other(_)) => {
+            return Err(GitUnlinkWorktreeError::Git(err.into()));
+        }
+    };
+    // For a linked worktree, gix's `git_dir()` is the admin directory the
+    // gitlink names, `<common_dir>/worktrees/<name>`. Anything else — the main
+    // worktree, a submodule's gitlink — is not ours to disconnect. gix reports
+    // `common_dir()` relative to the admin dir (`worktrees/<name>/../..`), so
+    // both sides are canonicalized before comparing.
+    let metadata_dir = worktree_repo.git_dir().to_owned();
+    let worktrees_dir = worktree_repo.common_dir().join("worktrees");
+    drop(worktree_repo);
+    let is_linked = match (
+        metadata_dir.parent().map(dunce::canonicalize),
+        dunce::canonicalize(&worktrees_dir),
+    ) {
+        (Some(Ok(parent)), Ok(worktrees_dir)) => parent == worktrees_dir,
+        _ => false,
+    };
+    if !is_linked || !is_own_worktree_metadata(worktree_path, &metadata_dir)? {
+        return Err(GitUnlinkWorktreeError::NotALinkedWorktree(
+            worktree_path.to_owned(),
+        ));
+    }
     // `git worktree remove` isn't used because it deletes the directory
     // contents, and forgetting a workspace should preserve its files.
     std::fs::remove_file(&dot_git)
         .context(&dot_git)
         .map_err(GitUnlinkWorktreeError::RemoveGitLink)?;
-    // TODO: `git worktree prune` removes metadata for all worktrees whose
-    // working directories are missing, not just the one we removed. Ideally
-    // we'd target only the specific worktree.
-    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
-    git_ctx.spawn_worktree_prune()?;
+    std::fs::remove_dir_all(&metadata_dir)
+        .context(&metadata_dir)
+        .map_err(GitUnlinkWorktreeError::RemoveMetadata)?;
     Ok(true)
+}
+
+/// Whether the linked worktree metadata directory `metadata_dir` belongs to
+/// the worktree at `worktree_path`.
+///
+/// Git records the path of the worktree's `.git` in `<metadata_dir>/gitdir`:
+/// absolute, or relative to `metadata_dir` with `worktree.useRelativePaths`.
+/// Only the directories are canonicalized, not the `.git` entry itself, so a
+/// `.git` that is a symlink to another worktree's gitlink does not match that
+/// worktree's record. A missing record, or one naming a directory that cannot
+/// be resolved, is not this worktree's.
+fn is_own_worktree_metadata(
+    worktree_path: &Path,
+    metadata_dir: &Path,
+) -> Result<bool, GitUnlinkWorktreeError> {
+    let gitdir_file = metadata_dir.join("gitdir");
+    let recorded = match std::fs::read(&gitdir_file) {
+        Ok(recorded) => recorded,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(GitUnlinkWorktreeError::ReadMetadata(PathError {
+                path: gitdir_file,
+                source,
+            }));
+        }
+    };
+    let Ok(recorded) = crate::file_util::path_from_bytes(recorded.trim_ascii_end()) else {
+        return Ok(false);
+    };
+    let recorded = metadata_dir.join(recorded);
+    let (Some(recorded_dir), Some(recorded_name)) = (recorded.parent(), recorded.file_name())
+    else {
+        return Ok(false);
+    };
+    match (
+        dunce::canonicalize(recorded_dir),
+        dunce::canonicalize(worktree_path),
+    ) {
+        (Ok(recorded_dir), Ok(worktree_dir)) => {
+            Ok(recorded_name == ".git" && recorded_dir == worktree_dir)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1995,11 +2184,29 @@ impl GitResetHeadError {
 
 /// Sets Git HEAD to the parent of the given working-copy commit and resets
 /// the Git index.
+///
+/// If HEAD has to move, it is locked before anything else is written, and the
+/// new value is written last, after the fallible index reset. Writing the ref
+/// is an immediate on-disk side effect that the caller's transaction cannot
+/// roll back, whereas `mut_repo` is only updated in memory: if HEAD moved and
+/// the index reset then failed, the command would abort with the view still
+/// naming the old HEAD, and the next command in that workspace would import
+/// the new HEAD and replace the working-copy commit with a fresh one. A
+/// detached HEAD is also checked against the target recorded in the view
+/// while it is locked, so if another process has moved it, the reset fails
+/// with [`GitResetHeadError::UpdateHeadRef`] before the index or the
+/// operation state is touched. None of this makes the Git side effects atomic
+/// with the caller's transaction.
+///
+/// `sparse_patterns` are the workspace's sparse patterns: every index entry
+/// outside them is marked skip-worktree, so Git skips the files the working
+/// copy doesn't check out instead of reporting them as deleted.
 pub async fn reset_head(
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
     workspace_root: &Path,
     wc_commit: &Commit,
+    sparse_patterns: &[RepoPathBuf],
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(mut_repo.store())?;
     let git_repo = git_backend
@@ -2012,10 +2219,10 @@ pub async fn reset_head(
     } else {
         RefTarget::absent()
     };
-
-    // If the first parent of the working copy has changed, reset the Git HEAD.
     let old_head_target = mut_repo.git_head(workspace_name);
-    if *old_head_target != new_head_target {
+    let head_update = if *old_head_target == new_head_target {
+        None
+    } else {
         let expected_ref = if let Some(id) = old_head_target.as_normal() {
             // We have to check the actual HEAD state because we don't record a
             // symbolic ref as such.
@@ -2033,10 +2240,10 @@ pub async fn reset_head(
             gix::refs::transaction::PreviousValue::MustExist
         };
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
-        update_git_head(&git_repo, expected_ref, new_oid)
+        let head_update = prepare_git_head_update(&git_repo, expected_ref, new_oid)
             .map_err(GitResetHeadError::UpdateHeadRef)?;
-        mut_repo.set_git_head_target(workspace_name, new_head_target);
-    }
+        Some(head_update)
+    };
 
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
     // up.
@@ -2044,7 +2251,13 @@ pub async fn reset_head(
         clear_operation_state(&git_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, &git_repo, wc_commit, sparse_patterns).await?;
+
+    if let Some(head_update) = head_update {
+        commit_git_head_update(&git_repo, head_update).map_err(GitResetHeadError::UpdateHeadRef)?;
+        mut_repo.set_git_head_target(workspace_name, new_head_target);
+    }
+    Ok(())
 }
 
 // TODO: Polish and upstream this to `gix`.
@@ -2084,6 +2297,7 @@ async fn reset_index(
     repo: &dyn Repo,
     git_repo: &gix::Repository,
     wc_commit: &Commit,
+    sparse_patterns: &[RepoPathBuf],
 ) -> Result<(), GitResetHeadError> {
     let parent_tree = wc_commit.parent_tree(repo).await?;
     // Use the merged parent tree as the Git index, allowing `git diff` to show the
@@ -2111,6 +2325,7 @@ async fn reset_index(
 
     let wc_tree = wc_commit.tree();
     update_intent_to_add_impl(git_repo, &mut index, &parent_tree, &wc_tree).await?;
+    set_skip_worktree(&mut index, sparse_patterns);
 
     // Match entries in the new index with entries in the old index, and copy stat
     // information if the entry didn't change.
@@ -2129,9 +2344,101 @@ async fn reset_index(
 
     debug_assert!(index.verify_entries().is_ok());
 
+    write_index(&index)
+}
+
+/// How long a Git index write waits for `.git/index.lock` before failing.
+///
+/// A concurrent Git process may hold the lock briefly (a `git status` run by an
+/// editor or a prompt persists the stat cache it just refreshed, for example).
+/// gix's `File::write()` gives up on the first attempt, which turned each such
+/// moment into a failed `jj` command. A lock nobody releases (left by a killed
+/// process) still fails, after this long.
+const INDEX_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Writes `index` to its path, waiting up to [`INDEX_LOCK_TIMEOUT`] for the
+/// index lock. Same on-disk result and errors as `File::write()`, whose lock
+/// mode isn't configurable.
+fn write_index(index: &gix::index::File) -> Result<(), GitResetHeadError> {
+    use gix::error::ErrorExt as _;
+    use gix::error::ResultExt as _;
+    use gix::error::message;
+    let lock = gix::lock::File::acquire_to_update_resource(
+        index.path(),
+        gix::lock::acquire::Fail::AfterDurationWithBackoff(INDEX_LOCK_TIMEOUT),
+        None,
+    )
+    .or_raise(|| message("Could not acquire lock for index file"))
+    .map_err(GitResetHeadError::from_git)?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, lock);
     index
-        .write(gix::index::write::Options::default())
-        .map_err(GitResetHeadError::from_git)
+        .write_to(&mut out, gix::index::write::Options::default())
+        .or_raise(|| message("Could not write index"))
+        .map_err(GitResetHeadError::from_git)?;
+    let lock = out.into_inner().map_err(|err| {
+        GitResetHeadError::from_git(
+            err.into_error()
+                .and_raise(message("Could not flush buffered index data")),
+        )
+    })?;
+    lock.commit()
+        .or_raise(|| message("Could not commit lock for index file"))
+        .map_err(GitResetHeadError::from_git)?;
+    Ok(())
+}
+
+/// Updates the Git index of the colocated workspace at `workspace_root` after
+/// its sparse patterns change: every entry outside `sparse_patterns` is marked
+/// skip-worktree and every entry inside them is cleared of the mark, as
+/// [`reset_head()`] does. The index is written only if an entry changed.
+pub fn update_index_sparse_patterns(
+    store: &Store,
+    workspace_root: &Path,
+    sparse_patterns: &[RepoPathBuf],
+) -> Result<(), GitResetHeadError> {
+    let git_backend = get_git_backend(store)?;
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitResetHeadError::from_git)?;
+    let mut index = git_repo
+        .index_or_empty()
+        .map_err(GitResetHeadError::from_git)?;
+    let mut_index = Arc::make_mut(&mut index);
+    if set_skip_worktree(mut_index, sparse_patterns) {
+        write_index(mut_index)?;
+    }
+    Ok(())
+}
+
+/// Marks each entry of `index` outside `sparse_patterns` skip-worktree and
+/// clears the mark from each entry inside them, the state Git's own sparse
+/// checkout leaves: Git then neither reports a file the working copy leaves
+/// out as deleted nor stages its deletion. Returns whether any entry changed.
+fn set_skip_worktree(index: &mut gix::index::File, sparse_patterns: &[RepoPathBuf]) -> bool {
+    use gix::index::entry::Flags;
+    let everything = sparse_patterns.iter().any(|pattern| pattern.is_root());
+    let matcher = PrefixMatcher::new(sparse_patterns);
+    let mut changed = false;
+    for (entry, path) in index.entries_mut_with_paths() {
+        // A path jj can't represent was never checked out by jj either way;
+        // leave it as Git sees it.
+        let skip = !everything
+            && std::str::from_utf8(path)
+                .ok()
+                .and_then(|path| RepoPath::from_internal_string(path).ok())
+                .is_some_and(|path| !matcher.matches(path));
+        if entry.flags.contains(Flags::SKIP_WORKTREE) == skip {
+            continue;
+        }
+        changed = true;
+        entry.flags.set(Flags::SKIP_WORKTREE, skip);
+        // The extended flags are written only when `EXTENDED` is set.
+        let extended = entry
+            .flags
+            .intersects(Flags::SKIP_WORKTREE | Flags::INTENT_TO_ADD);
+        entry.flags.set(Flags::EXTENDED, extended);
+    }
+    changed
 }
 
 fn build_index_from_merged_tree(
@@ -2270,9 +2577,7 @@ pub async fn update_intent_to_add(
     let mut_index = Arc::make_mut(&mut index);
     update_intent_to_add_impl(&git_repo, mut_index, old_tree, new_tree).await?;
     debug_assert!(mut_index.verify_entries().is_ok());
-    mut_index
-        .write(gix::index::write::Options::default())
-        .map_err(GitResetHeadError::from_git)?;
+    write_index(mut_index)?;
 
     Ok(())
 }
