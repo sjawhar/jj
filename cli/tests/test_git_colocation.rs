@@ -631,6 +631,52 @@ fn test_git_colocation_disable_child_workspace_fails_when_worktree_stays_linked(
     ");
 }
 
+/// A child workspace whose `.git` is not a linked worktree of the repository,
+/// here a gitlink naming the main repository's own `.git`, cannot be
+/// disconnected. `git colocation disable` must fail instead of reporting a
+/// conversion that leaves the workspace colocated.
+#[test]
+fn test_git_colocation_disable_child_workspace_fails_when_not_a_linked_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.colocate = true");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let secondary_dir = test_env.work_dir("secondary");
+    let secondary = test_env.env_root().join("secondary");
+    let main_git_dir = main_dir.root().join(".git");
+    std::fs::write(
+        secondary.join(".git"),
+        format!("gitdir: {}\n", main_git_dir.display()),
+    )
+    .unwrap();
+
+    let output = secondary_dir.run_jj(["git", "colocation", "disable"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Error: Failed to remove Git worktree for "$TEST_ENV/secondary"
+    Caused by: $TEST_ENV/secondary is not a linked worktree of this repository
+    [EOF]
+    [exit status: 1]
+    "#);
+
+    // Nothing was half-converted: the workspace is still fully colocated.
+    assert!(secondary.join(".git").is_file());
+    assert!(secondary.join(".jj/.gitignore").is_file());
+    let output = secondary_dir.run_jj(["git", "colocation", "status", "--quiet"]);
+    insta::assert_snapshot!(output, @"
+    Workspace 'secondary' is currently colocated with Git.
+    Last imported/exported Git HEAD: 7b22a8cbe888adcb4d5ff6dd46a38049e870c6ab
+    [EOF]
+    ");
+}
+
 #[test]
 fn test_git_colocation_enable_child_workspace_with_existing_git_dir() -> TestResult {
     let test_env = TestEnvironment::default();
