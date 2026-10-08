@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::sync::Once;
 
 use bstr::ByteSlice as _;
+use futures::AsyncReadExt as _;
 use itertools::Itertools as _;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::conflict_labels::ConflictLabels;
@@ -14,11 +16,8 @@ use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathComponent;
-use jj_lib::settings::UserSettings;
 use jj_lib::tree::Tree;
 use jj_lib::working_copy::WorkingCopyFreshness;
-use futures::AsyncReadExt as _;
-use jj_lib::backend::MergedTreeValueExt as _;
 use pollster::FutureExt as _;
 use test_case::test_case;
 use testutils::TestRepo;
@@ -270,8 +269,7 @@ fn test_gitattr_filter_update() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -329,8 +327,7 @@ fn test_gitattr_filter_update_gitattributes_removed() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("hello.txt");
@@ -415,8 +412,7 @@ fn test_gitattr_filter_update_gitattributes_added() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("hello.txt");
@@ -482,8 +478,7 @@ fn test_gitattr_filter_disabled_by_settings() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -535,8 +530,7 @@ fn test_gitattr_filter_update_optional_filter_failed() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -588,8 +582,7 @@ fn test_gitattr_filter_update_required_filter_failed() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -669,8 +662,7 @@ fn test_gitattr_filter_snapshot() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -732,8 +724,7 @@ fn test_gitattr_filter_snapshot_optional_filter_failed() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");
@@ -798,8 +789,7 @@ fn test_gitattr_filter_snapshot_required_filter_failed() {
         )
         .expect("Failed to parse the settings"),
     );
-    let user_settings = UserSettings::from_config(config)
-        .expect("Failed to create the UserSettings from the config");
+    let user_settings = testutils::user_settings_from_config(config);
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &user_settings);
     let file_repo_path = repo_path("test-gitattr-filter-file");

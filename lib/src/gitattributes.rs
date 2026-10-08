@@ -335,6 +335,10 @@ struct GitAttributesNode {
     metadata_collection: gix_attributes::search::MetadataCollection,
 }
 
+/// A [`GitAttributesNode`] that is computed once, by whichever caller gets
+/// there first.
+type NodeCell = Arc<AsyncMutex<Option<Arc<GitAttributesNode>>>>;
+
 /// A cached, lazy query interface to query the states of given git attributes
 /// associated to a file.
 pub struct GitAttributes {
@@ -348,7 +352,7 @@ pub struct GitAttributes {
     /// [`GitAttributesNode`] object, and the cache key is the path to the
     /// folder, e.g., `foo`. This allows files under the same folder properly
     /// share the same cache entry.
-    node_cache: Mutex<HashMap<RepoPathBuf, Arc<AsyncMutex<Option<Arc<GitAttributesNode>>>>>>,
+    node_cache: Mutex<HashMap<RepoPathBuf, NodeCell>>,
     file_loaders: Box<[Arc<dyn FileLoader>]>,
 }
 
@@ -562,7 +566,7 @@ impl GitAttributes {
 
 #[cfg(test)]
 mod tests {
-        use std::pin::Pin;
+    use std::pin::Pin;
     use std::task::Poll;
 
     use futures::io::Cursor;

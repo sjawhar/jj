@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 
 use clap_complete::ArgValueCompleter;
@@ -22,6 +23,7 @@ use jj_lib::fsmonitor::FsmonitorSettings;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::local_working_copy::EolConversionMode;
 use jj_lib::local_working_copy::ExecChangeSetting;
+use jj_lib::local_working_copy::FilterSettings;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::matchers::EverythingMatcher;
@@ -121,6 +123,10 @@ pub(crate) async fn cmd_file_edit(
         eol_conversion_mode: EolConversionMode::None,
         exec_change_setting: ExecChangeSetting::Auto,
         fsmonitor_settings: FsmonitorSettings::None,
+        filter_settings: FilterSettings {
+            enabled: false,
+            drivers: HashMap::new(),
+        },
     };
     let mut tree_state = TreeState::init(
         repo.store().clone(),
@@ -157,7 +163,10 @@ pub(crate) async fn cmd_file_edit(
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size: u64::MAX,
         })
-        .await?;
+        .await
+        .map_err(|err| {
+            CommandError::from_snapshot_error(err, workspace_command.path_converter())
+        })?;
     let new_tree = tree_state.current_tree().clone();
 
     if new_tree.tree_ids() == commit.tree().tree_ids() {

@@ -2075,11 +2075,7 @@ impl FileSnapshotter<'_> {
             let (file, ignore_reason) = self
                 .tree_state
                 .filter_strategy
-                .convert_to_store(
-                    AllowStdIo::new(file),
-                    repo_path,
-                    self.git_attributes,
-                )
+                .convert_to_store(AllowStdIo::new(file), repo_path, self.git_attributes)
                 .await
                 .map_err(|err| SnapshotError::Other {
                     message: "Failed to use the filter to convert the contents.".to_string(),

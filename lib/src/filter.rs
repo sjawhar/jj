@@ -30,10 +30,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bstr::BString;
 use bstr::ByteSlice as _;
-use itertools::Itertools as _;
 use futures::AsyncRead;
-use futures::io::Cursor;
 use futures::AsyncReadExt as _;
+use futures::io::Cursor;
+use itertools::Itertools as _;
 
 use crate::command_config::CommandNameAndArgs;
 use crate::config::ConfigGetError;
