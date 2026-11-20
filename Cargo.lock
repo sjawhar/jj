@@ -1380,9 +1380,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1449,6 +1451,7 @@ dependencies = [
  "bstr",
  "gix-date",
  "gix-error",
+ "serde",
 ]
 
 [[package]]
@@ -1555,6 +1558,7 @@ dependencies = [
  "gix-error",
  "itoa",
  "jiff",
+ "serde",
 ]
 
 [[package]]
@@ -1564,6 +1568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "939aee7bbc9f233de858839e865c82886e0baceb8f1fe792ea1703fa895f09e1"
 dependencies = [
  "bstr",
+ "getrandom 0.4.3",
  "gix-attributes",
  "gix-command",
  "gix-error",
@@ -1700,6 +1705,7 @@ dependencies = [
  "faster-hex",
  "gix-error",
  "gix-features",
+ "serde",
  "sha1dc",
  "sha2 0.11.0",
 ]
@@ -1818,6 +1824,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "itoa",
+ "serde",
  "smallvec",
 ]
 
@@ -1846,20 +1853,28 @@ dependencies = [
 [[package]]
 name = "gix-pack"
 version = "0.75.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0451a48faef8e0e7a8f6d903c8329c7d18a793b3030907ca841f889dc695d1df"
 dependencies = [
+ "bstr",
  "clru",
+ "criterion",
  "crossbeam-deque",
+ "document-features",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-features",
  "gix-hash",
  "gix-hashtable",
  "gix-object",
  "gix-path",
+ "gix-tempfile",
+ "gix-traverse",
  "gix-zlib",
+ "insta",
+ "maplit",
  "memmap2",
+ "parking_lot",
+ "serde",
  "smallvec",
  "uluru",
 ]
@@ -2214,6 +2229,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44a1a9c82ec5b712082566cbef8f5782472a0d3973132911e5a83380a5298fe2"
 dependencies = [
  "gix-error",
+ "serde",
  "zlib-rs",
 ]
 

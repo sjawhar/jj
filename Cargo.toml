@@ -10,6 +10,7 @@ members = [
     "lib",
     "lib/gen-protos",
     "lib/testutils",
+    "vendor/gix-pack",
 ]
 
 [workspace.package]
@@ -196,6 +197,18 @@ codegen-units = 1
 debug = "line-tables-only"
 opt-level = 3
 
+[profile.dev.package.gix-pack]
+# gix-pack is a member of this workspace, since this tree carries it, so the
+# setting for all dependencies above does not reach it.
+codegen-units = 1
+debug = "line-tables-only"
+opt-level = 3
+
 [profile.release]
 strip = "debuginfo"
 codegen-units = 1
+
+# gix-pack as published on crates.io, carried in this tree so that its pack
+# and index mappings can be changed here.
+[patch.crates-io]
+gix-pack = { path = "vendor/gix-pack" }
