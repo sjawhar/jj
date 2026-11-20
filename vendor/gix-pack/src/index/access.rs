@@ -33,43 +33,23 @@ where
 {
     fn iter_v1(&self) -> impl Iterator<Item = Entry> + '_ {
         match self.version {
-            index::Version::V1 => self.data[V1_HEADER_SIZE..]
-                .chunks_exact(N32_SIZE + self.hash_len)
-                .take(self.num_objects as usize)
-                .map(|c| {
-                    let (ofs, oid) = c.split_at(N32_SIZE);
-                    Entry {
-                        oid: gix_hash::ObjectId::from_bytes_or_panic(oid),
-                        pack_offset: u64::from(crate::read_u32(ofs)),
-                        crc32: None,
-                    }
-                }),
+            // Patched in this tree: built on the accessors, which mark what they read.
+            index::Version::V1 => (0..self.num_objects).map(|index| Entry {
+                oid: self.oid_at_index(index).to_owned(),
+                pack_offset: self.pack_offset_at_index(index),
+                crc32: None,
+            }),
             _ => panic!("Cannot use iter_v1() on index of type {:?}", self.version),
         }
     }
 
     fn iter_v2(&self) -> impl Iterator<Item = Entry> + '_ {
-        let pack64_offset = self.offset_pack_offset64_v2();
-        let oids = self.data[V2_HEADER_SIZE..]
-            .chunks_exact(self.hash_len)
-            .take(self.num_objects as usize);
-        let crcs = self.data[self.offset_crc32_v2()..]
-            .as_chunks::<N32_SIZE>()
-            .0
-            .iter()
-            .take(self.num_objects as usize);
-        let offsets = self.data[self.offset_pack_offset_v2()..]
-            .as_chunks::<N32_SIZE>()
-            .0
-            .iter()
-            .take(self.num_objects as usize);
-        assert_eq!(oids.len(), crcs.len());
-        assert_eq!(crcs.len(), offsets.len());
         match self.version {
-            index::Version::V2 => izip!(oids, crcs, offsets).map(move |(oid, crc32, ofs32)| Entry {
-                oid: gix_hash::ObjectId::from_bytes_or_panic(oid),
-                pack_offset: self.pack_offset_from_offset_v2(ofs32, pack64_offset),
-                crc32: Some(crate::read_u32(crc32)),
+            // Patched in this tree: built on the accessors, which mark what they read.
+            index::Version::V2 => (0..self.num_objects).map(|index| Entry {
+                oid: self.oid_at_index(index).to_owned(),
+                pack_offset: self.pack_offset_at_index(index),
+                crc32: self.crc32_at_index(index),
             }),
             _ => panic!("Cannot use iter_v2() on index of type {:?}", self.version),
         }
@@ -87,7 +67,7 @@ where
             index::Version::V2 => V2_HEADER_SIZE + index * self.hash_len,
             index::Version::V1 => V1_HEADER_SIZE + index * (N32_SIZE + self.hash_len) + N32_SIZE,
         };
-        gix_hash::oid::from_bytes_unchecked(&self.data[start..][..self.hash_len])
+        gix_hash::oid::from_bytes_unchecked(self.data.slice(start..start + self.hash_len))
     }
 
     /// Returns the offset into our pack data file at which to start reading the object at `index`.
@@ -100,11 +80,11 @@ where
         match self.version {
             index::Version::V2 => {
                 let start = self.offset_pack_offset_v2() + index * N32_SIZE;
-                self.pack_offset_from_offset_v2(&self.data[start..][..N32_SIZE], self.offset_pack_offset64_v2())
+                self.pack_offset_from_offset_v2(self.data.slice(start..start + N32_SIZE), self.offset_pack_offset64_v2())
             }
             index::Version::V1 => {
                 let start = V1_HEADER_SIZE + index * (N32_SIZE + self.hash_len);
-                u64::from(crate::read_u32(&self.data[start..][..N32_SIZE]))
+                u64::from(crate::read_u32(self.data.slice(start..start + N32_SIZE)))
             }
         }
     }
@@ -120,7 +100,7 @@ where
         match self.version {
             index::Version::V2 => {
                 let start = self.offset_crc32_v2() + index * N32_SIZE;
-                Some(crate::read_u32(&self.data[start..start + N32_SIZE]))
+                Some(crate::read_u32(self.data.slice(start..start + N32_SIZE)))
             }
             index::Version::V1 => None,
         }
@@ -172,19 +152,10 @@ where
     pub fn sorted_offsets(&self) -> Vec<data::Offset> {
         let mut ofs: Vec<_> = match self.version {
             index::Version::V1 => self.iter().map(|e| e.pack_offset).collect(),
-            index::Version::V2 => {
-                let offset32_start = &self.data[self.offset_pack_offset_v2()..];
-                let offsets32 = offset32_start
-                    .as_chunks::<N32_SIZE>()
-                    .0
-                    .iter()
-                    .take(self.num_objects as usize);
-                assert_eq!(self.num_objects as usize, offsets32.len());
-                let pack_offset_64_start = self.offset_pack_offset64_v2();
-                offsets32
-                    .map(|offset| self.pack_offset_from_offset_v2(offset, pack_offset_64_start))
-                    .collect()
-            }
+            // Patched in this tree: built on the accessor, which marks what it reads.
+            index::Version::V2 => (0..self.num_objects)
+                .map(|index| self.pack_offset_at_index(index))
+                .collect(),
         };
         ofs.sort_unstable();
         ofs
@@ -211,7 +182,7 @@ where
         let ofs32 = crate::read_u32(offset);
         if (ofs32 & N32_HIGH_BIT) == N32_HIGH_BIT {
             let from = pack64_offset + (ofs32 ^ N32_HIGH_BIT) as usize * N64_SIZE;
-            crate::read_u64(&self.data[from..][..N64_SIZE])
+            crate::read_u64(self.data.slice(from..from + N64_SIZE))
         } else {
             u64::from(ofs32)
         }

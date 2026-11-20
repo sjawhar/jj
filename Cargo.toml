@@ -8,6 +8,7 @@ members = [
     "core/proc-macros",
     "dsl",
     "lib",
+    "lib/chunked-mmap",
     "lib/gen-protos",
     "lib/testutils",
     "vendor/gix-pack",
@@ -84,6 +85,7 @@ jsonschema = { version = "0.58.2", default-features = false }
 libc = { version = "0.2.186" }
 maplit = "1.0.2"
 memchr = "2.8.2"
+memmap2 = "0.9.11"
 # no_thp due to perf issues with kernel page compaction, see #9708
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 nix = "0.31.3"

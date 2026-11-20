@@ -24,15 +24,55 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 #![allow(clippy::all, clippy::pedantic)]
 
-use std::{borrow::Cow, ops::Deref, path::Path};
+use std::{borrow::Cow, ops::Range, path::Path};
 
 /// The default memory-backed storage for pack data and index files.
-pub use memmap2::Mmap as MMap;
+///
+/// Patched in this tree: on Linux, it maps each file in chunks that the process keeps resident up to a budget, and on
+/// other targets it is memmap2's one mapping of the file.
+pub use chunked_mmap::Mmap as MMap;
 
 /// A byte-oriented backing store for pack data and indices.
-pub trait FileData: Deref<Target = [u8]> {}
+///
+/// Patched in this tree: its bytes are reached only through [`FileData::slice()`] and [`FileData::read_from()`],
+/// which tell a chunked [`MMap`] which bytes a read consumed, so that the process keeps resident only the chunks
+/// read most recently. A read that bypasses them does not compile.
+pub trait FileData {
+    /// The number of bytes.
+    fn len(&self) -> usize;
 
-impl<T> FileData for T where T: Deref<Target = [u8]> {}
+    /// Returns the bytes of `range`, marked as read.
+    ///
+    /// # Panics
+    ///
+    /// If `range` is out of bounds.
+    fn slice(&self, range: Range<usize>) -> &[u8];
+
+    /// Lends the bytes from `start` to the end to `read`, which returns its result and how many bytes from `start`
+    /// it consumed, and marks those as read.
+    ///
+    /// # Panics
+    ///
+    /// If `start` is out of bounds.
+    fn read_from<R>(&self, start: usize, read: impl FnOnce(&[u8]) -> (R, usize)) -> R;
+}
+
+impl FileData for MMap {
+    #[inline]
+    fn len(&self) -> usize {
+        MMap::len(self)
+    }
+
+    #[inline]
+    fn slice(&self, range: Range<usize>) -> &[u8] {
+        MMap::slice(self, range)
+    }
+
+    #[inline]
+    fn read_from<R>(&self, start: usize, read: impl FnOnce(&[u8]) -> (R, usize)) -> R {
+        MMap::read_from(self, start, read)
+    }
+}
 
 ///
 #[cfg_attr(rustfmt, rustfmt::skip)]
@@ -79,13 +119,9 @@ pub mod testing;
 mod mmap {
     use std::path::Path;
 
-    pub fn read_only(path: &Path) -> std::io::Result<memmap2::Mmap> {
-        let file = std::fs::File::open(path)?;
-        // SAFETY: we have to take the risk of somebody changing the file underneath. Git never writes into the same file.
-        #[expect(unsafe_code)]
-        unsafe {
-            memmap2::MmapOptions::new().map_copy_read_only(&file)
-        }
+    /// Patched in this tree: maps the file at `path` with [`chunked_mmap::Mmap`].
+    pub fn read_only(path: &Path) -> std::io::Result<crate::MMap> {
+        chunked_mmap::Mmap::open(path)
     }
 }
 

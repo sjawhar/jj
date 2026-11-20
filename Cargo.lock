@@ -411,6 +411,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chunked-mmap"
+version = "0.46.0"
+dependencies = [
+ "libc",
+ "memmap2",
+ "tempfile",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1855,6 +1864,7 @@ name = "gix-pack"
 version = "0.75.0"
 dependencies = [
  "bstr",
+ "chunked-mmap",
  "clru",
  "criterion",
  "crossbeam-deque",
@@ -1876,6 +1886,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "tempfile",
  "uluru",
 ]
 

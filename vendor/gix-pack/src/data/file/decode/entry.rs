@@ -116,8 +116,12 @@ where
             );
         }
 
-        let object_data = &self.data[pack_offset..];
-        data::Entry::from_bytes(object_data, offset, self.object_hash)
+        // Patched in this tree: marks the header that `Entry::from_bytes()` read.
+        self.data.read_from(pack_offset, |object_data| {
+            let entry = data::Entry::from_bytes(object_data, offset, self.object_hash);
+            let consumed = entry.as_ref().map_or(0, data::Entry::header_size);
+            (entry, consumed)
+        })
     }
 
     /// Decompress the object expected at the given data offset, sans pack header. This information is only
@@ -179,8 +183,13 @@ where
         }
 
         inflate.reset();
-        inflate
-            .once(&self.data[offset..], out)
+        // Patched in this tree: marks the compressed bytes that inflate consumed.
+        self.data
+            .read_from(offset, |compressed| {
+                let result = inflate.once(compressed, out);
+                let consumed = result.as_ref().map_or(0, |&(_, consumed_in, _)| consumed_in);
+                (result, consumed)
+            })
             .or_raise_erased(|| message("Failed to decompress pack entry"))
     }
 
@@ -426,7 +435,7 @@ where
 
         // From oldest to most recent, apply all deltas, swapping the buffer back and forth
         // TODO: once we have more tests, we could optimize this memory-intensive work to
-        //       analyse the delta-chains to only copy data once - after all, with 'copy-from-base' deltas,
+        //       analyse the delta-chains to only copy data once - after all, with 'copy-from-base' deltas, (codespell:ignore analyse)
         //       all data originates from one base at some point.
         // `out` is: [source-buffer][target-buffer][max-delta-instructions-buffer]
         let (buffers, instructions) = out.split_at_mut(second_buffer_end);

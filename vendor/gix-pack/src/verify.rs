@@ -12,9 +12,12 @@ pub fn fan(data: &[u32]) -> Option<usize> {
 
 /// Calculate the hash of the given kind by trying to read the file from disk at `data_path` or falling back on the mapped content in `data`.
 /// `Ok(expected)` is returned if the hash matches, otherwise the error is classified as corruption.
+///
+/// Patched in this tree: the mapped content is hashed one chunk of [`chunked_mmap::CHUNK_SIZE`] at a time, so each piece
+/// is marked as it is read.
 pub fn checksum_on_disk_or_mmap(
     data_path: &Path,
-    data: &[u8],
+    data: &impl crate::FileData,
     expected: gix_hash::ObjectId,
     object_hash: gix_hash::Kind,
     progress: &mut dyn Progress,
@@ -36,7 +39,10 @@ pub fn checksum_on_disk_or_mmap(
             Some(_) => {
                 let start = std::time::Instant::now();
                 let mut hasher = gix_hash::hasher(object_hash);
-                hasher.update(&data[..data_len_without_trailer]);
+                for piece in (0..data_len_without_trailer).step_by(chunked_mmap::CHUNK_SIZE) {
+                    let end = (piece + chunked_mmap::CHUNK_SIZE).min(data_len_without_trailer);
+                    hasher.update(data.slice(piece..end));
+                }
                 progress.inc_by(data_len_without_trailer);
                 progress.show_throughput(start);
                 hasher

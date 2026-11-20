@@ -51,7 +51,8 @@ where
         }
 
         let (version, object_hash, num_chunks, num_indices) = {
-            let (signature, data) = data.split_at(4);
+            let header = data.slice(0..Self::HEADER_LEN);
+            let (signature, data) = header.split_at(4);
             if signature != Self::SIGNATURE {
                 return Err(corrupt("Invalid signature"));
             }
@@ -79,18 +80,25 @@ where
             (version, object_hash, num_chunks, num_indices)
         };
 
-        let chunks = gix_chunk::file::Index::from_bytes(&data, Self::HEADER_LEN, u32::from(num_chunks))
+        // Patched in this tree: the table of contents is decoded where it lies in the file, which marks only its bytes.
+        let toc_end = Self::HEADER_LEN + gix_chunk::file::Index::size_for_entries(num_chunks.into());
+        let chunks = data
+            .read_from(0, |bytes| {
+                let toc = gix_chunk::file::Index::from_bytes(bytes, Self::HEADER_LEN, u32::from(num_chunks));
+                (toc, toc_end.min(bytes.len()))
+            })
             .or_raise_erased(|| gix_error::corruption("Could not decode multi-index chunk table"))?;
 
         let index_names = chunks
-            .data_by_id(&data, chunk::index_names::ID)
+            .usize_offset_by_id(chunk::index_names::ID)
             .or_raise_erased(|| gix_error::corruption("Could not read multi-index pack names"))?;
-        let index_names = chunk::index_names::from_bytes(index_names, num_indices, alloc_limit_bytes).or_erased()?;
+        let index_names =
+            chunk::index_names::from_bytes(data.slice(index_names), num_indices, alloc_limit_bytes).or_erased()?;
 
         let fan = chunks
-            .data_by_id(&data, chunk::fanout::ID)
+            .usize_offset_by_id(chunk::fanout::ID)
             .or_raise_erased(|| gix_error::corruption("Could not read multi-index fan"))?;
-        let fan = chunk::fanout::from_bytes(fan)
+        let fan = chunk::fanout::from_bytes(data.slice(fan))
             .ok_or_else(|| corrupt("The multi-index fan doesn't have the correct size of 256 * 4 bytes"))?;
         let num_objects = fan[255];
         validate_fan(&fan)?;
@@ -121,8 +129,8 @@ where
             .transpose()?;
 
         let checksum_offset = chunks.highest_offset() as usize;
-        let trailer = &data[checksum_offset..];
-        if trailer.len() != object_hash.len_in_bytes() {
+        // Patched in this tree: only the trailer's length is needed here, so no byte of it is read.
+        if data.len() - checksum_offset != object_hash.len_in_bytes() {
             return Err(corrupt(
                 "Trailing checksum didn't have the expected size or there were unknown bytes after the checksum.",
             ));

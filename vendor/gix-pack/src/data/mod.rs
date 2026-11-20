@@ -135,7 +135,7 @@ where
     pub fn entry_slice(&self, slice: EntryRange) -> Option<&[u8]> {
         let entry_end: usize = slice.end.try_into().expect("end of pack fits into usize");
         let entry_start = slice.start as usize;
-        self.data.get(entry_start..entry_end)
+        (entry_start <= entry_end && entry_end <= self.data.len()).then(|| self.data.slice(entry_start..entry_end))
     }
 
     /// Returns the CRC32 of the pack data indicated by `pack_offset` and the `size` of the mapped data.
@@ -148,7 +148,7 @@ where
     /// If `pack_offset` or `size` are pointing to a range outside of the mapped pack data.
     pub fn entry_crc32(&self, pack_offset: Offset, size: usize) -> u32 {
         let pack_offset: usize = pack_offset.try_into().expect("pack_size fits into usize");
-        gix_features::hash::crc32(&self.data[pack_offset..pack_offset + size])
+        gix_features::hash::crc32(self.data.slice(pack_offset..pack_offset + size))
     }
 }
 

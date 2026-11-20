@@ -54,7 +54,8 @@ where
     ///
     /// It can be used to validate it didn't change after creation.
     pub fn checksum(&self) -> gix_hash::ObjectId {
-        gix_hash::ObjectId::from_bytes_or_panic(&self.data[self.data.len() - self.hash_len..])
+        let len = self.data.len();
+        gix_hash::ObjectId::from_bytes_or_panic(self.data.slice(len - self.hash_len..len))
     }
     /// Return all names of index files (`*.idx`) whose objects we contain.
     ///
@@ -73,7 +74,7 @@ where
         debug_assert!(index < self.num_objects, "index out of bounds");
         let index: usize = index as usize;
         let start = self.lookup_ofs + index * self.hash_len;
-        gix_hash::oid::from_bytes_unchecked(&self.data[start..][..self.hash_len])
+        gix_hash::oid::from_bytes_unchecked(self.data.slice(start..start + self.hash_len))
     }
 
     /// Given a `prefix`, find an object that matches it uniquely within this index and return `Some(Ok(entry_index))`.
@@ -117,15 +118,16 @@ where
 
         const HIGH_BIT: u32 = 1 << 31;
 
-        let pack_index = crate::read_u32(&self.data[start..][..4]);
-        let offset = &self.data[start + 4..][..4];
+        let entry = self.data.slice(start..start + OFFSET_ENTRY_SIZE);
+        let pack_index = crate::read_u32(&entry[..4]);
+        let offset = &entry[4..];
         let ofs32 = crate::read_u32(offset);
         let pack_offset = if (ofs32 & HIGH_BIT) == HIGH_BIT {
             // We determine if large offsets are actually larger than 4GB and if not, we don't use the high-bit to signal anything
             // but allow the presence of the large-offset chunk to signal what's happening.
             if let Some(offsets_64) = self.large_offsets_ofs {
                 let from = offsets_64 + (ofs32 ^ HIGH_BIT) as usize * 8;
-                crate::read_u64(&self.data[from..][..8])
+                crate::read_u64(self.data.slice(from..from + 8))
             } else {
                 u64::from(ofs32)
             }

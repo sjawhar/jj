@@ -86,6 +86,12 @@ doctest = false
 test = false
 bench = false
 
+# Patched in this tree: the tests of this crate's reads through jj's chunked
+# mapping.
+[[test]]
+name = "chunked_mapping"
+path = "tests/chunked_mapping.rs"
+
 [dependencies.clru]
 version = "0.6.1"
 optional = true
@@ -136,8 +142,11 @@ optional = true
 [dependencies.gix-zlib]
 version = "^0.2.0"
 
-[dependencies.memmap2]
-version = "0.9.11"
+# Patched in this tree: `mmap::read_only` maps packs and indexes with jj's own
+# crate, in chunks on Linux and with memmap2 elsewhere. It is named by path
+# alone, since jj's release build rewrites versions in jj's root Cargo.toml only.
+[dependencies.chunked-mmap]
+path = "../../lib/chunked-mmap"
 
 [dependencies.parking_lot]
 version = "0.12.4"
@@ -170,6 +179,16 @@ version = "1.46.3"
 
 [dev-dependencies.maplit]
 version = "1.0.2"
+
+[dev-dependencies.gix-hash]
+version = "^0.27.0"
+features = ["sha1"]
+
+[dev-dependencies.memmap2]
+version = "0.9.11"
+
+[dev-dependencies.tempfile]
+version = "3.27.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.gix-tempfile]
 version = "^25.0.0"

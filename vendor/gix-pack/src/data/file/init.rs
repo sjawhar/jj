@@ -44,7 +44,7 @@ where
             .raise_erased());
         }
         let (kind, num_objects) = data::header::decode(
-            &data[..data::header::SIZE]
+            data.slice(0..data::header::SIZE)
                 .try_into()
                 .expect("enough data after previous check"),
         )?;

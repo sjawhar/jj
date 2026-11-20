@@ -46,13 +46,15 @@ where
                 "Pack index of size {idx_len} is too small for even an empty index"
             )));
         }
+        // Patched in this tree: the header and the fan-out table, which is where they end in version 2.
+        let header = data.slice(0..V2_SIGNATURE.len() + N32_SIZE + FAN_LEN * N32_SIZE);
         let (kind, fan, num_objects) = {
             let (kind, d) = {
-                let (sig, d) = data.split_at(V2_SIGNATURE.len());
+                let (sig, d) = header.split_at(V2_SIGNATURE.len());
                 if sig == V2_SIGNATURE {
                     (Version::V2, d)
                 } else {
-                    (Version::V1, &data[..])
+                    (Version::V1, header)
                 }
             };
             let d = {
@@ -106,7 +108,7 @@ fn validate_fan(fan: &[u32; FAN_LEN]) -> ExnResult {
     Ok(())
 }
 
-fn validate_size(data: &[u8], kind: Version, num_objects: u32, hash_len: usize) -> ExnResult {
+fn validate_size<T: crate::FileData>(data: &T, kind: Version, num_objects: u32, hash_len: usize) -> ExnResult {
     let num_objects = num_objects as usize;
     let footer_size = hash_len * 2;
     let expected_size = match kind {
@@ -137,7 +139,8 @@ fn validate_size(data: &[u8], kind: Version, num_objects: u32, hash_len: usize) 
                     num_objects
                 )));
             }
-            let (large_offsets, max_large_offset_index) = data[offset32_start..offset32_end]
+            let (large_offsets, max_large_offset_index) = data
+                .slice(offset32_start..offset32_end)
                 .as_chunks::<N32_SIZE>()
                 .0
                 .iter()
