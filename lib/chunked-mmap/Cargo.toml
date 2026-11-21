@@ -1,0 +1,21 @@
+[package]
+name = "chunked-mmap"
+description = "Read-only file mappings made of chunks that a process keeps resident up to a budget"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+memmap2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

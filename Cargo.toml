@@ -8,8 +8,10 @@ members = [
     "core/proc-macros",
     "dsl",
     "lib",
+    "lib/chunked-mmap",
     "lib/gen-protos",
     "lib/testutils",
+    "vendor/gix-pack",
 ]
 
 [workspace.package]
@@ -83,6 +85,7 @@ jsonschema = { version = "0.58.2", default-features = false }
 libc = { version = "0.2.186" }
 maplit = "1.0.2"
 memchr = "2.8.2"
+memmap2 = "0.9.11"
 # no_thp due to perf issues with kernel page compaction, see #9708
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 nix = "0.31.3"
@@ -196,6 +199,18 @@ codegen-units = 1
 debug = "line-tables-only"
 opt-level = 3
 
+[profile.dev.package.gix-pack]
+# gix-pack is a member of this workspace, since this tree carries it, so the
+# setting for all dependencies above does not reach it.
+codegen-units = 1
+debug = "line-tables-only"
+opt-level = 3
+
 [profile.release]
 strip = "debuginfo"
 codegen-units = 1
+
+# gix-pack as published on crates.io, carried in this tree so that its pack
+# and index mappings can be changed here.
+[patch.crates-io]
+gix-pack = { path = "vendor/gix-pack" }
