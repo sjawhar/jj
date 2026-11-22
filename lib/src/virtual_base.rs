@@ -231,11 +231,12 @@ pub(crate) async fn stored_virtual_base_terms(
 /// lines that only VB holds, which jj shows only in the conflict's base, is
 /// not made. The changes are then made to V's terms by region (see
 /// [`edited_terms`]); for M, an insertion before or after its block goes into
-/// each term of text, an absent one read as empty, and a term that is not text
-/// is left as it is (see [`edited_m_terms`]). The file is the VB or M of the
-/// edited terms, or their text where they resolve. Where the new hunks do not
-/// match the old ones, or no change can be made, the base stays `old_id`: a
-/// snapshot never writes a plain file that holds VB's or M's marker lines.
+/// each file term, binary ones too, an absent one read as empty, and a term
+/// that is not a file is left as it is (see [`edited_m_terms`]). The file is
+/// the VB or M of the edited terms, or their text where they resolve. Where
+/// the new hunks do not match the old ones, or no change can be made, the base
+/// stays `old_id`: a snapshot never writes a plain file that holds VB's or M's
+/// marker lines.
 pub(crate) async fn rewrite_virtual_base(
     store: &Store,
     path: &RepoPath,
@@ -801,11 +802,13 @@ fn term_offset(segments: &[Segment<'_>], point: usize, term: usize) -> usize {
         .map_or(0, |segment| segment.hunk.ranges[term].end)
 }
 
-/// The texts of V's terms, `terms` with the contents `contents`, with
+/// The contents of V's terms, `terms` with the contents `contents`, with
 /// `edits`, changes to M, `m`, made: an insertion before or after M's block
-/// goes into each term of text, at its start or its end, an absent term read
-/// as empty; a term that is not text is left as it is, and no other change is
-/// made, as M holds none of V's text.
+/// goes into each file term, at its start or its end, as jj's line merge,
+/// which splits any content at newline bytes, makes it into a binary file
+/// too, an absent term read as empty; a term that is not a file (a symlink, a
+/// directory or a submodule) is left as it is, and no other change is made,
+/// as M holds none of V's text.
 fn edited_m_terms(
     m: &[u8],
     terms: &MergedTreeValue,
@@ -825,12 +828,7 @@ fn edited_m_terms(
     }
     zip(terms.iter(), contents.iter())
         .map(|(term, content)| {
-            let is_text = match term {
-                None => true,
-                Some(TreeValue::File { .. }) => !is_binary_content(content),
-                Some(_) => false,
-            };
-            if is_text {
+            if matches!(term, None | Some(TreeValue::File { .. })) {
                 [before.as_slice(), content.as_slice(), after.as_slice()].concat()
             } else {
                 content.as_slice().to_vec()
@@ -1271,10 +1269,12 @@ fn is_hex(hex: &[u8]) -> bool {
 /// Whether `terms`, the terms of V that a VB or M names, can be V's: the store
 /// holds each of them, and no side of V is itself VB or M, which no merge
 /// writes as a side. V's bases can be VB or M, once or more. A submodule's
-/// commit is not an object of the store, so it counts as held. A planted chain
-/// of files that each name the one before as a side is thus refused at its
-/// first link; one that names the one before as bases is bounded where a merge
-/// replaces the files (see `MergedTree::merge`).
+/// commit is not an object of the store, so it counts as held. The side rule
+/// is not recursive: a side counts as VB or M where its marker lines verify
+/// ([`virtual_base_terms`]), whether or not the terms it names would pass
+/// this check. A planted chain of files that each name the one before as a
+/// side is thus refused at its first link; one that names the one before as
+/// bases is bounded where a merge replaces the files (see `MergedTree::merge`).
 async fn holds_terms(
     store: &Store,
     path: &RepoPath,

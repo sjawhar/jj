@@ -2273,6 +2273,29 @@ fn x1_append_keeps_every_marker_line() -> TestResult {
     assert_no_marker_line(&merged)
 }
 
+/// X1-restore: X1's history, where P2 adds `Q` and `W` and d, the merge of P1
+/// and P2, adds `FIVE` too. d's `f` restored into P1, as `jj restore --from d
+/// --into P1 f` does, and d rebased: the merges of d's new parents and of its
+/// old ones enter as their terms, each with VB, so d holds `d + P1' - P1`
+/// with `P1' = d`, its own text, as jj 0.45.1 gives.
+#[test]
+fn x1_restore_into_p1_keeps_d() -> TestResult {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
+        Made::AFirst,
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
+    )?;
+    let d_text = "x1 Q x2 W 2 3 4 FIVE 6 7 8 9 10";
+    let d = case.commit(&[&p1, &p2], &[("f", lines(d_text))])?;
+    let merged = amend_and_rebase(case, &p1, &[("f", lines(d_text))], &d)?;
+    assert_resolved_text(&merged, &format!("{}\n", d_text.replace(' ', "\n")))
+}
+
 /// MD-append: A deletes `f` and B changes it, so the kept conflict's base is
 /// M; a line appended after the conflict, and u, which holds B's text with it,
 /// rebased onto s, which holds only the line: no term holds a marker line.
@@ -2451,7 +2474,15 @@ fn crafted_virtual_base(names: &str, sides: &[&[u8]]) -> Vec<u8> {
 
 /// A file value of `content` at `f`.
 fn file_value(case: &Case, content: &[u8]) -> TestResult<Option<TreeValue>> {
-    let id = case.store().write_file(f(), &mut &content[..]).block_on()?;
+    file_value_at(case, f(), content)
+}
+
+/// A file value of `content` at `path`.
+fn file_value_at(case: &Case, path: &RepoPath, content: &[u8]) -> TestResult<Option<TreeValue>> {
+    let id = case
+        .store()
+        .write_file(path, &mut &content[..])
+        .block_on()?;
     Ok(Some(TreeValue::File {
         id,
         executable: false,
@@ -2504,43 +2535,67 @@ fn planted_chain_of_virtual_bases_is_plain_text() -> TestResult {
     Ok(())
 }
 
-/// CH2: a planted chain of files that each pass as VB, file i naming
-/// `[leaf, file i-1, leaf, file i-1, leaf]`, `depth` deep over the plain file
-/// `leaf`, as `contrib/vb-chain.py base` writes it, so that a full replacement
-/// doubles at each level. o holds the top file, A and B hold `a` and `b`, m
-/// merges them, and d, its child, resolves the conflict to `c`. Returns the
-/// history and d rebased onto A, with the time the rebase took.
+/// CH2: at each of `chains`, a path and a depth, a planted chain of files that
+/// each pass as VB, file i naming `[leaf, file i-1, leaf, file i-1, leaf]`,
+/// that deep over the plain file `leaf`, as `contrib/vb-chain.py base` writes
+/// it, so that a full replacement doubles at each level. o holds each top
+/// file, A and B hold `a` and `b` at each path, m merges them, and d, its
+/// child, resolves each conflict to `c`. Returns the history and d rebased
+/// onto A, with the time the rebase took.
 fn base_chain_rebase(
-    depth: usize,
+    chains: &[(&'static str, usize)],
 ) -> TestResult<(Case, jj_lib::backend::BackendResult<Commit>, Duration)> {
     let mut case = Case::new();
-    let leaf = case.text("leaf");
-    let leaf_name = file_name(leaf.as_ref());
-    let mut top = leaf;
-    for _ in 0..depth {
-        let name = file_name(top.as_ref());
-        let names = format!("{leaf_name} {name} {leaf_name} {name} {leaf_name}");
-        top = file_value(&case, &crafted_virtual_base(&names, &[b"s\n"]))?;
+    let mut tops = vec![];
+    for &(path, depth) in chains {
+        let leaf = file_value_at(&case, repo_path(path), b"leaf\n")?;
+        let leaf_name = file_name(leaf.as_ref());
+        let mut top = leaf;
+        for _ in 0..depth {
+            let name = file_name(top.as_ref());
+            let names = format!("{leaf_name} {name} {leaf_name} {name} {leaf_name}");
+            let content = crafted_virtual_base(&names, &[b"s\n"]);
+            top = file_value_at(&case, repo_path(path), &content)?;
+        }
+        tops.push((repo_path_buf(path), resolved(top.as_ref())));
     }
-    assert!(virtual_base_terms(&case.read(top.as_ref()).unwrap()).is_some());
     let root = case.root();
-    let o =
-        case.commit_with_values(&[&root], vec![(repo_path_buf("f"), resolved(top.as_ref()))])?;
-    let a = case.commit(&[&o], &[("f", line("a"))])?;
-    let b = case.commit(&[&o], &[("f", line("b"))])?;
+    let o = case.commit_with_values(&[&root], tops)?;
+    let paths = chains.iter().map(|&(path, _)| path).collect_vec();
+    let writes = |text: &str| paths.iter().map(|&path| (path, line(text))).collect_vec();
+    let a = case.commit(&[&o], &writes("a"))?;
+    let b = case.commit(&[&o], &writes("b"))?;
     let m = case.commit(&[&a, &b], &[])?;
-    let d = case.commit(&[&m], &[("f", line("c"))])?;
+    let d = case.commit(&[&m], &writes("c"))?;
     let start = Instant::now();
     let result = rebase_commit(case.tx.repo_mut(), d, vec![a.id().clone()]).block_on();
     Ok((case, result, start.elapsed()))
 }
 
+/// Two chains of 13 levels at two paths, 8,191 replacements each: one alone
+/// is rewritten, but the bound counts the replacements of the whole merge, so
+/// the two together fail at the second path.
+#[test]
+fn planted_chains_at_two_paths_are_refused_together() -> TestResult {
+    let (_case, alone, _) = base_chain_rebase(&[("f", 13)])?;
+    assert!(alone.is_ok(), "expected one chain alone to be rewritten");
+    let (_case, result, _) = base_chain_rebase(&[("f", 13), ("g", 13)])?;
+    let Err(err) = result else {
+        panic!("expected the rebase to fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        "The merge at g names more than 10000 virtual bases"
+    );
+    Ok(())
+}
+
 /// CH2 twenty deep: a full replacement would replace 2^20 - 1 files, more than
-/// a merge replaces at one path, so the rebase fails at once, naming the path
+/// one merge replaces, so the rebase fails at once, naming the path
 /// and the bound.
 #[test]
 fn planted_chain_named_as_bases_is_refused() -> TestResult {
-    let (_case, result, elapsed) = base_chain_rebase(20)?;
+    let (_case, result, elapsed) = base_chain_rebase(&[("f", 20)])?;
     let Err(err) = result else {
         panic!("expected the rebase to fail");
     };
@@ -2559,7 +2614,7 @@ fn planted_chain_named_as_bases_is_refused() -> TestResult {
 /// d holds `[c, -b, leaf]`.
 #[test]
 fn planted_chain_named_as_bases_four_deep_is_replaced() -> TestResult {
-    let (case, result, _) = base_chain_rebase(4)?;
+    let (case, result, _) = base_chain_rebase(&[("f", 4)])?;
     let rebased = result?;
     let [b, c, leaf] = ["b", "c", "leaf"].map(|value| case.text(value));
     let value = value_at(&rebased.tree(), "f")?;
@@ -2707,10 +2762,11 @@ fn snapshot_of_an_append_after_m_edits_the_terms_of_v() -> TestResult {
 }
 
 /// K4 with binary files, whose conflict's base is M, with a line appended in
-/// the working copy: V's terms are not text, so they are left as they are and
-/// the base stays M; no side holds M's text.
+/// the working copy: jj's line merge splits binary content at newline bytes
+/// too, so the line goes at the end of each of V's file terms, and the base
+/// names `[x END, -o END, y END]`, binary; no side holds M's text.
 #[test]
-fn snapshot_of_an_append_after_a_binary_m_keeps_m() -> TestResult {
+fn snapshot_of_an_append_after_a_binary_m_edits_every_file_term() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
     } = two_bases(
@@ -2722,13 +2778,19 @@ fn snapshot_of_an_append_after_a_binary_m_keeps_m() -> TestResult {
         &[("f", binary("y"))],
     )?;
     let w = case.commit(&[&p1, &p2], &[])?;
-    let value = value_at(&w.tree(), "f")?.simplify();
     let edited = snapshot_edits(&case, &w, &[("", "END")])?.simplify();
     assert_no_side_marked(&case, &edited);
-    assert_eq!(
-        edited.removes().collect_vec(),
-        value.removes().collect_vec()
-    );
+    let removes = edited.removes().collect_vec();
+    let [base] = removes[..] else {
+        panic!("expected one base, got {}", describe(&case, &edited));
+    };
+    let content = case.read(base.as_ref()).expect("the base is a file");
+    let terms = virtual_base_terms(&content).expect("the base is VB or M");
+    let [x_end, o_end, y_end] = ["x", "o", "y"].map(|value| {
+        let content = [binary(value).unwrap(), b"END\n".to_vec()].concat();
+        case.file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(&case, &terms, &conflict(&[&x_end, &o_end, &y_end]));
     Ok(())
 }
 

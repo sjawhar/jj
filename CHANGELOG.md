@@ -94,7 +94,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   base of a conflict: where a later merge, such as a rebase, an abandon or a
   squash, would make one a side of a file's conflict, the merge uses the terms
   of the conflicts that every virtual merge base there stands for in their
-  place, and fails, naming the path, where they stand for more than 10,000.
+  place, and a rebase takes the merges of the old and the new parents there as
+  their terms, not as the text they resolve to. Such a merge fails, naming the
+  path, where the virtual merge bases stand for more than 10,000.
   Merge bases, and the parents of a merge of three or more commits, are
   merged in the order of their commit ids. This affects criss-cross histories,
   and merges whose base is itself conflicted.

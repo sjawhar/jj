@@ -99,6 +99,21 @@ pub async fn merge_commit_trees_no_resolve_without_repo(
     merge_trees_of_commits(store, index, commits, false).await
 }
 
+/// The merge of the trees of `parents`, as [`merge_commit_trees`] gives it,
+/// and, where they are two or more, the same merge left unresolved, which it
+/// is the resolution of (see `MergedTree::merge_with_unresolved`).
+async fn merge_parents(
+    repo: &dyn Repo,
+    parents: &[Commit],
+) -> BackendResult<(MergedTree, Option<MergedTree>)> {
+    if parents.len() < 2 {
+        return Ok((merge_commit_trees(repo, parents).await?, None));
+    }
+    let unresolved = merge_commit_trees_no_resolve(repo, parents).await?;
+    let resolved = unresolved.clone().resolve().await?;
+    Ok((resolved, Some(unresolved)))
+}
+
 /// The merge of the trees of `commits`, resolved if `resolve` is set.
 async fn merge_trees_of_commits(
     store: &Arc<Store>,
@@ -552,32 +567,38 @@ impl<'repo> CommitRewriter<'repo> {
             // We wouldn't need to resolve merge conflicts here if the
             // same-change rule is "keep". See 9d4a97381f30 "rewrite: don't
             // resolve intermediate parent tree when rebasing" for details.
-            let old_base_tree_fut = merge_commit_trees(self.mut_repo, &old_parents);
-            let new_base_tree_fut = merge_commit_trees(self.mut_repo, &new_parents);
+            // Each parents' merge also comes unresolved: at a path where the
+            // merge replaces a virtual merge base, it enters as its terms.
+            let old_base_fut = merge_parents(self.mut_repo, &old_parents);
+            let new_base_fut = merge_parents(self.mut_repo, &new_parents);
             let old_tree = self.old_commit.tree();
-            let (old_base_tree, new_base_tree) = try_join!(old_base_tree_fut, new_base_tree_fut)?;
+            let ((old_base_tree, old_unresolved), (new_base_tree, new_unresolved)) =
+                try_join!(old_base_fut, new_base_fut)?;
             (
                 old_base_tree.tree_ids() == self.old_commit.tree_ids(),
-                MergedTree::merge(Merge::from_vec(vec![
-                    (
-                        new_base_tree,
-                        format!(
-                            "{} (rebase destination)",
-                            conflict_label_for_commits(&new_parents)
+                MergedTree::merge_with_unresolved(
+                    Merge::from_vec(vec![
+                        (
+                            new_base_tree,
+                            format!(
+                                "{} (rebase destination)",
+                                conflict_label_for_commits(&new_parents)
+                            ),
                         ),
-                    ),
-                    (
-                        old_base_tree,
-                        format!(
-                            "{} (parents of rebased revision)",
-                            conflict_label_for_commits(&old_parents)
+                        (
+                            old_base_tree,
+                            format!(
+                                "{} (parents of rebased revision)",
+                                conflict_label_for_commits(&old_parents)
+                            ),
                         ),
-                    ),
-                    (
-                        old_tree,
-                        format!("{} (rebased revision)", self.old_commit.conflict_label()),
-                    ),
-                ]))
+                        (
+                            old_tree,
+                            format!("{} (rebased revision)", self.old_commit.conflict_label()),
+                        ),
+                    ]),
+                    &[new_unresolved, old_unresolved, None],
+                )
                 .await?,
             )
         };

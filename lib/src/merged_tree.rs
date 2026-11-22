@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::iter;
 use std::iter::zip;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -349,7 +350,20 @@ impl MergedTree {
     /// replaces every one at that path, sides and bases alike, with the terms
     /// of the conflict that it stands for.
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
-        Self::merge_with_overrides(merge, &[], true).await
+        Self::merge_with_overrides(merge, &[], &[], true).await
+    }
+
+    /// Merges the provided trees as [`Self::merge`] does, where each tree may
+    /// come with `unresolved`, the merge that it is the resolution of, such as
+    /// the merge of a commit's parents: at a path where the merge replaces a
+    /// virtual merge base, each such tree enters as the terms of its
+    /// unresolved merge there (each parent and the virtual merge base of their
+    /// merge bases), not as the value they resolve to.
+    pub(crate) async fn merge_with_unresolved(
+        merge: Merge<(Self, String)>,
+        unresolved: &[Option<Self>],
+    ) -> BackendResult<Self> {
+        Self::merge_with_overrides(merge, &[], unresolved, true).await
     }
 
     /// Merges the provided trees into a single `MergedTree`, without attempting
@@ -396,32 +410,61 @@ impl MergedTree {
     /// Merges the trees of `merge`, with `overrides` written over their terms,
     /// and resolves the result if `resolve` is set. Each override has one term
     /// for each term of the trees, in the order [`Self::merge_unsimplified`]
-    /// gives.
+    /// gives. `unresolved` holds, by index in `merge`, the unresolved merge
+    /// that a tree is the resolution of, if any.
     ///
     /// A virtual merge base, VB or M ([`crate::virtual_base`]), is only ever a
     /// base of a conflict, but a tree at a base of `merge` brings the bases of
     /// its conflicts into the merge as sides. At each path outside `overrides`
     /// where such a tree has a conflict, and where, once the merge's terms are
-    /// simplified, such a base is a side and is VB or M, every VB and M term
-    /// at that path, sides and bases alike, is replaced with the terms of V
-    /// that it names, inverted where it is a base, and so on for the VB and M
-    /// among those, until none is left. The terms then merge as the terms of
-    /// the merge bases' own conflicts would, whatever the order of `merge`. A
-    /// path where VB or M is only a base is merged as it is. The decision
-    /// reads the merge's terms and the files that may be VB or M, never merged
-    /// text. Each term that replaces a VB or M takes the label that it names
-    /// for that term, the label of the commit it comes from.
+    /// simplified, such a base is a side and is VB or M, each tree that comes
+    /// with its unresolved merge enters as the terms of that merge at the path,
+    /// and every VB and M term at that path, sides and bases alike, is
+    /// replaced with the terms of V that it names, inverted where it is a
+    /// base, and so on for the VB and M among those, until none is left. The
+    /// terms then merge as the terms of the merge bases' own conflicts would,
+    /// whatever the order of `merge`. A path where VB or M is only a base is
+    /// merged as it is. The decision reads the merge's terms and the files that
+    /// may be VB or M, never merged text. Each term that replaces a VB or M
+    /// takes the label that it names for that term, the label of the commit it
+    /// comes from.
     pub(crate) async fn merge_with_overrides(
         merge: Merge<(Self, String)>,
         overrides: &[(RepoPathBuf, MergedTreeValue)],
+        unresolved: &[Option<Self>],
         resolve: bool,
     ) -> BackendResult<Self> {
         let inverted_bases = inverted_bases(&merge, overrides)?;
+        let mut substitutes = vec![];
+        let mut start = 0;
+        for (index, (tree, label)) in merge.iter().enumerate() {
+            let end = start + tree.tree_ids().as_slice().len();
+            if let Some(Some(unresolved)) = unresolved.get(index) {
+                substitutes.push(Substitute {
+                    slots: start..end,
+                    tree: tree.clone(),
+                    unresolved,
+                    label: label.clone(),
+                });
+            }
+            start = end;
+        }
         let tree = Self::merge_unsimplified(merge);
         let mut expansions = vec![];
+        let mut replacements = 0;
         for (path, candidates) in inverted_bases {
             let terms = tree.term_values(&path).await?;
-            if let Some(expansion) = Expansion::new(tree.store(), &path, terms, candidates).await? {
+            let store = tree.store();
+            let expansion = Expansion::new(
+                store,
+                &path,
+                terms,
+                candidates,
+                &substitutes,
+                &mut replacements,
+            )
+            .await?;
+            if let Some(expansion) = expansion {
                 expansions.push((path, expansion));
             }
         }
@@ -481,12 +524,24 @@ type LabeledTerm = (Option<TreeValue>, String);
 /// The terms of V that a VB or M names, with their labels.
 type NamedTerms = (MergedTreeValue, Merge<String>);
 
-/// The most VB and M terms that a merge replaces at one path. A VB names at
-/// most one VB or M for each level of merge bases below it, so a rewrite of a
-/// history of 8,000 levels of merge bases, such as a braid, replaces 8,000; a
-/// planted set of files that name one another can stand for more, and the
-/// merge then fails rather than spend time and memory on them.
+/// The most VB and M terms that one merge replaces, across all its paths. A
+/// VB names at most one VB or M for each level of merge bases below it, so a
+/// rewrite of the top merge of a braid of 8,000 levels of merge bases replaces
+/// 7,999; a planted set of files that name one another can stand for more, at
+/// one path or at many, and the merge then fails, as a user error, rather than
+/// spend time and memory on them.
 const MAX_REPLACEMENTS: usize = 10_000;
+
+/// A tree of a merge that comes with the unresolved merge that it resolves
+/// (see [`MergedTree::merge_with_unresolved`]): the range of its terms among
+/// the merge's terms, the tree, and that unresolved merge, with the tree's
+/// label.
+struct Substitute<'a> {
+    slots: Range<usize>,
+    tree: MergedTree,
+    unresolved: &'a MergedTree,
+    label: String,
+}
 
 /// The terms of a merge at a path once every VB and M among them is replaced
 /// with the terms of V that it names (see [`MergedTree::merge_with_overrides`]):
@@ -530,13 +585,18 @@ impl Slot {
 impl Expansion {
     /// `terms` with every VB and M replaced, sides and bases alike, nested
     /// ones too, where a side that is one of `candidates` is VB or M once
-    /// `terms` are simplified; `None` where none is. Fails where the terms
-    /// stand for more than [`MAX_REPLACEMENTS`] VB and M.
+    /// `terms` are simplified; `None` where none is. Each of `substitutes`
+    /// first enters as the terms of its unresolved merge at `path` in place of
+    /// its own terms. Each VB and M replaced counts in `replacements`, the
+    /// count of the whole merge, which fails once it passes
+    /// [`MAX_REPLACEMENTS`].
     async fn new(
         store: &Store,
         path: &RepoPath,
         terms: MergedTreeValue,
         candidates: HashSet<TreeValue>,
+        substitutes: &[Substitute<'_>],
+        replacements: &mut usize,
     ) -> BackendResult<Option<Self>> {
         let mut named = HashMap::new();
         let mut side_is_virtual_base = false;
@@ -561,7 +621,35 @@ impl Expansion {
             expansion.set(Slot::Own(index), term);
             pending.push_back(Slot::Own(index));
         }
-        let mut replacements = 0;
+        // A substituted tree whose terms at `path` are those of its unresolved
+        // merge keeps them, with their places and labels. The terms of each
+        // other one are made absent first: they are one more of the tree's
+        // sign than of the other, so they leave one absent term of that sign,
+        // which the absent term that starts the unresolved merge's pairs
+        // cancels (see [`Self::replace`]). The tree's first term has the
+        // tree's sign, so the unresolved merge takes its place. No unresolved
+        // term can then cancel a term that is being replaced.
+        let mut entering = vec![];
+        for substitute in substitutes {
+            let own_terms = substitute.tree.term_values(path).await?;
+            let unresolved_terms = substitute.unresolved.term_values(path).await?;
+            if own_terms.simplify() != unresolved_terms.simplify() {
+                entering.push((substitute, unresolved_terms));
+            }
+        }
+        for (substitute, _) in &entering {
+            for index in substitute.slots.clone() {
+                expansion.set(Slot::Own(index), None);
+            }
+        }
+        for (substitute, unresolved_terms) in entering {
+            let labels = substitute
+                .unresolved
+                .labels_by_term(&substitute.label)
+                .map(|label| (*label).to_owned());
+            let first = Slot::Own(substitute.slots.start);
+            pending.extend(expansion.replace(first, unresolved_terms, labels));
+        }
         while let Some(slot) = pending.pop_front() {
             let Some(value) = expansion.term(slot).cloned() else {
                 continue;
@@ -569,12 +657,13 @@ impl Expansion {
             let Some((terms, labels)) = named_terms(store, path, &mut named, &value).await? else {
                 continue;
             };
-            replacements += 1;
-            if replacements > MAX_REPLACEMENTS {
+            *replacements += 1;
+            if *replacements > MAX_REPLACEMENTS {
+                // A user error: the merge's input, not the backend, is at fault.
                 let path = path.as_internal_file_string();
-                let message =
-                    format!("The merge at {path} names more than {MAX_REPLACEMENTS} virtual bases");
-                return Err(BackendError::Other(message.into()));
+                return Err(BackendError::Unsupported(format!(
+                    "The merge at {path} names more than {MAX_REPLACEMENTS} virtual bases"
+                )));
             }
             pending.extend(expansion.replace(slot, terms, labels));
         }
