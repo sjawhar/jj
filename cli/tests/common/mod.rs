@@ -73,3 +73,50 @@ pub fn create_commit_with_files(
         .run_jj(["bookmark", "create", "-r@", name])
         .success();
 }
+
+/// Makes a criss-cross history: "a" and "b" change "f" from "o" to "x" and to
+/// "y", and "p1" and "p2", two merges of "a" and "b", keep "x" and "y". The
+/// merge of "p1" and "p2" is a conflict whose base is the virtual merge base of
+/// "a" and "b".
+pub fn create_criss_cross_commits(work_dir: &TestWorkDir) {
+    create_commit_with_files(work_dir, "o", &[], &[("f", "o\n")]);
+    create_commit_with_files(work_dir, "a", &["o"], &[("f", "x\n")]);
+    create_commit_with_files(work_dir, "b", &["o"], &[("f", "y\n")]);
+    create_commit_with_files(work_dir, "p1", &["a", "b"], &[("f", "x\n")]);
+    create_commit_with_files(work_dir, "p2", &["a", "b"], &[("f", "y\n")]);
+}
+
+/// Asserts that no file that `revision` holds resolved has a line that opens a
+/// virtual merge base: that text is only ever the base of a conflict.
+pub fn assert_no_virtual_merge_base_text(work_dir: &TestWorkDir, revision: &str) {
+    let conflicts = work_dir.run_jj(["resolve", "--list", "-r", revision]);
+    let conflicted_paths: Vec<String> = if conflicts.status.success() {
+        conflicts
+            .stdout
+            .raw()
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![]
+    };
+    let files = work_dir.run_jj(["file", "list", "-r", revision]).success();
+    for path in files.stdout.raw().lines() {
+        if conflicted_paths.iter().any(|conflicted| conflicted == path) {
+            continue;
+        }
+        let content = work_dir
+            .run_jj(["file", "show", "-r", revision, path])
+            .success();
+        assert!(
+            !content
+                .stdout
+                .raw()
+                .lines()
+                .any(|line| line.starts_with("<<<<<<< jj virtual merge base")),
+            "{path} in {revision} holds a virtual merge base's text: {}",
+            content.stdout.raw()
+        );
+    }
+}

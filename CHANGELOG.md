@@ -89,9 +89,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sides that both changed it are merged against a virtual merge base built as
   Git builds one where that conflict is between text files, or give a conflict
   where it is not (for example, with a deletion or a binary file among its
-  sides). Merge bases, and the parents of a merge of three or more commits, are
-  merged in the order of their commit ids. This affects criss-cross histories,
-  and merges whose base is itself conflicted.
+  sides). A virtual merge base is only ever the base of a conflict: where a
+  later rebase, abandon or squash would leave it as a file's content, the file
+  stays conflicted. Merge bases, and the parents of a merge of three or more
+  commits, are merged in the order of their commit ids. This affects
+  criss-cross histories, and merges whose base is itself conflicted.
   [#6369](https://github.com/jj-vcs/jj/issues/6369)
 
 ## [0.46.0] - 2026-10-07

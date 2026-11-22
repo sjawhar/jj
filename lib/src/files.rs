@@ -306,6 +306,14 @@ pub fn try_merge<T: AsRef<[u8]>>(inputs: &Merge<T>, options: &MergeOptions) -> O
     merge_inner(inputs, options)
 }
 
+/// Whether `contents` is likely binary: whether its first 8,000 bytes hold a
+/// NUL byte. This is the same heuristic used by git as of writing:
+/// <https://github.com/git/git/blob/eea0e59ffbed6e33d171ace5be13cde9faa41639/xdiff-interface.c#L192-L198>
+pub(crate) fn is_binary_content(contents: &[u8]) -> bool {
+    const PEEK_SIZE: usize = 8000;
+    contents[..PEEK_SIZE.min(contents.len())].contains(&b'\0')
+}
+
 fn merge_inner<'input, T, B>(inputs: &'input Merge<T>, options: &MergeOptions) -> B
 where
     T: AsRef<[u8]>,

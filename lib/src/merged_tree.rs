@@ -52,6 +52,7 @@ use crate::matchers::Matcher;
 use crate::merge::Diff;
 use crate::merge::Merge;
 use crate::merge::MergeBuilder;
+use crate::merge_rule;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
@@ -336,13 +337,26 @@ impl MergedTree {
     /// conflict arises. However, if one of the input trees is already
     /// conflicted, the corresponding label will be ignored, and its existing
     /// labels will be used instead.
+    ///
+    /// A path whose resolved value would be a virtual merge base, which an
+    /// input tree can hold only as a term of a conflict, stays a conflict.
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
-        Self::merge_no_resolve(merge).resolve().await
+        merge_rule::merge_keeping_virtual_bases(merge, &[], true).await
     }
 
     /// Merges the provided trees into a single `MergedTree`, without attempting
     /// to resolve file conflicts.
     pub fn merge_no_resolve(merge: Merge<(Self, String)>) -> Self {
+        let tree = Self::merge_unsimplified(merge);
+        let (labels, tree_ids) = tree.labels.simplify_with(&tree.tree_ids);
+        Self::new(tree.store, tree_ids, labels)
+    }
+
+    /// The merge of the provided trees with each term of each tree kept, as
+    /// [`Self::merge_no_resolve`] builds it before it simplifies the terms:
+    /// the terms of the first tree, then those of the second, inverted, and so
+    /// on, each with its label.
+    pub(crate) fn merge_unsimplified(merge: Merge<(Self, String)>) -> Self {
         debug_assert!(
             merge
                 .iter()
@@ -359,9 +373,7 @@ impl MergedTree {
         let flattened_tree_ids: Merge<TreeId> = merge
             .into_map(|(tree, _label)| tree.into_tree_ids())
             .flatten();
-
-        let (labels, tree_ids) = flattened_labels.simplify_with(&flattened_tree_ids);
-        Self::new(store, tree_ids, labels)
+        Self::new(store, flattened_tree_ids, flattened_labels)
     }
 }
 

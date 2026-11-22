@@ -19,6 +19,9 @@ use testutils::TestResult;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
 use crate::common::fake_editor_path;
 
 #[test]
@@ -2578,6 +2581,28 @@ fn test_squash_with_editor_and_empty_message() -> TestResult {
     [EOF]
     ");
     Ok(())
+}
+
+#[test]
+fn test_squash_resolved_merge_into_a_parent_keeps_virtual_base_conflicted() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y", so its parent tree is a
+    // conflict whose base is the virtual merge base of "a" and "b". Squashing
+    // "d" into "p1" applies "d"'s change from that parent tree to "p1", which
+    // cancels every term but the virtual merge base: "f" stays a conflict.
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir
+        .run_jj(["squash", "--from", "d", "--into", "p1", "-u"])
+        .success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "p1"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "p1");
 }
 
 #[must_use]

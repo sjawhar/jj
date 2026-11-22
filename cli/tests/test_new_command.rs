@@ -331,11 +331,11 @@ fn test_new_merge_of_two_different_resolutions_conflicts() {
     <<<<<<<<<<< conflict 1 of 1
     %%%%%%%%%%% diff from: zsuskuln 4d032ef7 "a"
     \\\\\\\\\\\        to: vruxwmqv a902e1f4 "p1"
-    -<<<<<<< jj virtual merge base 48886e7b8a6d6138996f4c125a4b361a
+    -<<<<<<< jj virtual merge base bc644be6809c161606dd9a1ba5a047f1
      x
-    -======= 48886e7b8a6d6138996f4c125a4b361a
+    -======= bc644be6809c161606dd9a1ba5a047f1
     -y
-    ->>>>>>> 48886e7b8a6d6138996f4c125a4b361a
+    ->>>>>>> bc644be6809c161606dd9a1ba5a047f1
     +++++++++++ znkkpsqq 9ca67c80 "p2"
     y
     >>>>>>>>>>> conflict 1 of 1 ends

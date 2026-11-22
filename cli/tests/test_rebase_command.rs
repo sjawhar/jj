@@ -15,8 +15,10 @@
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::assert_no_virtual_merge_base_text;
 use crate::common::create_commit;
 use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
 
 #[test]
 fn test_rebase_invalid() {
@@ -3074,6 +3076,130 @@ fn test_rebase_simplify_parents() {
     ◆    zzzzzzzz  00000000
     [EOF]
     ");
+}
+
+#[test]
+fn test_rebase_merge_onto_one_parent_keeps_virtual_base_conflicted() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y", so its parent tree is a
+    // conflict whose base is the virtual merge base of "a" and "b". Rebasing
+    // "d" onto "p1" merges with that parent tree as the base, which cancels
+    // every term but the virtual merge base: "f" stays a conflict of "p1"'s
+    // "x" and "d"'s "y".
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "d", "-d", "p1"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    // "x" keeps the label of the rebase destination and "y" that of the rebased
+    // revision; the virtual merge base is the conflict's base.
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @r#"
+    <<<<<<<<<<< conflict 1 of 1
+    %%%%%%%%%%% diff from: znkkpsqq 6fe86de5 "p2"
+    \\\\\\\\\\\        to: vruxwmqv 6e354dd6 "p1" (rebase destination)
+    -<<<<<<< jj virtual merge base bc644be6809c161606dd9a1ba5a047f1
+     x
+    -======= bc644be6809c161606dd9a1ba5a047f1
+    -y
+    ->>>>>>> bc644be6809c161606dd9a1ba5a047f1
+    +++++++++++ kmkuslsw 9652d8e1 "d" (rebased revision)
+    y
+    >>>>>>>>>>> conflict 1 of 1 ends
+    [EOF]
+    "#);
+    assert_no_virtual_merge_base_text(&work_dir, "d");
+}
+
+#[test]
+fn test_rebase_sibling_of_a_conflicted_merge_keeps_virtual_base_conflicted() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "z" merges "p1" and "p2" and keeps their conflict; "c" and "q", children
+    // of "z", resolve it to "x" and to "y".
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
+    create_commit_with_files(&work_dir, "c", &["z"], &[("f", "x\n")]);
+    create_commit_with_files(&work_dir, "q", &["z"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "c");
+}
+
+#[test]
+fn test_rebase_sibling_of_a_conflicted_merge_with_a_deletion() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" deletes "f" and "b" changes it; "p1" and "p2", two merges of them,
+    // delete it and keep "y". "z", the merge of "p1" and "p2", holds a conflict
+    // whose base is a placeholder file, as the merge bases' conflict is not of
+    // text files. "c" and "q", children of "z", delete "f" and keep "y".
+    create_commit_with_files(&work_dir, "o", &[], &[("f", "o\n"), ("g", "g\n")]);
+    create_commit_deleting_f(&work_dir, "a", &["o"]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", "y\n")]);
+    create_commit_deleting_f(&work_dir, "p1", &["a", "b"]);
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", "y\n")]);
+    create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
+    create_commit_deleting_f(&work_dir, "c", &["z"]);
+    create_commit_with_files(&work_dir, "q", &["z"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
+    f    2-sided conflict including 1 deletion
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "c");
+}
+
+#[test]
+fn test_rebase_across_a_conflicted_parent_gives_its_base() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "m" is a conflicted merge of "a" and "b"; "c1", a child of "m", holds "b"
+    // and "c2" holds "a". Rebasing "c1" onto "c2" gives "o", the base of "m"'s
+    // conflict, with no conflict, as it did before virtual merge bases.
+    create_commit_with_files(&work_dir, "o", &[], &[("f", "o\n")]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", "a\n")]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", "b\n")]);
+    create_commit_with_files(&work_dir, "m", &["a", "b"], &[]);
+    create_commit_with_files(&work_dir, "c1", &["m"], &[("f", "b\n")]);
+    create_commit_with_files(&work_dir, "c2", &["m"], &[("f", "a\n")]);
+    work_dir
+        .run_jj(["rebase", "-r", "c1", "-d", "c2"])
+        .success();
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "c1", "f"]), @"
+    o
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c1"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+}
+
+/// Makes a commit named `name` with `parents` that deletes the file "f".
+fn create_commit_deleting_f(work_dir: &TestWorkDir, name: &str, parents: &[&str]) {
+    work_dir
+        .run_jj_with(|cmd| cmd.args(["new", "-m", name]).args(parents))
+        .success();
+    work_dir.remove_file("f");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", name])
+        .success();
 }
 
 #[must_use]
