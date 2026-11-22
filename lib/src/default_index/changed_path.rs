@@ -574,7 +574,9 @@ pub(super) async fn collect_changed_paths(
         return Ok(vec![]);
     }
     // Don't resolve the entire tree. It's cheaper to resolve each conflict file
-    // even if we have to visit all files.
+    // even if we have to visit all files. Only the outer merge is left
+    // unresolved: the merge bases are still merged, resolved and written, and a
+    // virtual merge base can be written as a file.
     tracing::trace!(?commit, parents_count = parents.len(), "calculating diffs");
     let store = commit.store();
     let from_tree = merge_commit_trees_no_resolve_without_repo(store, index, &parents).await?;

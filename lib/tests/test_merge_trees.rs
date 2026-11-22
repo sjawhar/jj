@@ -402,12 +402,9 @@ fn test_merge_of_merges_with_same_change_keeps_the_change() -> TestResult {
 /// side, where they cancel `r1` and `r2`, leaving "original" -- a version
 /// *neither side chose* -- to win, with no conflict at all.
 ///
-/// Collapsing the base to a single tree stops that. Ideally this merge would
-/// report a conflict, since `r1` and `r2` resolved the same conflict
-/// differently; it does not, because collapsing picks one side of the base and
-/// the other parent's resolution then wins outright. That is still a strict
-/// improvement: the result is a version somebody deliberately chose, rather
-/// than a reversion to content that predates both resolutions.
+/// Both `r1` and `r2` changed the base's conflict, so they are merged against
+/// a virtual merge base that holds the conflict's sides between marker lines,
+/// and the merge is a conflict between "A" and "B".
 #[test]
 fn test_merge_of_two_resolutions_does_not_revert_to_the_base() -> TestResult {
     let test_repo = TestRepo::init();
@@ -452,14 +449,16 @@ fn test_merge_of_two_resolutions_does_not_revert_to_the_base() -> TestResult {
     let repo = tx.commit("test").block_on()?;
 
     let tree = merge_commit_trees(repo.as_ref(), &[commit_r1, commit_r2]).block_on()?;
-    let value = tree.path_value(path).block_on()?;
-    if let Ok(Some(TreeValue::File { id, .. })) = value.clone().into_resolved() {
-        let content = String::from_utf8(testutils::read_file(repo.store(), path, &id)).unwrap();
-        assert_ne!(
-            content, "original\n",
-            "the merge reverted to the base's content, which neither side chose"
-        );
-    }
+    let value = tree.path_value(path).block_on()?.simplify();
+    assert!(!value.is_resolved(), "expected a conflict, got: {value:#?}");
+    let adds: Vec<Vec<u8>> = value
+        .adds()
+        .map(|add| match add {
+            Some(TreeValue::File { id, .. }) => testutils::read_file(repo.store(), path, id),
+            other => panic!("expected a file among the sides, got: {other:?}"),
+        })
+        .collect();
+    assert_eq!(adds, [b"A\n".to_vec(), b"B\n".to_vec()]);
 
     Ok(())
 }

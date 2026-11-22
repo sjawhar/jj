@@ -83,12 +83,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the index and when `jj sparse` changes the patterns.
 
 * Merging no longer silently drops content that both sides of the merge
-  contain. A recursive merge base is now reduced to a single virtual merge
-  base tree -- resolving what can be resolved and taking one side of whatever
-  remains, as Git's "resolve" strategy does when picking among several merge
-  bases -- instead of being flattened into the conflict unresolved, where the
-  content it carried canceled out the parents' copies of it. This affects
-  criss-cross histories, and merges whose base is itself conflicted.
+  contain, nor a change that one side made where the merge bases disagree.
+  Where the merge of the merge bases cannot resolve a path, the merge keeps
+  that conflict: a side that left it as it is counts as unchanged, and two
+  sides that both changed it are merged against a virtual merge base built as
+  Git builds one where that conflict is between text files, or give a conflict
+  where it is not (for example, with a deletion or a binary file among its
+  sides). Merge bases, and the parents of a merge of three or more commits, are
+  merged in the order of their commit ids. This affects criss-cross histories,
+  and merges whose base is itself conflicted.
   [#6369](https://github.com/jj-vcs/jj/issues/6369)
 
 ## [0.46.0] - 2026-10-07

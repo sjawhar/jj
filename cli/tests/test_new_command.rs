@@ -280,20 +280,19 @@ fn test_new_merge_same_change_of_same_change_merges() {
     work_dir.run_jj(["new", "c|d"]).success();
     assert_eq!(work_dir.read_file("file"), "modified\n");
 
-    // With "keep", the merge base of "c" and "d" is the *conflicted* merge of
-    // "a" and "b", so this also covers collapsing a base that cannot be
-    // resolved.
+    // With "keep", the merge of the merge bases of "c" and "d" is the
+    // *conflicted* merge of "a" and "b". Both sides hold "modified", so the
+    // merge keeps it although that base cannot be resolved.
     work_dir.run_jj(["new", "root()"]).success();
     work_dir
         .run_jj(["new", "c|d", "--config=merge.same-change=keep"])
         .success();
     assert_eq!(work_dir.read_file("file"), "modified\n");
 
-    // Whatever the merge produced has to survive a working-copy snapshot.
-    // Reducing an unresolvable base by materializing its conflict would leave
-    // conflict markers in the merged file, and those do not always parse back:
-    // the next snapshot would store them as ordinary content, silently turning
-    // a conflict into text that merely looks like one.
+    // Whatever the merge produced has to survive a working-copy snapshot: the
+    // merged file must hold no conflict markers that the next snapshot would
+    // store as ordinary content, silently turning a conflict into text that
+    // merely looks like one.
     let commit_id = |work_dir: &TestWorkDir| {
         work_dir
             .run_jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])

@@ -1014,8 +1014,8 @@ fn test_description_with_dir_and_deletion() -> TestResult {
     Conflict:
       Removing file with id df967b96a579e45a18b8251732d16804b2e56a55 (rlvkpnrz 1792382a "base")
       Removing file with id df967b96a579e45a18b8251732d16804b2e56a55 (rlvkpnrz 1792382a "base")
-      Adding file with id 61780798228d17af2d34fce4cfbdf35556832472 (zsuskuln 6c74ed1d "edit")
       Adding tree with id 133bb38fc4e4bf6b551f1f04db7e48f04cac2877 (royxmykx 09c02334 "dir")
+      Adding file with id 61780798228d17af2d34fce4cfbdf35556832472 (zsuskuln 6c74ed1d "edit")
     [EOF]
     [exit status: 1]
     "#);
@@ -2262,12 +2262,12 @@ fn test_resolve_with_contents_of_side() -> TestResult {
     "#);
     insta::assert_snapshot!(work_dir.read_file("other"), @r#"
     <<<<<<< conflict 1 of 1
+    +++++++ vruxwmqv dd35236a "c"
+    right
     %%%%%%% diff from: rlvkpnrz ed3e06b2 "base"
     \\\\\\\        to: royxmykx e5747f42 "b"
     -base
     +left
-    +++++++ vruxwmqv dd35236a "c"
-    right
     >>>>>>> conflict 1 of 1 ends
     "#);
     let setup_opid = work_dir.current_operation_id();
@@ -2278,13 +2278,13 @@ fn test_resolve_with_contents_of_side() -> TestResult {
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Rebased 1 descendant commits.
-    Working copy  (@) now at: kmkuslsw 6cca6d79 tip | (empty) tip
-    Parent commit (@-)      : znkkpsqq b84d5da4 conflict | conflict
+    Working copy  (@) now at: kmkuslsw f278f3fb tip | (empty) tip
+    Parent commit (@-)      : znkkpsqq ead13414 conflict | conflict
     Added 0 files, modified 2 files, removed 0 files
     [EOF]
     ");
     insta::assert_snapshot!(work_dir.read_file("file"), @"a");
-    insta::assert_snapshot!(work_dir.read_file("other"), @"left");
+    insta::assert_snapshot!(work_dir.read_file("other"), @"right");
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
     ------- stderr -------
     Error: No conflicts found at this revision
@@ -2299,13 +2299,13 @@ fn test_resolve_with_contents_of_side() -> TestResult {
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Rebased 1 descendant commits.
-    Working copy  (@) now at: kmkuslsw 4a54e224 tip | (empty) tip
-    Parent commit (@-)      : znkkpsqq ffd341c7 conflict | conflict
+    Working copy  (@) now at: kmkuslsw 8b835593 tip | (empty) tip
+    Parent commit (@-)      : znkkpsqq f15e9d4b conflict | conflict
     Added 0 files, modified 2 files, removed 0 files
     [EOF]
     ");
     insta::assert_snapshot!(work_dir.read_file("file"), @"b");
-    insta::assert_snapshot!(work_dir.read_file("other"), @"right");
+    insta::assert_snapshot!(work_dir.read_file("other"), @"left");
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
     ------- stderr -------
     Error: No conflicts found at this revision

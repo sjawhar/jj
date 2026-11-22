@@ -1438,7 +1438,9 @@ async fn has_diff_from_parent(
         }
     }
 
-    // Conflict resolution is expensive, try that only for matched files.
+    // Conflict resolution is expensive, try that only for matched files. Only
+    // the outer merge is left unresolved: the merge bases are still merged,
+    // resolved and written, and a virtual merge base can be written as a file.
     let from_tree =
         rewrite::merge_commit_trees_no_resolve_without_repo(store, index, &parents).await?;
     let to_tree = commit.tree();
@@ -1465,7 +1467,9 @@ async fn matches_diff_from_parent(
     side: DiffMatchSide,
 ) -> BackendResult<bool> {
     let parents = commit.parents().await?;
-    // Conflict resolution is expensive, try that only for matched files.
+    // Conflict resolution is expensive, try that only for matched files. Only
+    // the outer merge is left unresolved: the merge bases are still merged,
+    // resolved and written, and a virtual merge base can be written as a file.
     let from_tree =
         rewrite::merge_commit_trees_no_resolve_without_repo(store, index, &parents).await?;
     let to_tree = commit.tree();

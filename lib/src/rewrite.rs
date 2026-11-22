@@ -20,6 +20,10 @@ use std::mem;
 use std::slice;
 use std::sync::Arc;
 
+use blake2::Blake2b512;
+use bstr::BString;
+use bstr::ByteSlice as _;
+use digest::Digest as _;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::future::ready;
@@ -33,13 +37,20 @@ use tracing::instrument;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
+use crate::backend::CopyId;
 use crate::backend::MergedTreeValue;
+use crate::backend::MergedTreeValueExt as _;
 use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::commit::CommitIteratorExt as _;
 use crate::commit::conflict_label_for_commits;
 use crate::commit_builder::CommitBuilder;
 use crate::conflict_labels::ConflictLabels;
+use crate::conflicts::extract_as_single_hunk;
+use crate::content_hash::ContentHash;
+use crate::files;
+use crate::files::MergeResult;
+use crate::hex_util;
 use crate::index::Index;
 use crate::index::IndexResult;
 use crate::index::ResolvedChangeTargets;
@@ -49,6 +60,7 @@ use crate::matchers::Matcher;
 use crate::matchers::Visit;
 use crate::merge::Diff;
 use crate::merge::Merge;
+use crate::merge::SameChange;
 use crate::merged_tree::MergedTree;
 use crate::merged_tree_builder::MergedTreeBuilder;
 use crate::repo::MutableRepo;
@@ -57,6 +69,7 @@ use crate::repo_path::RepoPath;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetStreamExt as _;
 use crate::store::Store;
+use crate::tree_merge::MergeOptions;
 
 /// Merges `commits` and tries to resolve any conflicts recursively.
 #[instrument(skip(repo))]
@@ -71,7 +84,13 @@ pub async fn merge_commit_trees(repo: &dyn Repo, commits: &[Commit]) -> BackendR
     }
 }
 
-/// Merges `commits` without attempting to resolve file conflicts.
+/// Merges `commits` without attempting to resolve file conflicts in the
+/// result.
+///
+/// The merge bases of `commits` are still merged and resolved, which writes
+/// trees and files to the store, and a virtual merge base can be written to the
+/// store as a file (see [`merge_parent_values`]). Only the outer merge is left
+/// unresolved.
 pub async fn merge_commit_trees_no_resolve(
     repo: &dyn Repo,
     commits: &[Commit],
@@ -83,102 +102,135 @@ pub async fn merge_commit_trees_no_resolve(
     }
 }
 
-/// Merges `commits` without attempting to resolve file conflicts.
+/// Merges `commits` without attempting to resolve file conflicts in the
+/// result.
+///
+/// Like [`merge_commit_trees_no_resolve`], this still merges, resolves and
+/// writes the merge bases of `commits`, and can write a virtual merge base.
 #[instrument(skip(index))]
 pub async fn merge_commit_trees_no_resolve_without_repo(
     store: &Arc<Store>,
     index: &dyn Index,
     commits: &[Commit],
 ) -> BackendResult<MergedTree> {
-    let commit_ids = commits
+    let mut commit_ids = commits
         .iter()
         .map(|commit| commit.id().clone())
         .collect_vec();
-    Box::pin(merge_commit_ids_no_resolve(store, index, &commit_ids)).await
+    // The commits of a merge of three or more are merged in the order of their
+    // commit ids, so the merge does not depend on the order they are named in.
+    if commit_ids.len() > 2 {
+        commit_ids.sort_unstable();
+    }
+    Box::pin(merge_commit_ids(store, index, &commit_ids, false)).await
 }
 
-/// Merges the trees of `commit_ids` against their merge bases, without
-/// attempting to resolve the resulting file conflicts.
+/// Merges the trees of `commit_ids` one at a time, in the given order: the
+/// tree of each commit is merged into the merge of the trees before it, against
+/// V, the merge of their merge bases.
 ///
-/// When two commits have several best common ancestors (a criss-cross
-/// history), those ancestors are merged recursively and the result is
-/// collapsed into a single virtual merge base (see
-/// [`MergedTree::collapse_conflicts`]).
-///
-/// Reducing the base to a single tree is what keeps the merge from losing
-/// content. Flattening an unresolved base merge into the outer term list puts
-/// every side of it on the *remove* side, where the content it carries cancels
-/// against the same content in the parents.
-///
-/// The shape that triggers this is two bugfixes that independently add the
-/// same line, merged together twice:
-///
-/// ```text
-///        base          a file WITHOUT some line
-///        /  \
-///       A    B         two fixes, each independently ADDING that line
-///       |\  /|
-///       | \/ |
-///       | /\ |
-///  AB_for_X  AB_for_Y  two *separate* merges of A and B; both have the line
-///        \    /
-///          XY          merging them loses the line, with no conflict
-/// ```
-///
-/// `AB_for_X` and `AB_for_Y` have two best common ancestors, `A` and `B`, and
-/// both of those carry the line. Merging them recursively and flattening the
-/// result gives:
-///
-/// ```text
-/// adds    [AB_for_X(line), base(no line), AB_for_Y(line)]
-/// removes [A(line), B(line)]
-///
-/// line:    +2 -2 = 0   cancels, and vanishes without a trace
-/// no line: +1          wins, so XY gets base's version of the file
-/// ```
-///
-/// Exactly one value nets +1, which is the "resolved cleanly" case, so no
-/// conflict is recorded. Note that this needs only two parents; the line must
-/// be added *independently* on both sides (if it came from a single ancestor
-/// it would be in the base too, and could only collect +1 votes).
-async fn merge_commit_ids_no_resolve(
+/// Where V does not resolve, [`merge_parent_values`] gives the value at that
+/// path, so that V's terms cannot cancel content that the merged trees hold
+/// (<https://github.com/jj-vcs/jj/issues/6369>). Each merge but the last is
+/// resolved, and the last one too if `resolve` is set.
+async fn merge_commit_ids(
     store: &Arc<Store>,
     index: &dyn Index,
     commit_ids: &[CommitId],
+    resolve: bool,
 ) -> BackendResult<MergedTree> {
-    let commit_tree = async |commit_id: &CommitId| {
-        let commit = store.get_commit_async(commit_id).await?;
-        Ok::<_, BackendError>((commit.tree(), commit.conflict_label()))
+    let commits: Vec<Commit> =
+        try_join_all(commit_ids.iter().map(|id| store.get_commit_async(id))).await?;
+    let Some(first) = commits.first() else {
+        return Ok(store.root_commit().tree());
     };
-    let [first_id, other_ids @ ..] = commit_ids else {
-        let (tree, _label) = commit_tree(store.root_commit_id()).await?;
-        return Ok(tree);
-    };
-    let first_term = commit_tree(first_id).await?;
-    if other_ids.is_empty() {
-        return Ok(first_term.0);
-    }
-
-    let mut terms = vec![first_term];
-    for (pos, commit_id) in commit_ids.iter().enumerate().skip(1) {
-        let ancestor_ids = index
-            .common_ancestors(&commit_ids[..pos], slice::from_ref(commit_id))
+    let mut tree = first.tree();
+    for (pos, commit) in commits.iter().enumerate().skip(1) {
+        let mut base_ids = index
+            .common_ancestors(&commit_ids[..pos], slice::from_ref(commit.id()))
             .await
             // TODO: indexing error shouldn't be a "BackendError"
             .map_err(|err| BackendError::Other(err.into()))?;
-        let base_tree = Box::pin(merge_commit_ids_no_resolve(store, index, &ancestor_ids)).await?;
-        let base_tree = base_tree.collapse_conflicts().await?;
-        let base_commits: Vec<Commit> = try_join_all(
-            ancestor_ids
-                .iter()
-                .map(|id| store.get_commit_async(id))
-                .collect_vec(),
+        let base_commits: Vec<Commit> =
+            try_join_all(base_ids.iter().map(|id| store.get_commit_async(id))).await?;
+        // V's label lists the merge bases in the order the index returns them,
+        // but V merges them in the order of their commit ids, so that V does
+        // not depend on the order they were made in.
+        base_ids.sort_unstable();
+        let base_tree = Box::pin(merge_commit_ids(store, index, &base_ids, true)).await?;
+        tree = merge_parent_trees(
+            store,
+            (tree, conflict_label_for_commits(&commits[..pos])),
+            (base_tree, conflict_label_for_commits(&base_commits)),
+            (commit.tree(), commit.conflict_label()),
         )
         .await?;
-        terms.push((base_tree, conflict_label_for_commits(&base_commits)));
-        terms.push(commit_tree(commit_id).await?);
+        if resolve || pos + 1 < commits.len() {
+            tree = tree.resolve().await?;
+        }
     }
-    Ok(MergedTree::merge_no_resolve(Merge::from_vec(terms)))
+    Ok(tree)
+}
+
+/// Merges `side1` and `side2` against `base`, V, the merge of their merge
+/// bases, without resolving the result.
+///
+/// Each path where V does not resolve, and, under `merge.same-change=accept`,
+/// each path where both sides hold the same conflict, takes the value
+/// [`merge_parent_values`] gives. Every other path is merged as
+/// [`MergedTree::merge_no_resolve`] merges it.
+async fn merge_parent_trees(
+    store: &Arc<Store>,
+    side1: (MergedTree, String),
+    base: (MergedTree, String),
+    side2: (MergedTree, String),
+) -> BackendResult<MergedTree> {
+    let mut paths = HashSet::new();
+    if base.0.has_conflict() {
+        for (path, value) in base.0.conflicts() {
+            value?;
+            paths.insert(path);
+        }
+    }
+    // A flattened merge against a resolved V leaves a conflict that both sides
+    // hold unresolved.
+    if store.merge_options().same_change == SameChange::Accept && side1.0.has_conflict() {
+        for (path, value1) in side1.0.conflicts() {
+            if side2.0.path_value(&path).await?.same_terms_as(&value1?) {
+                paths.insert(path);
+            }
+        }
+    }
+    let mut overrides = vec![];
+    for path in &paths {
+        // The value at a path decides everything inside it.
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| paths.contains(ancestor))
+        {
+            continue;
+        }
+        let base_value = base.0.path_value(path);
+        let value1 = side1.0.path_value(path);
+        let value2 = side2.0.path_value(path);
+        let (base_value, value1, value2) = try_join!(base_value, value1, value2)?;
+        let value = merge_parent_values(store, path, &base_value, &value1, &value2).await?;
+        overrides.push((path.clone(), value));
+    }
+    let merged = MergedTree::merge_no_resolve(Merge::from_vec(vec![side1, base, side2]));
+    if overrides.is_empty() {
+        return Ok(merged);
+    }
+    let num_sides = merged.tree_ids().num_sides();
+    let mut builder = MergedTreeBuilder::new(merged);
+    for (path, mut value) in overrides {
+        if !value.is_resolved() {
+            value.pad_to(num_sides, &None);
+        }
+        builder.set_or_remove(path, value);
+    }
+    builder.write_tree_no_resolve().await
 }
 
 /// Merges the values that two parents, `parent1` and `parent2`, hold at
@@ -197,13 +249,29 @@ async fn merge_commit_ids_no_resolve(
 /// unresolved, where the virtual base is the file [`virtual_merge_base`]
 /// writes.
 pub async fn merge_parent_values(
-    _store: &Store,
-    _path: &RepoPath,
-    _base: &MergedTreeValue,
-    _parent1: &MergedTreeValue,
-    _parent2: &MergedTreeValue,
+    store: &Store,
+    path: &RepoPath,
+    base: &MergedTreeValue,
+    parent1: &MergedTreeValue,
+    parent2: &MergedTreeValue,
 ) -> BackendResult<MergedTreeValue> {
-    todo!()
+    let same_change = store.merge_options().same_change;
+    if let Some(resolved_base) = base.resolve_trivial(same_change) {
+        if same_change == SameChange::Accept && parent1.same_terms_as(parent2) {
+            return Ok(parent1.clone());
+        }
+        let base = Merge::resolved(resolved_base.clone());
+        return Ok(Merge::from_vec(vec![parent1.clone(), base, parent2.clone()]).flatten());
+    }
+    if parent1.same_terms_as(parent2) || parent2.same_terms_as(base) {
+        Ok(parent1.clone())
+    } else if parent1.same_terms_as(base) {
+        Ok(parent2.clone())
+    } else {
+        let virtual_base = virtual_merge_base(store, path, base, parent1, parent2).await?;
+        let virtual_base = Merge::normal(virtual_base);
+        Ok(Merge::from_vec(vec![parent1.clone(), virtual_base, parent2.clone()]).flatten())
+    }
 }
 
 /// Writes to the store the virtual base against which [`merge_parent_values`]
@@ -224,24 +292,201 @@ pub async fn merge_parent_values(
 /// `true`, and keeps the copy id of `base` where its copy ids merge, else the
 /// placeholder. The result does not depend on the order of the parents.
 pub async fn virtual_merge_base(
-    _store: &Store,
-    _path: &RepoPath,
-    _base: &MergedTreeValue,
-    _parent1: &MergedTreeValue,
-    _parent2: &MergedTreeValue,
+    store: &Store,
+    path: &RepoPath,
+    base: &MergedTreeValue,
+    parent1: &MergedTreeValue,
+    parent2: &MergedTreeValue,
 ) -> BackendResult<TreeValue> {
-    todo!()
+    let base = base.simplify();
+    let base_contents = text_file_contents(store, path, &base);
+    let contents1 = file_term_contents(store, path, parent1);
+    let contents2 = file_term_contents(store, path, parent2);
+    let (base_contents, contents1, contents2) = try_join!(base_contents, contents1, contents2)?;
+    let parent_lines: HashSet<&[u8]> = contents1
+        .iter()
+        .chain(contents2.iter())
+        .flat_map(|content| content.lines())
+        .collect();
+    let content = if let Some(base_contents) = base_contents {
+        virtual_base_content(path, &base_contents, store.merge_options(), &parent_lines)
+    } else {
+        let markers = (0..)
+            .map(|salt| VirtualBaseMarkers::new(path, 0, &base, salt))
+            .find(|markers| markers.are_not_in(&parent_lines))
+            .expect("some salt gives marker lines that no parent holds");
+        let mut content = vec![];
+        push_line(&mut content, &markers.open);
+        content
+    };
+    let id = store.write_file(path, &mut content.as_slice()).await?;
+    // The executable bit and the copy id depend on V alone, not on the order of
+    // the parents.
+    let executable = base
+        .to_executable_merge()
+        .and_then(|bits| bits.resolve_trivial(SameChange::Accept).copied().flatten())
+        .unwrap_or(false);
+    let copy_id = base
+        .to_copy_id_merge()
+        .and_then(|ids| ids.resolve_trivial(SameChange::Accept).cloned().flatten())
+        .unwrap_or_else(CopyId::placeholder);
+    Ok(TreeValue::File {
+        id,
+        executable,
+        copy_id,
+    })
+}
+
+/// The start of the opening marker line of a hunk of a virtual merge base.
+const VIRTUAL_BASE_OPEN: &str = "<<<<<<< jj virtual merge base ";
+/// The start of the marker line between two sides of a hunk of a virtual merge
+/// base.
+const VIRTUAL_BASE_SEPARATOR: &str = "======= ";
+/// The start of the closing marker line of a hunk of a virtual merge base.
+const VIRTUAL_BASE_CLOSE: &str = ">>>>>>> ";
+
+/// The marker lines of one hunk of a virtual merge base, without their
+/// newlines.
+struct VirtualBaseMarkers {
+    open: String,
+    separator: String,
+    close: String,
+}
+
+impl VirtualBaseMarkers {
+    /// The marker lines of hunk `hunk_index` of the virtual merge base at
+    /// `path`, whose hex is 32 hex digits of a content hash over the path, the
+    /// hunk's index, the hunk's `terms` and `salt`.
+    fn new(path: &RepoPath, hunk_index: usize, terms: &impl ContentHash, salt: u64) -> Self {
+        let mut hasher = Blake2b512::default();
+        ContentHash::hash(path, &mut hasher);
+        ContentHash::hash(&(hunk_index as u64), &mut hasher);
+        ContentHash::hash(terms, &mut hasher);
+        ContentHash::hash(&salt, &mut hasher);
+        let hex = hex_util::encode_hex(&hasher.finalize()[..16]);
+        Self {
+            open: format!("{VIRTUAL_BASE_OPEN}{hex}"),
+            separator: format!("{VIRTUAL_BASE_SEPARATOR}{hex}"),
+            close: format!("{VIRTUAL_BASE_CLOSE}{hex}"),
+        }
+    }
+
+    /// Whether none of the marker lines is one of `lines`.
+    fn are_not_in(&self, lines: &HashSet<&[u8]>) -> bool {
+        [&self.open, &self.separator, &self.close]
+            .iter()
+            .all(|marker| !lines.contains(marker.as_bytes()))
+    }
+}
+
+/// The content of the virtual merge base of `contents`, the terms of a
+/// conflict of text files at `path`, whose marker lines are none of
+/// `parent_lines`.
+fn virtual_base_content(
+    path: &RepoPath,
+    contents: &Merge<BString>,
+    options: &MergeOptions,
+    parent_lines: &HashSet<&[u8]>,
+) -> Vec<u8> {
+    let hunks: Vec<Merge<Vec<u8>>> = match files::merge_hunks(contents, options) {
+        MergeResult::Resolved(content) => return content.into(),
+        MergeResult::Conflict(hunks) => hunks
+            .into_iter()
+            .map(|hunk| hunk.into_map(Vec::from))
+            .collect(),
+    };
+    let markers = (0..)
+        .map(|salt| {
+            hunks
+                .iter()
+                .enumerate()
+                .filter(|(_, hunk)| !hunk.is_resolved())
+                .map(|(index, hunk)| VirtualBaseMarkers::new(path, index, hunk, salt))
+                .collect_vec()
+        })
+        .find(|markers| markers.iter().all(|hunk| hunk.are_not_in(parent_lines)))
+        .expect("some salt gives marker lines that no parent holds");
+    let mut markers = markers.iter();
+    let mut content = vec![];
+    for hunk in &hunks {
+        if let Some(resolved) = hunk.as_resolved() {
+            content.extend_from_slice(resolved);
+            continue;
+        }
+        let hunk_markers = markers
+            .next()
+            .expect("marker lines for each conflicted hunk");
+        push_line(&mut content, &hunk_markers.open);
+        for (index, side) in hunk.adds().enumerate() {
+            if index > 0 {
+                push_line(&mut content, &hunk_markers.separator);
+            }
+            content.extend_from_slice(side);
+        }
+        push_line(&mut content, &hunk_markers.close);
+    }
+    content
+}
+
+/// Appends `line` and a newline to `content`, after a newline if `content`
+/// does not end with one.
+fn push_line(content: &mut Vec<u8>, line: &str) {
+    if content.last().is_some_and(|&byte| byte != b'\n') {
+        content.push(b'\n');
+    }
+    content.extend_from_slice(line.as_bytes());
+    content.push(b'\n');
+}
+
+/// The contents of the terms of `base` if `base` is a conflict of text files:
+/// each add is a regular file whose first 8,000 bytes hold no NUL byte, which
+/// is git's test for a binary file, and each remove is such a file or absent,
+/// which reads as an empty file.
+async fn text_file_contents(
+    store: &Store,
+    path: &RepoPath,
+    base: &MergedTreeValue,
+) -> BackendResult<Option<Merge<BString>>> {
+    const PEEK_SIZE: usize = 8000;
+    let Some(file_ids) = base.to_file_merge() else {
+        return Ok(None);
+    };
+    if file_ids.adds().any(Option::is_none) {
+        return Ok(None);
+    }
+    let contents = extract_as_single_hunk(&file_ids, store, path).await?;
+    let is_text = contents
+        .iter()
+        .all(|content| !content[..PEEK_SIZE.min(content.len())].contains(&b'\0'));
+    Ok(is_text.then_some(contents))
+}
+
+/// The contents of the file terms of `value`, and an empty content for each
+/// other term.
+async fn file_term_contents(
+    store: &Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> BackendResult<Merge<BString>> {
+    let file_ids = value.map(|term| match term {
+        Some(TreeValue::File { id, .. }) => Some(id.clone()),
+        _ => None,
+    });
+    extract_as_single_hunk(&file_ids, store, path).await
 }
 
 /// Merges the trees of `base_ids`, the merge bases of two commits, into V,
-/// folding them in the order of their commit ids, and resolves the result.
+/// folding them in the order of their commit ids and resolving each merge.
+/// With one merge base, V is its tree, and with none, the root commit's tree.
 /// The order of `base_ids` does not change the result.
 pub async fn merge_base_tree(
-    _store: &Arc<Store>,
-    _index: &dyn Index,
-    _base_ids: &[CommitId],
+    store: &Arc<Store>,
+    index: &dyn Index,
+    base_ids: &[CommitId],
 ) -> BackendResult<MergedTree> {
-    todo!()
+    let mut base_ids = base_ids.to_vec();
+    base_ids.sort_unstable();
+    merge_commit_ids(store, index, &base_ids, true).await
 }
 
 /// Find the commits to use as input to the recursive merge algorithm.
