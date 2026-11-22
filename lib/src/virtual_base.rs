@@ -220,10 +220,13 @@ pub(crate) async fn stored_virtual_base_terms(
 /// the working copy, or a merge tool's output) gave the hunks `new_hunks`;
 /// `None` where that base is not VB or M.
 ///
-/// The person changed the file that jj materialized, not the terms. Each
-/// change to a hunk that resolves, a line diff of the hunk as jj materialized
-/// it against the new hunk, is made to VB at the VB lines that the changed
-/// lines are; VB keeps every other line, its marker lines included. An
+/// The person changed the file that jj materialized, not the terms. A change
+/// to a hunk that resolves and covers whole blocks of VB replaces that hunk's
+/// region of VB with the new text, which then goes into every term of V there,
+/// as jj's snapshot writes a resolved hunk into every term. Each change to
+/// another hunk that resolves, a line diff of the hunk as jj materialized it
+/// against the new hunk, is made to VB at the VB lines that the changed lines
+/// are; VB keeps every other line, its marker lines included. An
 /// insertion next to VB lines that the materialized hunk does not hold goes
 /// outside the block they belong to, and so does a hunk that resolves where
 /// none was. In a hunk that conflicts, a change to VB's lines is taken as it
@@ -369,18 +372,38 @@ fn output_edits(
                 Some(new_hunk) => new_hunk.as_resolved().unwrap_or(&empty),
                 None => &empty,
             };
-            let anchors = ContentDiff::by_line([hunk.text.as_slice(), &vb[region.clone()]])
-                .hunk_ranges()
-                .collect_vec();
-            for (range, text) in line_changes(&hunk.text, new_text) {
-                let target = if range.is_empty() {
-                    let point = insertion_point(&anchors, range.start, vb, region.start, &blocks);
-                    Some(point..point)
-                } else {
-                    matched_range(&anchors, &range, region.start)
-                };
-                if let Some(range) = target {
-                    edits.push(Edit { range, text });
+            let mut touched_blocks = blocks
+                .iter()
+                .filter(|block| block.start < region.end && region.start < block.end)
+                .peekable();
+            let covers_whole_blocks = touched_blocks.peek().is_some()
+                && touched_blocks
+                    .all(|block| region.start <= block.start && block.end <= region.end);
+            if covers_whole_blocks {
+                // The person resolved a hunk that covers whole blocks, as jj's
+                // snapshot writes it: its text goes into every term of V there
+                // (see [`edited_terms`]).
+                if new_text.as_slice() != hunk.text.as_slice() {
+                    edits.push(Edit {
+                        range: region.clone(),
+                        text: new_text.as_slice().to_vec(),
+                    });
+                }
+            } else {
+                let anchors = ContentDiff::by_line([hunk.text.as_slice(), &vb[region.clone()]])
+                    .hunk_ranges()
+                    .collect_vec();
+                for (range, text) in line_changes(&hunk.text, new_text) {
+                    let target = if range.is_empty() {
+                        let point =
+                            insertion_point(&anchors, range.start, vb, region.start, &blocks);
+                        Some(point..point)
+                    } else {
+                        matched_range(&anchors, &range, region.start)
+                    };
+                    if let Some(range) = target {
+                        edits.push(Edit { range, text });
+                    }
                 }
             }
         }
@@ -602,11 +625,15 @@ struct Group<'a> {
 /// VB, made by region. A change to lines where V's terms are the same is made
 /// to each term. A change that touches lines where V's terms differ but merge
 /// writes the changed text of the hunks it touches into each term, in place
-/// of the term's own text there. A change inside a side of a block is made to
-/// the term of V whose side it is. An insertion at a block's edge is outside
-/// the block, and goes into each term. A change that touches a marker line,
-/// crosses a block's edge or two sides, or whose text holds a marker line, is
-/// not made. `None` where `vb` is not the VB of `contents`.
+/// of the term's own text there, and so does a change that covers whole
+/// blocks, whose text holds no marker line. Another change inside a side of a
+/// block is made to the term of V whose side it is. A term's text whose last
+/// line has no final newline is a block side all the same, as jj's line split
+/// takes that line as a line, though VB ends the side with a newline. An
+/// insertion at a block's edge is outside the block, and goes into each term.
+/// A change that touches a marker line without covering its block, crosses a
+/// block's edge or two sides, or whose text holds a marker line, is not made.
+/// `None` where `vb` is not the VB of `contents`.
 fn edited_terms(
     vb: &[u8],
     contents: &Merge<BString>,
@@ -625,7 +652,7 @@ fn edited_terms(
             let sides_hold_adds = block.start == cursor
                 && block.sides.len() == contents.adds().len()
                 && zip(&block.sides, adds)
-                    .all(|(side, (add, range))| *side == &add.as_slice()[range.clone()]);
+                    .all(|(side, (add, range))| side_holds(side, &add.as_slice()[range.clone()]));
             if !sides_hold_adds {
                 return None;
             }
@@ -673,11 +700,14 @@ fn edited_terms(
             })
             .map(|(index, _)| index)
             .collect_vec();
+        // A change that covers whole blocks, a hunk the person resolved over
+        // them, goes into every term below; any other change that touches a
+        // block goes to the term whose side it is in.
+        let covers = |range: &Range<usize>| start <= range.start && range.end <= end;
         if let Some(&index) = touched
             .iter()
-            .find(|&&index| segments[index].block.is_some())
+            .find(|&&index| segments[index].block.is_some() && !covers(&segments[index].range))
         {
-            // A change inside a block goes to the term whose side it is in.
             let segment = &segments[index];
             let Some(block) = segment.block.filter(|_| touched.len() == 1) else {
                 continue;
@@ -690,18 +720,36 @@ fn edited_terms(
                 continue;
             };
             let term = 2 * side;
-            let shift = segment.hunk.ranges[term].start;
-            let side_start = block.side_ranges[side].start;
+            let term_range = &segment.hunk.ranges[term];
+            let side_range = &block.side_ranges[side];
+            let (from, to) = (start - side_range.start, end - side_range.start);
+            let (range, text) = if to <= term_range.len() {
+                (from..to, edit.text.clone())
+            } else {
+                // The term's last line has no final newline, which VB added:
+                // the changed lines keep that.
+                let mut text = edit.text.clone();
+                if text.last() == Some(&b'\n') {
+                    text.pop();
+                }
+                if from == side_range.len() {
+                    text.insert(0, b'\n');
+                    (term_range.len()..term_range.len(), text)
+                } else {
+                    (from..term_range.len(), text)
+                }
+            };
             term_edits[term].push(Edit {
-                range: shift + start - side_start..shift + end - side_start,
-                text: edit.text.clone(),
+                range: term_range.start + range.start..term_range.start + range.end,
+                text,
             });
             continue;
         }
         let expand = touched.iter().any(|&index| {
             let segment = &segments[index];
-            segment.hunk.kind == HunkKind::Merged
-                && (start < end || (segment.range.start < start && start < segment.range.end))
+            let inside = segment.range.start < start && start < segment.range.end;
+            segment.block.is_some()
+                || (segment.hunk.kind == HunkKind::Merged && (start < end || inside))
         });
         let (first, last) = (
             touched.first().copied().unwrap_or_default(),
@@ -780,6 +828,14 @@ fn edited_terms(
         new_contents.push(text);
     }
     Some(new_contents)
+}
+
+/// Whether `side`, a side of a block of VB, holds `text`, a term's text there:
+/// the same text, or, where the text's last line has no final newline, the
+/// text with the newline that VB ends each side with.
+fn side_holds(side: &[u8], text: &[u8]) -> bool {
+    side == text
+        || (!text.is_empty() && !text.ends_with(b"\n") && side.strip_suffix(b"\n") == Some(text))
 }
 
 /// The offset in the term at `term` that `point` of VB stands for, where

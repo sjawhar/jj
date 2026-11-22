@@ -2857,6 +2857,48 @@ fn snapshot_of_an_edit_of_a_line_only_vb_holds_keeps_vb() -> TestResult {
     Ok(())
 }
 
+/// `words` as lines, the last one with no final newline.
+fn unterminated(words: &str) -> Option<Vec<u8>> {
+    let mut content = lines(words)?;
+    content.pop();
+    Some(content)
+}
+
+/// VB5d: VB5b's history where every file but o's ends without a final
+/// newline, so V's terms conflict at lines 9 and 10 too, and VB's second block
+/// holds sides whose last line has no final newline in the terms. w, the
+/// merge of P1 and P2, which both hold `9a 10` there, is snapshotted with `9a`
+/// edited to `9b`: that resolved hunk covers the whole block, so its text goes
+/// into every term of V. s and u, children of w, hold P1's and P2's text with
+/// `9b`; u rebased onto s is a conflict at line 1 only, and every side holds
+/// `9b`.
+#[test]
+fn vb5d_an_edit_reaches_v_where_the_files_end_without_a_newline() -> TestResult {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("o 2 3 4 5 6 7 8 9 10"))],
+        &[("f", unterminated("x 2 3 4 5 6 7 8 9a 10"))],
+        &[("f", unterminated("y 2 3 4 5 6 7 8 9 10"))],
+        Made::AFirst,
+        &[("f", unterminated("x 2 3 4 5 6 7 8 9a 10"))],
+        &[("f", unterminated("y 2 3 4 5 6 7 8 9a 10"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("9a", "9b")])?;
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", unterminated("x 2 3 4 5 6 7 8 9b 10"))])?;
+    let u = case.commit(&[&w], &[("f", unterminated("y 2 3 4 5 6 7 8 9b 10"))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?.simplify();
+    let [x, o, y] = ["x", "o", "y"].map(|first| {
+        let content = unterminated(&format!("{first} 2 3 4 5 6 7 8 9b 10")).unwrap();
+        case.file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(&case, &value, &conflict(&[&x, &o, &y]));
+    Ok(())
+}
+
 /// An edit of a block's side after which V's terms merge: the base is their
 /// merged text, a plain file with no marker line. Here that text is P1's, so
 /// the conflict then resolves to P2's.
