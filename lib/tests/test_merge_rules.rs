@@ -3122,6 +3122,60 @@ fn rebase_across_a_conflicted_parent_gives_the_base() -> TestResult {
     assert_resolved_text(&merged, "o\n")
 }
 
+/// S2's history: o holds `o`, A `x` and B `y`; P1, a merge of A and B,
+/// resolves `f` to `X`, P2, another, holds `p2`, and d, the merge of P1 and
+/// P2, holds `d`.
+fn s2_history(p2: &str, d: &str) -> TestResult<(TwoBases, Commit)> {
+    let mut history = two_bases(
+        &[("f", line("o"))],
+        &[("f", line("x"))],
+        &[("f", line("y"))],
+        Made::AFirst,
+        &[("f", line("X"))],
+        &[("f", line(p2))],
+    )?;
+    let d = history
+        .case
+        .commit(&[&history.p1, &history.p2], &[("f", line(d))])?;
+    Ok((history, d))
+}
+
+/// S2a, a stated limit, which the fix keeps: the spec's S2 limit, jj 0.45.1's
+/// rebase of one commit. d, which resolves to `o` the merge of P1 (`X`) and P2
+/// (`y`), rebased onto P1 alone holds `x`, with no conflict, as jj 0.45.1
+/// gives. A fix that changes this updates the spec's S2 limit.
+#[test]
+fn s2a_rebase_onto_one_parent_gives_x() -> TestResult {
+    assert_resolved_text(&rebase_onto_p1(s2_history("y", "o")?)?, "x\n")
+}
+
+/// S2b, a stated limit, which the fix keeps: the spec's S2 limit, jj 0.45.1's
+/// rebase of one commit. d, as in S2a, squashed into P1, as `jj squash --from
+/// d --into P1 -u` does, leaves P1 holding `x`, with no conflict, as jj 0.45.1
+/// gives. A fix that changes this updates the spec's S2 limit.
+#[test]
+fn s2b_squash_into_one_parent_gives_x() -> TestResult {
+    assert_resolved_text(&squash_into_p1(s2_history("y", "o")?)?, "x\n")
+}
+
+/// S2c, a stated limit, which the fix keeps: the spec's S2 limit, jj 0.45.1's
+/// rebase of one commit. With P2 and d holding `Y`, d rebased onto P1 alone is
+/// a conflict whose sides are `x` and `y`, as jj 0.45.1 gives. A fix that
+/// changes this updates the spec's S2 limit.
+#[test]
+fn s2c_rebase_onto_one_parent_conflicts_x_and_y() -> TestResult {
+    let merged = rebase_onto_p1(s2_history("Y", "Y")?)?;
+    let value = merged.value()?.simplify();
+    let [x, y] = ["x", "y"].map(|value| merged.case.text(value));
+    assert_eq!(
+        value.adds().counts(),
+        [&x, &y].into_iter().counts(),
+        "expected a conflict whose sides are x and y, got {}",
+        describe(&merged.case, &value)
+    );
+    Ok(())
+}
+
 /// A user's text that holds lines like a virtual base's marker lines, and a
 /// whole block of them, with a salt and a term, whose hex no merge wrote.
 const USER_MARKER_TEXT: &str = "1\n<<<<<<< jj virtual merge base 0123456789abcdef0123456789abcdef \
