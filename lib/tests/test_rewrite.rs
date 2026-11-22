@@ -119,9 +119,9 @@ fn test_merge_criss_cross() -> TestResult {
     assert_tree_eq!(merged, tree_expected);
 
     // D and E have two best common ancestors, B and C. They are merged and
-    // resolved into a single virtual merge base, so the unresolved merge has
-    // three sides rather than the five it would have if the base merge were
-    // flattened in unresolved.
+    // resolved into one tree, so the unresolved merge has three sides rather
+    // than the five it would have if the base merge were flattened in
+    // unresolved.
     let ancestor_ids = tx
         .repo()
         .index()

@@ -445,13 +445,11 @@ impl<T> Merge<T> {
     where
         T: Eq + Hash,
     {
-        let mut counts = HashMap::new();
-        for (position, &index) in indices.iter().enumerate() {
-            *counts
-                .entry((position % 2 == 0, &self.values[index]))
-                .or_default() += 1;
-        }
-        counts
+        indices
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| (position % 2 == 0, &self.values[index]))
+            .counts()
     }
 
     /// If this merge can be trivially resolved, returns the value it resolves

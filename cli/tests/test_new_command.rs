@@ -293,17 +293,11 @@ fn test_new_merge_same_change_of_same_change_merges() {
     // merged file must hold no conflict markers that the next snapshot would
     // store as ordinary content, silently turning a conflict into text that
     // merely looks like one.
-    let commit_id = |work_dir: &TestWorkDir| {
-        work_dir
-            .run_jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-            .success()
-            .stdout
-            .raw()
-            .to_owned()
-    };
-    let before = commit_id(&work_dir);
+    let before = get_working_copy_commit_id(&work_dir);
+    // Writing the file makes the snapshot read it again.
+    work_dir.write_file("file", "modified\n");
     work_dir.run_jj(["status"]).success(); // snapshots the working copy
-    assert_eq!(commit_id(&work_dir), before);
+    assert_eq!(get_working_copy_commit_id(&work_dir), before);
     assert_eq!(work_dir.read_file("file"), "modified\n");
 }
 
@@ -330,33 +324,30 @@ fn test_new_merge_of_two_different_resolutions_conflicts() {
     ");
     // The conflict's base is the virtual merge base, whose own lines start like
     // conflict markers, so jj materializes the conflict with longer markers.
-    let materialized = work_dir.read_file("file").to_string();
-    assert!(
-        materialized.starts_with("<<<<<<<<<<< conflict 1 of 1\n"),
-        "{materialized}"
-    );
-    assert!(
-        materialized.contains("jj virtual merge base"),
-        "{materialized}"
-    );
-    assert!(
-        materialized.ends_with(">>>>>>>>>>> conflict 1 of 1 ends\n"),
-        "{materialized}"
-    );
+    // Each side carries the label of the commit it comes from: "p1" for "x"
+    // and "p2" for "y".
+    let materialized = work_dir.read_file("file");
+    insta::assert_snapshot!(materialized, @r#"
+    <<<<<<<<<<< conflict 1 of 1
+    %%%%%%%%%%% diff from: zsuskuln 4d032ef7 "a"
+    \\\\\\\\\\\        to: vruxwmqv a902e1f4 "p1"
+    -<<<<<<< jj virtual merge base 48886e7b8a6d6138996f4c125a4b361a
+     x
+    -======= 48886e7b8a6d6138996f4c125a4b361a
+    -y
+    ->>>>>>> 48886e7b8a6d6138996f4c125a4b361a
+    +++++++++++ znkkpsqq 9ca67c80 "p2"
+    y
+    >>>>>>>>>>> conflict 1 of 1 ends
+    "#);
 
     // A snapshot of the working copy reads the file back as the same conflict.
-    let commit_id = |work_dir: &TestWorkDir| {
-        work_dir
-            .run_jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-            .success()
-            .stdout
-            .raw()
-            .to_owned()
-    };
-    let before = commit_id(&work_dir);
+    let before = get_working_copy_commit_id(&work_dir);
+    // Writing the file makes the snapshot parse it again.
+    work_dir.write_file("file", &materialized);
     work_dir.run_jj(["status"]).success(); // snapshots the working copy
-    assert_eq!(commit_id(&work_dir), before);
-    assert_eq!(work_dir.read_file("file").to_string(), materialized);
+    assert_eq!(get_working_copy_commit_id(&work_dir), before);
+    assert_eq!(work_dir.read_file("file"), materialized);
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
     file    2-sided conflict
     [EOF]
@@ -1124,4 +1115,14 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
 fn get_short_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     let template = r#"if(description, description, "root")"#;
     work_dir.run_jj(["log", "-T", template])
+}
+
+#[must_use]
+fn get_working_copy_commit_id(work_dir: &TestWorkDir) -> String {
+    work_dir
+        .run_jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned()
 }

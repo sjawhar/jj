@@ -20,11 +20,11 @@
 //! V. Where V does not resolve, a parent that holds V's own conflict (the same
 //! adds and the same removes, in any order, after `simplify()`) counts as
 //! unchanged, and two parents that both changed it are merged against a
-//! virtual base: for a conflict of text files, jj's line merge of V's terms
-//! with V's sides between marker lines where they do not merge, as git builds
-//! one; otherwise a file of one marker line, so the merge is a conflict. Merge
-//! bases, and the parents of a merge of three or more commits, are merged in
-//! the order of their commit ids.
+//! virtual base (VB): for a conflict of text files, jj's line merge of V's
+//! terms with V's sides between marker lines where they do not merge, as git
+//! builds one; otherwise a file of one marker line (M), so the merge is a
+//! conflict. Merge bases, and the parents of a merge of three or more commits,
+//! are merged in the order of their commit ids.
 //!
 //! The case tests are named for the histories they build: K (the merge bases'
 //! own merge is a conflict), D and MD (a merge base deletes the path), T (three
@@ -41,10 +41,9 @@ use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::MergedTreeValue;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
-use jj_lib::config::ConfigLayer;
-use jj_lib::config::ConfigSource;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
 use jj_lib::merged_tree::MergedTree;
@@ -69,6 +68,7 @@ use testutils::create_tree;
 use testutils::read_file;
 use testutils::repo_path;
 use testutils::repo_path_buf;
+use testutils::settings_with_same_change;
 
 /// The opening marker line of a hunk of the virtual base, before its hex.
 const OPEN: &str = "<<<<<<< jj virtual merge base ";
@@ -307,19 +307,8 @@ impl Merged {
 /// Whether two merged values have the same adds and the same removes, as
 /// multisets, after `simplify()`.
 fn same_terms(a: &MergedTreeValue, b: &MergedTreeValue) -> bool {
-    fn sorted<'a>(terms: impl Iterator<Item = &'a Option<TreeValue>>) -> Vec<String> {
-        terms.map(|term| format!("{term:?}")).sorted().collect()
-    }
     let (a, b) = (a.simplify(), b.simplify());
-    sorted(a.adds()) == sorted(b.adds()) && sorted(a.removes()) == sorted(b.removes())
-}
-
-#[track_caller]
-fn assert_same_terms(actual: &MergedTreeValue, expected: &MergedTreeValue) {
-    assert!(
-        same_terms(actual, expected),
-        "expected the terms of {expected:?}, got {actual:?}"
-    );
+    a.adds().counts() == b.adds().counts() && a.removes().counts() == b.removes().counts()
 }
 
 /// A merge of the given terms.
@@ -351,7 +340,8 @@ fn describe(case: &Case, value: &MergedTreeValue) -> String {
     }
 }
 
-/// Like `assert_same_terms`, with file contents in the failure message.
+/// Asserts that `actual` and `expected` have the same adds and the same
+/// removes, with file contents in the failure message.
 #[track_caller]
 fn assert_same_value(case: &Case, actual: &MergedTreeValue, expected: &MergedTreeValue) {
     assert!(
@@ -366,6 +356,13 @@ fn assert_same_value(case: &Case, actual: &MergedTreeValue, expected: &MergedTre
 fn marker_hex<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     let hex = line.strip_prefix(prefix)?;
     (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// The hex of the opening marker line that starts `lines`.
+#[track_caller]
+fn opening_hex<'a>(lines: &[&'a str]) -> &'a str {
+    marker_hex(lines[0], OPEN)
+        .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"))
 }
 
 /// Whether `content` holds a line that starts with the virtual base's opening
@@ -473,16 +470,22 @@ enum Base {
     Marker,
 }
 
-/// Asserts that the merge is a conflict at `f` whose adds hold each parent's
-/// value there, and whose one remove, after `simplify()`, is `base`.
-fn assert_conflict(merged: &Merged, base: Base) -> TestResult {
+/// Asserts that the merge is a conflict at `f`, and returns its value there,
+/// simplified.
+fn conflict_at_f(merged: &Merged) -> TestResult<MergedTreeValue> {
     let value = merged.value()?;
     assert!(
         !value.is_resolved(),
         "expected a conflict at f, got {}",
         describe(&merged.case, &value)
     );
-    let simplified = value.simplify();
+    Ok(value.simplify())
+}
+
+/// Asserts that the merge is a conflict at `f` whose adds hold each parent's
+/// value there, and whose one remove, after `simplify()`, is `base`.
+fn assert_conflict(merged: &Merged, base: Base) -> TestResult {
+    let simplified = conflict_at_f(merged)?;
     assert_parents_among_adds(merged, &simplified)?;
     let removes = simplified.removes().collect_vec();
     let [remove] = removes[..] else {
@@ -878,8 +881,8 @@ fn case_k4_result_then_a_resolution_of_the_bases() -> TestResult<Merged> {
     Merged::new(case, &[&z, &w])
 }
 
-/// K4's P1 and P2 are Z1 and Z2; Q1 is a merge of them that leaves `f`, Q2 a
-/// merge of them that sets `f` to `R`.
+/// Q1 is a merge of K4's P1 and P2 that leaves `f`, Q2 one that sets `f` to
+/// `R`.
 fn case_two_level_resolution_of_a_k4_merge() -> TestResult<Merged> {
     let TwoBases {
         mut case, p1, p2, ..
@@ -897,8 +900,8 @@ fn case_single_conflicted_base_two_resolutions() -> TestResult<Merged> {
     Merged::new(case, &[&r1, &r2])
 }
 
-/// The reviewer's first table, its second row: a and b set `f` to `A` and `B`;
-/// r1 resolves m's conflict to `A`, m's first side; r2 adds `g2`.
+/// a and b set `f` to `A` and `B`; r1 resolves m's conflict to `A`, m's first
+/// side; r2 adds `g2`.
 fn case_k1_resolved_to_the_bases_first_side() -> TestResult<Merged> {
     let ConflictedBase { mut case, m, .. } = conflicted_base("A", "B")?;
     let r1 = case.commit(&[&m], &[("f", line("A"))])?;
@@ -965,6 +968,29 @@ fn case_resolved_differently(made: Made) -> TestResult<Merged> {
         &[("f", line("b"))],
     )?;
     Merged::new(case, &[&p1, &p2])
+}
+
+/// o holds `d/f` and `g`; a and b change `d/f`, and m, their merge, is
+/// conflicted there; c, a child of o, replaces the directory `d` with a file;
+/// P1 merges m and c, so it holds a conflict between a directory and a file at
+/// `d`; P2, a child of m, changes `g`. Returns the merge of P1 and P2, and P1's
+/// value at `d`.
+fn case_file_directory_conflict_in_a_side() -> TestResult<(Merged, MergedTreeValue)> {
+    let mut case = Case::new();
+    let root = case.root();
+    let o = case.commit(&[&root], &[("d/f", line("o")), ("g", line("g"))])?;
+    let a = case.commit(&[&o], &[("d/f", line("a"))])?;
+    let b = case.commit(&[&o], &[("d/f", line("b"))])?;
+    let m = case.commit(&[&a, &b], &[])?;
+    let c = case.commit(&[&o], &[("d", line("c"))])?;
+    let p1 = case.commit(&[&m, &c], &[])?;
+    let p2 = case.commit(&[&m], &[("g", line("g2"))])?;
+    let p1_value = value_at(&p1.tree(), "d")?;
+    assert!(
+        !p1_value.is_resolved(),
+        "the case needs P1 to hold a conflict at d"
+    );
+    Ok((Merged::new(case, &[&p1, &p2])?, p1_value))
 }
 
 #[test]
@@ -1117,17 +1143,11 @@ fn e2_swapped() -> TestResult {
 #[test]
 fn e4_deletion_after_a_k4_merge() -> TestResult {
     let merged = case_e4()?;
-    let value = merged.value()?;
-    assert!(
-        !value.is_resolved(),
-        "expected a conflict at f, got {}",
-        describe(&merged.case, &value)
-    );
-    let simplified = value.simplify();
+    let simplified = conflict_at_f(&merged)?;
     assert!(
         simplified.adds().any(|add| add.is_none()),
         "expected a deletion among the conflict's sides, got {}",
-        describe(&merged.case, &value)
+        describe(&merged.case, &simplified)
     );
     assert_parents_among_adds(&merged, &simplified)
 }
@@ -1197,19 +1217,13 @@ fn md1_then_a_deletion_resolves_to_the_deletion() -> TestResult {
 #[test]
 fn k4_result_then_a_resolution_of_the_bases() -> TestResult {
     let merged = case_k4_result_then_a_resolution_of_the_bases()?;
-    let value = merged.value()?;
-    assert!(
-        !value.is_resolved(),
-        "expected a conflict at f, got {}",
-        describe(&merged.case, &value)
-    );
-    let simplified = value.simplify();
+    let simplified = conflict_at_f(&merged)?;
     for side in ["x", "y", "w"] {
         let term = merged.case.text(side);
         assert!(
             simplified.adds().any(|add| *add == term),
             "the conflict does not hold {side:?}: {}",
-            describe(&merged.case, &value)
+            describe(&merged.case, &simplified)
         );
     }
     Ok(())
@@ -1288,6 +1302,61 @@ fn resolved_differently_in_both_base_orders() -> TestResult {
     Ok(())
 }
 
+/// V does not resolve at `d/f`, P1 holds a conflict between a directory and a
+/// file at `d`, and P2 leaves `d` as V holds it: the merge holds P1's conflict
+/// at `d`.
+#[test]
+fn file_directory_conflict_above_a_conflicted_base() -> TestResult {
+    let (merged, p1_value) = case_file_directory_conflict_in_a_side()?;
+    let value = value_at(&merged.tree, "d")?;
+    assert!(
+        same_terms(&value, &p1_value),
+        "expected P1's value at d, {p1_value:?}, got {value:?}"
+    );
+    Ok(())
+}
+
+/// Where both parents changed V's conflict at `f`, each parent's value in the
+/// merge's conflict carries that parent's label, as jj's materialization reads
+/// the labels: the tree's labels, simplified with the file ids at `f`.
+#[test]
+fn conflict_labels_name_each_parent() -> TestResult {
+    let cases = [
+        ("K4", case_k4(Made::AFirst, Order::AsNamed)?),
+        (
+            "resolved differently, A first",
+            case_resolved_differently(Made::AFirst)?,
+        ),
+        (
+            "resolved differently, B first",
+            case_resolved_differently(Made::BFirst)?,
+        ),
+    ];
+    for (name, merged) in cases {
+        let file_ids = merged
+            .value()?
+            .to_file_merge()
+            .unwrap_or_else(|| panic!("{name}: expected files at f"));
+        let (labels, file_ids) = merged.tree.labels().simplify_with(&file_ids);
+        for parent in &merged.parents {
+            let parent_ids = value_at(&parent.tree(), "f")?
+                .to_file_merge()
+                .unwrap_or_else(|| panic!("{name}: expected the parent to hold a file at f"));
+            let index = file_ids
+                .adds()
+                .position(|id| id == parent_ids.first())
+                .unwrap_or_else(|| panic!("{name}: {file_ids:?} lacks {parent_ids:?}"));
+            assert_eq!(
+                labels.get_add(index),
+                Some(parent.conflict_label().as_str()),
+                "{name}: the label of the parent's value in the conflict, with the labels \
+                 {labels:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `merge_commit_trees_no_resolve` keeps its contract: the rule's value at
 /// `f`, unresolved, and at `g`, a conflict that resolves, what
 /// `MergedTree::merge_no_resolve` of the parents and V holds there.
@@ -1325,7 +1394,7 @@ fn no_resolve_leaves_other_paths_unresolved() -> TestResult {
         (base, "base".to_owned()),
         (p2.tree(), "p2".to_owned()),
     ]));
-    assert_same_terms(&g_value, &value_at(&expected, "g")?);
+    assert_same_value(&merged.case, &g_value, &value_at(&expected, "g")?);
     Ok(())
 }
 
@@ -1407,6 +1476,9 @@ fn virtual_base_never_in_a_resolved_tree() -> TestResult {
         ("resolved differently, B first", || {
             case_resolved_differently(Made::BFirst)
         }),
+        ("file/directory conflict in a side", || {
+            Ok(case_file_directory_conflict_in_a_side()?.0)
+        }),
     ];
     for (name, build) in cases {
         let merged = build()?;
@@ -1436,11 +1508,7 @@ fn virtual_base_never_in_a_resolved_tree() -> TestResult {
 /// V does not depend on the order in which its merge bases are given.
 #[test]
 fn v_independent_of_base_order() -> TestResult {
-    for (name, made) in [
-        ("T3", Made::AFirst),
-        ("T5 A first", Made::AFirst),
-        ("T5 B first", Made::BFirst),
-    ] {
+    for (name, made) in [("A first", Made::AFirst), ("B first", Made::BFirst)] {
         let (case, bases) = three_bases(made)?;
         let ids = bases.iter().map(|commit| commit.id().clone()).collect_vec();
         let mut values: Vec<(Vec<CommitId>, MergedTreeValue, MergedTreeValue)> = vec![];
@@ -1504,17 +1572,12 @@ fn older_fold_counts_as_changed() -> TestResult {
         ],
     )?;
     let merged = Merged::new(case, &[&x, &y])?;
-    let value = merged.value()?;
-    assert!(
-        !value.is_resolved(),
-        "expected a conflict at f, got {}",
-        describe(&merged.case, &value)
-    );
+    let simplified = conflict_at_f(&merged)?;
     let term_r = merged.case.text("R");
     assert!(
-        value.simplify().adds().any(|add| *add == term_r),
+        simplified.adds().any(|add| *add == term_r),
         "the conflict does not hold R: {}",
-        describe(&merged.case, &value)
+        describe(&merged.case, &simplified)
     );
     Ok(())
 }
@@ -1573,20 +1636,6 @@ fn term_lines(case: &Case, value: &MergedTreeValue) -> Vec<String> {
         .collect()
 }
 
-fn settings_with_same_change(same_change: SameChange) -> UserSettings {
-    let mut config = testutils::base_user_config();
-    let mut layer = ConfigLayer::empty(ConfigSource::User);
-    let same_change_str = match same_change {
-        SameChange::Keep => "keep",
-        SameChange::Accept => "accept",
-    };
-    layer
-        .set_value("merge.same-change", same_change_str)
-        .unwrap();
-    config.add_layer(layer);
-    testutils::user_settings_from_config(config)
-}
-
 /// Both parents hold the same value, resolved or conflicted, where V resolves
 /// and where it does not: the merge holds that value.
 #[test]
@@ -1596,10 +1645,10 @@ fn rule_parents_equal() -> TestResult {
     let (res_c, res_o) = (resolved(c.as_ref()), resolved(o.as_ref()));
     let k = conflict(&[&a, &o, &b]);
     let k2 = conflict(&[&c, &o, &d]);
-    assert_same_terms(&rule(&case, &res_o, &res_c, &res_c)?, &res_c);
-    assert_same_terms(&rule(&case, &res_o, &k, &k)?, &k);
-    assert_same_terms(&rule(&case, &k, &res_c, &res_c)?, &res_c);
-    assert_same_terms(&rule(&case, &k, &k2, &k2)?, &k2);
+    assert_same_value(&case, &rule(&case, &res_o, &res_c, &res_c)?, &res_c);
+    assert_same_value(&case, &rule(&case, &res_o, &k, &k)?, &k);
+    assert_same_value(&case, &rule(&case, &k, &res_c, &res_c)?, &res_c);
+    assert_same_value(&case, &rule(&case, &k, &k2, &k2)?, &k2);
     Ok(())
 }
 
@@ -1609,12 +1658,14 @@ fn rule_base_resolves_three_way() -> TestResult {
     let case = Case::new();
     let [a, b, c, o] = ["a", "b", "c", "o"].map(|value| case.text(value));
     let [res_a, res_b, res_c, res_o] = [&a, &b, &c, &o].map(|term| resolved(term.as_ref()));
-    assert_same_terms(
+    assert_same_value(
+        &case,
         &rule(&case, &res_o, &res_a, &res_b)?,
         &conflict(&[&a, &o, &b]),
     );
-    assert_same_terms(&rule(&case, &res_o, &res_a, &res_o)?, &res_a);
-    assert_same_terms(
+    assert_same_value(&case, &rule(&case, &res_o, &res_a, &res_o)?, &res_a);
+    assert_same_value(
+        &case,
         &rule(&case, &res_o, &conflict(&[&a, &o, &b]), &res_c)?,
         &conflict(&[&a, &o, &b, &o, &c]),
     );
@@ -1629,16 +1680,17 @@ fn rule_keep_same_change() -> TestResult {
     let [a, b, c, d, o, r] = ["a", "b", "c", "d", "o", "R"].map(|value| case.text(value));
     let [res_a, res_c, res_d, res_o, res_r] =
         [&a, &c, &d, &o, &r].map(|term| resolved(term.as_ref()));
-    assert_same_terms(
+    assert_same_value(
+        &case,
         &rule(&case, &res_o, &res_a, &res_a)?,
         &conflict(&[&a, &o, &a]),
     );
     let v = conflict(&[&a, &o, &b]);
-    assert_same_terms(&rule(&case, &v, &res_c, &res_c)?, &res_c);
-    assert_same_terms(&rule(&case, &v, &v, &res_r)?, &res_r);
+    assert_same_value(&case, &rule(&case, &v, &res_c, &res_c)?, &res_c);
+    assert_same_value(&case, &rule(&case, &v, &v, &res_r)?, &res_r);
     let result = rule(&case, &v, &res_c, &res_d)?;
     let base_term = virtual_base_term(&case, &result);
-    assert_same_terms(&result, &conflict(&[&c, &base_term, &d]));
+    assert_same_value(&case, &result, &conflict(&[&c, &base_term, &d]));
     Ok(())
 }
 
@@ -1652,13 +1704,17 @@ fn rule_one_parent_unchanged() -> TestResult {
     let res_r = resolved(r.as_ref());
     let v = conflict(&[&a, &o, &b]);
     let k2 = conflict(&[&c, &o, &d]);
-    assert_same_terms(&rule(&case, &v, &v, &res_r)?, &res_r);
-    assert_same_terms(&rule(&case, &v, &res_r, &v)?, &res_r);
-    assert_same_terms(&rule(&case, &v, &v, &k2)?, &k2);
-    assert_same_terms(&rule(&case, &v, &k2, &v)?, &k2);
-    assert_same_terms(&rule(&case, &v, &v, &Merge::absent())?, &Merge::absent());
+    assert_same_value(&case, &rule(&case, &v, &v, &res_r)?, &res_r);
+    assert_same_value(&case, &rule(&case, &v, &res_r, &v)?, &res_r);
+    assert_same_value(&case, &rule(&case, &v, &v, &k2)?, &k2);
+    assert_same_value(&case, &rule(&case, &v, &k2, &v)?, &k2);
+    assert_same_value(
+        &case,
+        &rule(&case, &v, &v, &Merge::absent())?,
+        &Merge::absent(),
+    );
     let v3 = conflict(&[&x, &o, &y, &o, &x]);
-    assert_same_terms(&rule(&case, &v3, &v3, &res_r)?, &res_r);
+    assert_same_value(&case, &rule(&case, &v3, &v3, &res_r)?, &res_r);
     Ok(())
 }
 
@@ -1669,8 +1725,8 @@ fn rule_both_parents_unchanged() -> TestResult {
     let case = Case::new();
     let [a, b, o] = ["a", "b", "o"].map(|value| case.text(value));
     let v = conflict(&[&a, &o, &b]);
-    assert_same_terms(&rule(&case, &v, &v, &v)?, &v);
-    assert_same_terms(&rule(&case, &v, &v, &conflict(&[&b, &o, &a]))?, &v);
+    assert_same_value(&case, &rule(&case, &v, &v, &v)?, &v);
+    assert_same_value(&case, &rule(&case, &v, &v, &conflict(&[&b, &o, &a]))?, &v);
     Ok(())
 }
 
@@ -1683,14 +1739,16 @@ fn rule_equal_in_another_order() -> TestResult {
     let res_r = resolved(r.as_ref());
     let v = conflict(&[&a, &o, &b]);
     let other_order = conflict(&[&b, &o, &a]);
-    assert_same_terms(&rule(&case, &v, &other_order, &res_r)?, &res_r);
-    assert_same_terms(&rule(&case, &v, &res_r, &other_order)?, &res_r);
-    assert_same_terms(
+    assert_same_value(&case, &rule(&case, &v, &other_order, &res_r)?, &res_r);
+    assert_same_value(&case, &rule(&case, &v, &res_r, &other_order)?, &res_r);
+    assert_same_value(
+        &case,
         &rule(&case, &v, &conflict(&[&a, &o, &b, &c, &c]), &res_r)?,
         &res_r,
     );
     let v3 = conflict(&[&x, &o, &y, &o, &x]);
-    assert_same_terms(
+    assert_same_value(
+        &case,
         &rule(&case, &v3, &conflict(&[&y, &o, &x, &o, &x]), &res_r)?,
         &res_r,
     );
@@ -1707,13 +1765,13 @@ fn rule_both_changed_text() -> TestResult {
     let result = rule(&case, &v, &resolved(c.as_ref()), &resolved(d.as_ref()))?;
     assert!(!result.is_resolved(), "expected a conflict, got {result:?}");
     let base_term = virtual_base_term(&case, &result);
-    assert_same_terms(&result, &conflict(&[&c, &base_term, &d]));
+    assert_same_value(&case, &result, &conflict(&[&c, &base_term, &d]));
     assert_virtual_base(&case.read(base_term.as_ref()).unwrap(), &["a", "b"]);
 
     let k2 = conflict(&[&c, &o, &d]);
     let result = rule(&case, &v, &k2, &resolved(e.as_ref()))?;
     let base_term = virtual_base_term(&case, &result);
-    assert_same_terms(&result, &conflict(&[&c, &o, &d, &base_term, &e]));
+    assert_same_value(&case, &result, &conflict(&[&c, &o, &d, &base_term, &e]));
     Ok(())
 }
 
@@ -1806,8 +1864,7 @@ fn virtual_base_keeps_merged_hunks() -> TestResult {
     let p2 = Merge::resolved(file("z 2 3 4 5 6 7 8 9a 10"));
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
-    let hex = marker_hex(lines[0], OPEN)
-        .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"));
+    let hex = opening_hex(&lines);
     let expected = [
         format!("{OPEN}{hex}"),
         "x".to_owned(),
@@ -1838,8 +1895,7 @@ fn virtual_base_sides_between_markers() -> TestResult {
     let p2 = Merge::resolved(file("x1 Q x2 2 3 4 5 6 7 8 9 10"));
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
-    let hex = marker_hex(lines[0], OPEN)
-        .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"));
+    let hex = opening_hex(&lines);
     let expected = [
         format!("{OPEN}{hex}"),
         "x1".to_owned(),
@@ -1864,8 +1920,7 @@ fn virtual_base_sides_between_markers() -> TestResult {
     let p2 = Merge::resolved(file("q 2 3"));
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
-    let hex = marker_hex(lines[0], OPEN)
-        .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"));
+    let hex = opening_hex(&lines);
     let expected = [
         format!("{OPEN}{hex}"),
         "x".to_owned(),
@@ -2030,8 +2085,7 @@ fn virtual_base_add_add() -> TestResult {
     let v = conflict(&[&x, &None, &y]);
     let (_, content) = virtual_base(&case, &v, &resolved(c.as_ref()), &resolved(d.as_ref()))?;
     let lines = text_lines(&content);
-    let hex = marker_hex(lines[0], OPEN)
-        .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"));
+    let hex = opening_hex(&lines);
     assert_eq!(
         lines,
         [

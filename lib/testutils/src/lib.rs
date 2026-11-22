@@ -51,6 +51,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::merge::Merge;
+use jj_lib::merge::SameChange;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
@@ -156,6 +157,22 @@ pub fn user_settings() -> UserSettings {
 /// Creates new immutable settings object from the given config.
 pub fn user_settings_from_config(config: StackedConfig) -> UserSettings {
     UserSettings::from_config_and_home_dir(config, None).unwrap()
+}
+
+/// Returns settings like [`user_settings()`] with `merge.same-change` set to
+/// `same_change`.
+pub fn settings_with_same_change(same_change: SameChange) -> UserSettings {
+    let mut config = base_user_config();
+    let mut layer = ConfigLayer::empty(ConfigSource::User);
+    let same_change_str = match same_change {
+        SameChange::Keep => "keep",
+        SameChange::Accept => "accept",
+    };
+    layer
+        .set_value("merge.same-change", same_change_str)
+        .unwrap();
+    config.add_layer(layer);
+    user_settings_from_config(config)
 }
 
 /// Creates [`SnapshotOptions`] for use in tests.

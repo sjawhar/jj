@@ -13,14 +13,11 @@
 // limitations under the License.
 
 use jj_lib::backend::TreeValue;
-use jj_lib::config::ConfigLayer;
-use jj_lib::config::ConfigSource;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::rewrite::rebase_commit;
-use jj_lib::settings::UserSettings;
 use pollster::FutureExt as _;
 use test_case::test_case;
 use testutils::CommitBuilderExt as _;
@@ -29,6 +26,7 @@ use testutils::TestResult;
 use testutils::assert_tree_eq;
 use testutils::create_tree;
 use testutils::repo_path;
+use testutils::settings_with_same_change;
 
 #[test]
 fn test_simplify_conflict_after_resolving_parent() -> TestResult {
@@ -271,8 +269,8 @@ fn test_rebase_on_lossy_merge(same_change: SameChange) -> TestResult {
 /// removes [A(bun), B(bun)]`, so "bun" cancels to net 0 while the no-bun
 /// version wins with +1: the line is resolved away with no conflict marker,
 /// and -- because a merge commit's diff is taken against its auto-merged
-/// parents -- with no diff either. Reducing the bases to a single virtual
-/// merge base first keeps it.
+/// parents -- with no diff either. Merging and resolving the bases into one
+/// tree first keeps it.
 #[test]
 fn test_merge_does_not_drop_content_carried_by_both_sides() -> TestResult {
     let test_repo = TestRepo::init();
@@ -461,18 +459,4 @@ fn test_merge_of_two_resolutions_does_not_revert_to_the_base() -> TestResult {
     assert_eq!(adds, [b"A\n".to_vec(), b"B\n".to_vec()]);
 
     Ok(())
-}
-
-fn settings_with_same_change(same_change: SameChange) -> UserSettings {
-    let mut config = testutils::base_user_config();
-    let mut layer = ConfigLayer::empty(ConfigSource::User);
-    let same_change_str = match same_change {
-        SameChange::Keep => "keep",
-        SameChange::Accept => "accept",
-    };
-    layer
-        .set_value("merge.same-change", same_change_str)
-        .unwrap();
-    config.add_layer(layer);
-    testutils::user_settings_from_config(config)
 }
