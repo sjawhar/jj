@@ -122,54 +122,174 @@ pub async fn merge_commit_trees_no_resolve_without_repo(
     if commit_ids.len() > 2 {
         commit_ids.sort_unstable();
     }
-    Box::pin(merge_commit_ids(store, index, &commit_ids, false)).await
+    let fold = TreeFold { store };
+    // The merge's future is boxed so that its nested type does not reach the
+    // callers: unboxed, rustc overflows its recursion limit when it lays out
+    // the futures of jj-cli.
+    Box::pin(fold_commits(store, index, &fold, commit_ids, false)).await
 }
 
-/// Merges the trees of `commit_ids` one at a time, in the given order: the
-/// tree of each commit is merged into the merge of the trees before it, against
-/// V, the merge of their merge bases.
+/// What [`fold_commits`] builds from a list of commits: their merge, one
+/// commit at a time.
+trait CommitFold {
+    /// The merge of some commits.
+    type Merged;
+    /// What V, the merge of the merge bases of two commits, is called in the
+    /// merge of the two.
+    type Label;
+
+    /// Puts `base_ids`, the merge bases of two commits, in the order in which
+    /// V merges them.
+    fn sort_bases(&self, base_ids: &mut [CommitId]);
+
+    /// The label of V, the merge of `base_ids`, which are in the order the
+    /// index returns them.
+    async fn label_bases(&self, base_ids: &[CommitId]) -> BackendResult<Self::Label>;
+
+    /// The merge of the one commit `commit_id`.
+    async fn commit(&self, commit_id: &CommitId) -> BackendResult<Self::Merged>;
+
+    /// Merges the commit `commit_ids[pos]` into `merged`, the merge of
+    /// `commit_ids[..pos]`, against `base`, V and its label, and resolves the
+    /// result if `resolve` is set.
+    async fn merge_next(
+        &self,
+        merged: Self::Merged,
+        commit_ids: &[CommitId],
+        pos: usize,
+        base: (Self::Merged, Self::Label),
+        resolve: bool,
+    ) -> BackendResult<Self::Merged>;
+}
+
+/// Merges `commit_ids` one at a time, in the given order, as `fold` merges
+/// them: each commit is merged into the merge of the commits before it,
+/// against V, the merge of their merge bases. With no merge base, V is the
+/// root commit, and with one, that commit. Two or more merge bases are merged
+/// the same way, in the order [`CommitFold::sort_bases`] gives, before the
+/// merge that needs them goes on.
 ///
-/// Where V does not resolve, [`merge_parent_values`] gives the value at that
-/// path, so that V's terms cannot cancel content that the merged trees hold
-/// (<https://github.com/jj-vcs/jj/issues/6369>). Each merge but the last is
-/// resolved, and the last one too if `resolve` is set.
-async fn merge_commit_ids(
-    store: &Arc<Store>,
+/// Each merge is resolved but the last one, and the last one too if `resolve`
+/// is set. The merges that wait for their V are kept in a `Vec`, so merge
+/// bases nested to any depth take no more of the call stack than one merge.
+async fn fold_commits<F: CommitFold>(
+    store: &Store,
     index: &dyn Index,
-    commit_ids: &[CommitId],
+    fold: &F,
+    commit_ids: Vec<CommitId>,
     resolve: bool,
-) -> BackendResult<MergedTree> {
-    let commits: Vec<Commit> =
-        try_join_all(commit_ids.iter().map(|id| store.get_commit_async(id))).await?;
-    let Some(first) = commits.first() else {
-        return Ok(store.root_commit().tree());
+) -> BackendResult<F::Merged> {
+    /// The commits being merged, the position of the next one, and the merge
+    /// of the commits before it.
+    struct WorkItem<M> {
+        commit_ids: Vec<CommitId>,
+        pos: usize,
+        merged: M,
+    }
+
+    let Some(first_id) = commit_ids.first() else {
+        return fold.commit(store.root_commit_id()).await;
     };
-    let mut tree = first.tree();
-    for (pos, commit) in commits.iter().enumerate().skip(1) {
-        let mut base_ids = index
-            .common_ancestors(&commit_ids[..pos], slice::from_ref(commit.id()))
-            .await
-            // TODO: indexing error shouldn't be a "BackendError"
-            .map_err(|err| BackendError::Other(err.into()))?;
-        let base_commits: Vec<Commit> =
-            try_join_all(base_ids.iter().map(|id| store.get_commit_async(id))).await?;
-        // V's label lists the merge bases in the order the index returns them,
-        // but V merges them in the order of their commit ids, so that V does
-        // not depend on the order they were made in.
+    let merged = fold.commit(first_id).await?;
+    let mut item = WorkItem {
+        commit_ids,
+        pos: 1,
+        merged,
+    };
+    // The work items below `item`, each with the label of the merge bases of
+    // its next commit, whose merge `item` builds.
+    let mut waiting: Vec<(WorkItem<F::Merged>, F::Label)> = vec![];
+    loop {
+        let base = if let Some(next_id) = item.commit_ids.get(item.pos) {
+            let mut base_ids = index
+                .common_ancestors(&item.commit_ids[..item.pos], slice::from_ref(next_id))
+                .await
+                // TODO: indexing error shouldn't be a "BackendError"
+                .map_err(|err| BackendError::Other(err.into()))?;
+            let label = fold.label_bases(&base_ids).await?;
+            if base_ids.len() > 1 {
+                fold.sort_bases(&mut base_ids);
+                let merged = fold.commit(&base_ids[0]).await?;
+                let bases = WorkItem {
+                    commit_ids: base_ids,
+                    pos: 1,
+                    merged,
+                };
+                waiting.push((mem::replace(&mut item, bases), label));
+                continue;
+            }
+            let base_id = base_ids.first().unwrap_or(store.root_commit_id());
+            (fold.commit(base_id).await?, label)
+        } else if let Some((below, label)) = waiting.pop() {
+            (mem::replace(&mut item, below).merged, label)
+        } else {
+            return Ok(item.merged);
+        };
+        let resolve = resolve || item.pos + 1 < item.commit_ids.len() || !waiting.is_empty();
+        item.merged = fold
+            .merge_next(item.merged, &item.commit_ids, item.pos, base, resolve)
+            .await?;
+        item.pos += 1;
+    }
+}
+
+/// The merge of the trees of commits, two at a time by
+/// [`merge_parent_trees`]: where V does not resolve, [`merge_parent_values`]
+/// gives the value at that path, so that V's terms cannot cancel content that
+/// the merged trees hold (<https://github.com/jj-vcs/jj/issues/6369>).
+struct TreeFold<'a> {
+    store: &'a Arc<Store>,
+}
+
+impl CommitFold for TreeFold<'_> {
+    type Merged = MergedTree;
+    type Label = String;
+
+    /// V merges the merge bases in the order of their commit ids, so that V
+    /// does not depend on the order they were made in.
+    fn sort_bases(&self, base_ids: &mut [CommitId]) {
         base_ids.sort_unstable();
-        let base_tree = Box::pin(merge_commit_ids(store, index, &base_ids, true)).await?;
-        tree = merge_parent_trees(
-            store,
-            (tree, conflict_label_for_commits(&commits[..pos])),
-            (base_tree, conflict_label_for_commits(&base_commits)),
-            (commit.tree(), commit.conflict_label()),
+    }
+
+    /// V's label lists the merge bases in the order the index returns them.
+    async fn label_bases(&self, base_ids: &[CommitId]) -> BackendResult<String> {
+        let base_commits: Vec<Commit> =
+            try_join_all(base_ids.iter().map(|id| self.store.get_commit_async(id))).await?;
+        Ok(conflict_label_for_commits(&base_commits))
+    }
+
+    async fn commit(&self, commit_id: &CommitId) -> BackendResult<MergedTree> {
+        Ok(self.store.get_commit_async(commit_id).await?.tree())
+    }
+
+    async fn merge_next(
+        &self,
+        merged: MergedTree,
+        commit_ids: &[CommitId],
+        pos: usize,
+        base: (MergedTree, String),
+        resolve: bool,
+    ) -> BackendResult<MergedTree> {
+        let merged_commits = try_join_all(
+            commit_ids[..pos]
+                .iter()
+                .map(|id| self.store.get_commit_async(id)),
+        );
+        let next = self.store.get_commit_async(&commit_ids[pos]);
+        let (merged_commits, next) = try_join!(merged_commits, next)?;
+        let tree = merge_parent_trees(
+            self.store,
+            (merged, conflict_label_for_commits(&merged_commits)),
+            base,
+            (next.tree(), next.conflict_label()),
         )
         .await?;
-        if resolve || pos + 1 < commits.len() {
-            tree = tree.resolve().await?;
+        if resolve {
+            tree.resolve().await
+        } else {
+            Ok(tree)
         }
     }
-    Ok(tree)
 }
 
 /// Merges `side1` and `side2` against `base`, V, the merge of their merge
@@ -484,83 +604,52 @@ pub async fn merge_base_tree(
     index: &dyn Index,
     base_ids: &[CommitId],
 ) -> BackendResult<MergedTree> {
+    let fold = TreeFold { store };
     let mut base_ids = base_ids.to_vec();
-    base_ids.sort_unstable();
-    merge_commit_ids(store, index, &base_ids, true).await
+    fold.sort_bases(&mut base_ids);
+    fold_commits(store, index, &fold, base_ids, true).await
 }
 
-/// Find the commits to use as input to the recursive merge algorithm.
+/// Find the commits to use as input to the recursive merge algorithm: each
+/// commit of `commit_ids` after the first is merged into the merge of the
+/// commits before it, against the merge of their merge bases, which are merged
+/// the same way in the order the index returns them, and each merge is
+/// flattened into one merge of commit ids.
 pub async fn find_recursive_merge_commits(
     store: &Arc<Store>,
     index: &dyn Index,
     commit_ids: Vec<CommitId>,
 ) -> BackendResult<Merge<CommitId>> {
-    #[derive(Debug)]
-    struct WorkItem {
-        commit_ids: Vec<CommitId>,
-        result: Merge<CommitId>,
+    fold_commits(store, index, &CommitIdFold, commit_ids, false).await
+}
+
+/// The merge of commit ids, where each merge is flattened.
+struct CommitIdFold;
+
+impl CommitFold for CommitIdFold {
+    type Merged = Merge<CommitId>;
+    type Label = ();
+
+    fn sort_bases(&self, _base_ids: &mut [CommitId]) {}
+
+    async fn label_bases(&self, _base_ids: &[CommitId]) -> BackendResult<()> {
+        Ok(())
+    }
+
+    async fn commit(&self, commit_id: &CommitId) -> BackendResult<Merge<CommitId>> {
+        Ok(Merge::resolved(commit_id.clone()))
+    }
+
+    async fn merge_next(
+        &self,
+        merged: Merge<CommitId>,
+        commit_ids: &[CommitId],
         pos: usize,
-    }
-
-    impl WorkItem {
-        fn new(commit_ids: Vec<CommitId>) -> Self {
-            let result = Merge::resolved(commit_ids[0].clone());
-            Self {
-                commit_ids,
-                result,
-                pos: 1,
-            }
-        }
-
-        fn merge_next(&mut self, ancestor: Merge<CommitId>) {
-            let dummy = Merge::resolved(CommitId::new(vec![]));
-            let result = mem::replace(&mut self.result, dummy);
-            let other = Merge::resolved(self.commit_ids[self.pos].clone());
-            self.result = Merge::from_vec(vec![result, ancestor, other]).flatten();
-            self.pos += 1;
-        }
-    }
-
-    let maybe_resolved = |commit_ids: Vec<CommitId>| match commit_ids.len() {
-        0 => Ok(Merge::resolved(store.root_commit_id().clone())),
-        1 => Ok(Merge::resolved(commit_ids.into_iter().next().unwrap())),
-        _ => Err(commit_ids),
-    };
-
-    // Execute recursion without using the call stack:
-    // ```
-    // let mut result = Merge::resolved(commit_ids[0].clone());
-    // for pos in 1..commit_ids.len() {
-    //     let ancestor_ids = index.common_ancestors(&commit_ids[0..pos], &commit_ids[pos..][..1])?;
-    //     let ancestor = find_recursive_merge_commits(store, index, ancestor_ids)?;
-    //     let other = Merge::resolved(commit_ids[pos].clone());
-    //     result = Merge::from_vec(vec![result, ancestor, other]).flatten();
-    // }
-    // ```
-    let mut stack = Vec::new();
-    match maybe_resolved(commit_ids) {
-        Ok(result) => return Ok(result),
-        Err(commit_ids) => stack.push(WorkItem::new(commit_ids)),
-    }
-    loop {
-        let top = stack.last_mut().unwrap();
-        if top.pos < top.commit_ids.len() {
-            let ancestor_ids = index
-                .common_ancestors(&top.commit_ids[0..top.pos], &top.commit_ids[top.pos..][..1])
-                .await
-                // TODO: indexing error shouldn't be a "BackendError"
-                .map_err(|err| BackendError::Other(err.into()))?;
-            match maybe_resolved(ancestor_ids) {
-                Ok(ancestor) => top.merge_next(ancestor),
-                Err(ancestor_ids) => stack.push(WorkItem::new(ancestor_ids)),
-            }
-        } else {
-            let ancestor = stack.pop().unwrap();
-            let Some(top) = stack.last_mut() else {
-                return Ok(ancestor.result);
-            };
-            top.merge_next(ancestor.result);
-        }
+        (base, ()): (Merge<CommitId>, ()),
+        _resolve: bool,
+    ) -> BackendResult<Merge<CommitId>> {
+        let next = Merge::resolved(commit_ids[pos].clone());
+        Ok(Merge::from_vec(vec![merged, base, next]).flatten())
     }
 }
 
