@@ -33,6 +33,8 @@ use tracing::instrument;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
+use crate::backend::MergedTreeValue;
+use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::commit::CommitIteratorExt as _;
 use crate::commit::conflict_label_for_commits;
@@ -177,6 +179,69 @@ async fn merge_commit_ids_no_resolve(
         terms.push(commit_tree(commit_id).await?);
     }
     Ok(MergedTree::merge_no_resolve(Merge::from_vec(terms)))
+}
+
+/// Merges the values that two parents, `parent1` and `parent2`, hold at
+/// `path`, against `base`, the value that V, the merge of all their merge
+/// bases, holds there.
+///
+/// Where `base` resolves, two parents that hold the same value give that value
+/// under the store's `merge.same-change=accept`, and otherwise the result is
+/// the three-way merge `[parent1, base, parent2]`, flattened. Where `base` does
+/// not resolve, under any `merge.same-change` setting: two parents that hold
+/// the same value give that value; a parent whose value has the same adds and
+/// the same removes as `base` (as multisets, after `simplify()`) counts as
+/// unchanged, so the result is the other parent's value, or `base` itself when
+/// both parents leave it; and two parents that differ from `base` and from
+/// each other give `[parent1, virtual base, parent2]`, flattened and left
+/// unresolved, where the virtual base is the file [`virtual_merge_base`]
+/// writes.
+pub async fn merge_parent_values(
+    _store: &Store,
+    _path: &RepoPath,
+    _base: &MergedTreeValue,
+    _parent1: &MergedTreeValue,
+    _parent2: &MergedTreeValue,
+) -> BackendResult<MergedTreeValue> {
+    todo!()
+}
+
+/// Writes to the store the virtual base against which [`merge_parent_values`]
+/// merges two parents that both changed `base`, an unresolved merge, at
+/// `path`, and returns it as a file value.
+///
+/// Where `base` is a conflict of text files (each add a regular file whose
+/// first 8,000 bytes hold no NUL byte, each remove such a file or absent, read
+/// as an empty file), the file is jj's line merge of `base`'s terms: each hunk
+/// that merges keeps its merged text, and each hunk that does not holds
+/// `base`'s sides at that hunk, in `base`'s order, after the marker line
+/// `<<<<<<< jj virtual merge base <hex>`, with `======= <hex>` between two
+/// sides and `>>>>>>> <hex>` after the last. Otherwise the file holds one line,
+/// the opening marker line of hunk 0. `<hex>` is 32 hex digits of a content
+/// hash over the path, the hunk's index, the hunk's terms and a salt, which
+/// goes up from 0 until no line of any term of either parent equals a marker
+/// line. The file is executable where the executable bits of `base` merge to
+/// `true`, and keeps the copy id of `base` where its copy ids merge, else the
+/// placeholder. The result does not depend on the order of the parents.
+pub async fn virtual_merge_base(
+    _store: &Store,
+    _path: &RepoPath,
+    _base: &MergedTreeValue,
+    _parent1: &MergedTreeValue,
+    _parent2: &MergedTreeValue,
+) -> BackendResult<TreeValue> {
+    todo!()
+}
+
+/// Merges the trees of `base_ids`, the merge bases of two commits, into V,
+/// folding them in the order of their commit ids, and resolves the result.
+/// The order of `base_ids` does not change the result.
+pub async fn merge_base_tree(
+    _store: &Arc<Store>,
+    _index: &dyn Index,
+    _base_ids: &[CommitId],
+) -> BackendResult<MergedTree> {
+    todo!()
 }
 
 /// Find the commits to use as input to the recursive merge algorithm.
