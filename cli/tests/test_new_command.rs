@@ -324,18 +324,19 @@ fn test_new_merge_of_two_different_resolutions_conflicts() {
     ");
     // The conflict's base is the virtual merge base, whose own lines start like
     // conflict markers, so jj materializes the conflict with longer markers.
-    // Each side carries the label of the commit it comes from: "p1" for "x"
-    // and "p2" for "y".
+    // Its opening line carries its salt and names the terms of the conflict of
+    // "a" and "b" that it stands for. Each side carries the label of the commit
+    // it comes from: "p1" for "x" and "p2" for "y".
     let materialized = work_dir.read_file("file");
     insta::assert_snapshot!(materialized, @r#"
     <<<<<<<<<<< conflict 1 of 1
     %%%%%%%%%%% diff from: zsuskuln 4d032ef7 "a"
     \\\\\\\\\\\        to: vruxwmqv a902e1f4 "p1"
-    -<<<<<<< jj virtual merge base bc644be6809c161606dd9a1ba5a047f1
+    -<<<<<<< jj virtual merge base 43076495dee0ff536be5b8031bfed2f3 0 file:587be6b4c3f93f93c489c0111bba5596147a26cb file:13e7564ea0c889e81bcba6f8e496b2a74cdb32fa file:975fbec8256d3e8a3797e7a3611380f27c49f4ac
      x
-    -======= bc644be6809c161606dd9a1ba5a047f1
+    -======= 43076495dee0ff536be5b8031bfed2f3
     -y
-    ->>>>>>> bc644be6809c161606dd9a1ba5a047f1
+    ->>>>>>> 43076495dee0ff536be5b8031bfed2f3
     +++++++++++ znkkpsqq 9ca67c80 "p2"
     y
     >>>>>>>>>>> conflict 1 of 1 ends

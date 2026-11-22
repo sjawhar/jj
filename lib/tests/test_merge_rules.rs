@@ -23,10 +23,11 @@
 //! virtual base (VB): for a conflict of text files, jj's line merge of V's
 //! terms with V's sides between marker lines where they do not merge, as git
 //! builds one; otherwise M, a block of marker lines around one line for each
-//! of V's terms, so the merge is a conflict. VB and M are only ever terms of a
-//! conflict, also after a later rebase, abandon or squash (VB1). Merge bases,
-//! and the parents of a merge of three or more commits, are merged in the
-//! order of their commit ids.
+//! of V's terms, so the merge is a conflict. VB and M name V's terms, and are
+//! only ever bases of conflicts: where a later merge, such as a rebase, an
+//! abandon or a squash, leaves one as a side, it merges the terms of V that it
+//! names instead (VB1 to VB5). Merge bases, and the parents of a merge of three
+//! or more commits, are merged in the order of their commit ids.
 //!
 //! The case tests are named for the histories they build: K (the merge bases'
 //! own merge is a conflict), D and MD (a merge base deletes the path), T (three
@@ -38,6 +39,8 @@
 
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
@@ -46,11 +49,17 @@ use jj_lib::backend::MergedTreeValue;
 use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
+use jj_lib::conflict_labels::ConflictLabels;
+use jj_lib::conflicts::ConflictMarkerStyle;
+use jj_lib::conflicts::ConflictMaterializeOptions;
+use jj_lib::conflicts::choose_materialized_conflict_marker_len;
+use jj_lib::conflicts::extract_as_single_hunk;
+use jj_lib::conflicts::materialize_merge_result_to_bytes;
+use jj_lib::conflicts::update_from_content;
+use jj_lib::files;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
-use jj_lib::merge_rule::is_virtual_base_content;
 use jj_lib::merge_rule::merge_parent_values;
-use jj_lib::merge_rule::virtual_merge_base;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
@@ -63,6 +72,8 @@ use jj_lib::rewrite::rebase_commit;
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
+use jj_lib::virtual_base::virtual_base_terms;
+use jj_lib::virtual_base::virtual_merge_base;
 use pollster::FutureExt as _;
 use testutils::CommitBuilderExt as _;
 use testutils::TestRepo;
@@ -75,11 +86,12 @@ use testutils::repo_path;
 use testutils::repo_path_buf;
 use testutils::settings_with_same_change;
 
-/// The opening marker line of a hunk of the virtual base, before its hex.
+/// The opening marker line of a block of a virtual base, before its hex, its
+/// salt and the names of V's terms.
 const OPEN: &str = "<<<<<<< jj virtual merge base ";
-/// The marker line between two sides of a hunk of the virtual base.
+/// The marker line between two sides of a block of a virtual base.
 const SEPARATOR: &str = "======= ";
-/// The closing marker line of a hunk of the virtual base.
+/// The closing marker line of a block of a virtual base.
 const CLOSE: &str = ">>>>>>> ";
 
 /// The path every case merges.
@@ -357,9 +369,18 @@ fn assert_same_value(case: &Case, actual: &MergedTreeValue, expected: &MergedTre
     );
 }
 
-/// The hex of `line` if it is a marker line that starts with `prefix`.
+/// The hex of `line` if it is a marker line that starts with `prefix`. An
+/// opening marker line carries a salt and the names of V's terms after its
+/// hex.
 fn marker_hex<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    let hex = line.strip_prefix(prefix)?;
+    let rest = line.strip_prefix(prefix)?;
+    let hex = if prefix == OPEN {
+        let (hex, salt_and_terms) = rest.split_once(' ')?;
+        let (salt, terms) = salt_and_terms.split_once(' ')?;
+        (salt.parse::<u64>().is_ok() && !terms.is_empty()).then_some(hex)?
+    } else {
+        rest
+    };
     (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hex)
 }
 
@@ -368,6 +389,16 @@ fn marker_hex<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 fn opening_hex<'a>(lines: &[&'a str]) -> &'a str {
     marker_hex(lines[0], OPEN)
         .unwrap_or_else(|| panic!("expected an opening marker line first, got {lines:?}"))
+}
+
+/// Asserts that `content` is VB or M of `v`: it names V's terms, after
+/// `simplify()`, and returns its opening marker line.
+#[track_caller]
+fn assert_names_terms<'a>(content: &'a [u8], v: &MergedTreeValue) -> &'a str {
+    assert_eq!(virtual_base_terms(content), Some(v.simplify()));
+    let lines = text_lines(content);
+    opening_hex(&lines);
+    lines[0]
 }
 
 /// Whether `content` holds a line that starts with the virtual base's opening
@@ -402,7 +433,7 @@ fn is_marker_file(content: &[u8]) -> bool {
     let separator = format!("{SEPARATOR}{hex}");
     let names_a_term = |line: &str| {
         line == "absent"
-            || ["file ", "symlink ", "tree ", "submodule "]
+            || ["file:", "symlink:", "tree:", "submodule:"]
                 .iter()
                 .any(|kind| line.starts_with(kind))
     };
@@ -415,7 +446,7 @@ fn is_marker_file(content: &[u8]) -> bool {
                 names_a_term(line)
             }
         })
-        && is_virtual_base_content(content)
+        && virtual_base_terms(content).is_some()
 }
 
 /// Whether `content` is a virtual base of a conflict of text files: more than
@@ -432,7 +463,7 @@ fn is_virtual_base(content: &[u8]) -> bool {
             .iter()
             .any(|line| marker_hex(line, SEPARATOR).is_some())
         && lines.iter().any(|line| marker_hex(line, CLOSE).is_some())
-        && is_virtual_base_content(content)
+        && virtual_base_terms(content).is_some()
 }
 
 #[track_caller]
@@ -498,6 +529,8 @@ enum Base {
     /// M, the block that names V's terms, for a V that is not a conflict of
     /// text files.
     Marker,
+    /// A file of this text, which no virtual base is: a term of V.
+    Text(String),
 }
 
 /// Asserts that the merge is a conflict at `f`, and returns its value there,
@@ -513,10 +546,19 @@ fn conflict_at_f(merged: &Merged) -> TestResult<MergedTreeValue> {
 }
 
 /// Asserts that the merge is a conflict at `f` whose adds hold each parent's
-/// value there, and whose one remove, after `simplify()`, is `base`.
+/// value there, and no marker line of a virtual base, and whose one remove,
+/// after `simplify()`, is `base`.
 fn assert_conflict(merged: &Merged, base: Base) -> TestResult {
     let simplified = conflict_at_f(merged)?;
     assert_parents_among_adds(merged, &simplified)?;
+    assert!(
+        !simplified.adds().any(|add| merged
+            .case
+            .read(add.as_ref())
+            .is_some_and(|content| holds_marker(&content))),
+        "a side of the conflict holds a virtual base's marker line: {}",
+        describe(&merged.case, &simplified)
+    );
     let removes = simplified.removes().collect_vec();
     let [remove] = removes[..] else {
         panic!(
@@ -531,6 +573,11 @@ fn assert_conflict(merged: &Merged, base: Base) -> TestResult {
     match base {
         Base::Virtual(sides) => assert_virtual_base(&content, sides),
         Base::Marker => assert_marker_file(&content),
+        Base::Text(text) => assert_eq!(
+            String::from_utf8_lossy(&content),
+            text,
+            "expected the conflict's base to be a term of V"
+        ),
     }
     Ok(())
 }
@@ -1027,15 +1074,49 @@ fn case_file_directory_conflict_in_a_side() -> TestResult<(Merged, MergedTreeVal
 /// makes `d_writes`. d's parent tree holds the rule's conflict `[x, VB, y]`,
 /// which a rewrite of d inverts: as the base of a merge, its VB is an add.
 fn resolved_k4_merge(d_writes: &[Write]) -> TestResult<(TwoBases, Commit)> {
-    let mut history = k4_history(Made::AFirst)?;
+    resolved_merge(k4_history(Made::AFirst)?, d_writes)
+}
+
+/// `history` and d, a merge of its P1 and P2 that makes `d_writes`.
+fn resolved_merge(mut history: TwoBases, d_writes: &[Write]) -> TestResult<(TwoBases, Commit)> {
     let d = history.case.commit(&[&history.p1, &history.p2], d_writes)?;
     Ok((history, d))
 }
 
-/// VB1a: d rebased onto P1, as `jj rebase -r d -d P1` rebases it. The result's
-/// conflict must hold P1's `x` and d's `y`.
-fn case_vb1a(d_writes: &[Write]) -> TestResult<Merged> {
-    let (TwoBases { mut case, p1, .. }, d) = resolved_k4_merge(d_writes)?;
+/// The six lines of `f` that o holds in the histories whose merge bases change
+/// some of them.
+const SIX_LINES: &str = "1\n2\n3\n4\n5\n6\n";
+
+/// K4's history with six lines at `f`: A changes line 1 to `a_line1`, and B
+/// changes lines 1 to 3 to `b_lines`; P1 and P2 keep A's and B's text.
+fn six_line_history(a_line1: &str, b_lines: &str) -> TestResult<TwoBases> {
+    let a_text = lines(&format!("{a_line1} 2 3 4 5 6"));
+    let b_text = lines(&format!("{b_lines} 4 5 6"));
+    two_bases(
+        &[("f", lines("1 2 3 4 5 6"))],
+        &[("f", a_text.clone())],
+        &[("f", b_text.clone())],
+        Made::AFirst,
+        &[("f", a_text)],
+        &[("f", b_text)],
+    )
+}
+
+/// VB2's history: A sets line 1 to `a`, B lines 1 to 3 to `b1 b2 b3`, and d
+/// resolves `f` to B's text with `b2` changed to `B2`, inside the hunk where A
+/// and B disagree. d's parent tree holds `[P1, VB, P2]`, and d's change from it
+/// leaves VB's marker lines in place, so no merge of VB's text with d's
+/// change can tell that it is VB.
+fn b2_history() -> TestResult<(TwoBases, Commit)> {
+    resolved_merge(
+        six_line_history("a", "b1 b2 b3")?,
+        &[("f", lines("b1 B2 b3 4 5 6"))],
+    )
+}
+
+/// d rebased onto P1, as `jj rebase -r d -d P1` rebases it.
+fn rebase_onto_p1((history, d): (TwoBases, Commit)) -> TestResult<Merged> {
+    let TwoBases { mut case, p1, .. } = history;
     let rebased = rebase_commit(case.tx.repo_mut(), d.clone(), vec![p1.id().clone()]).block_on()?;
     Ok(Merged {
         case,
@@ -1044,10 +1125,9 @@ fn case_vb1a(d_writes: &[Write]) -> TestResult<Merged> {
     })
 }
 
-/// VB1b: d rebased onto P2's parents once P2 is abandoned, as `jj abandon P2`
+/// d rebased onto P2's parents once P2 is abandoned, as `jj abandon P2`
 /// rebases it.
-fn case_vb1b() -> TestResult<Merged> {
-    let (history, d) = resolved_k4_merge(&[("f", line("y"))])?;
+fn abandon_p2((history, d): (TwoBases, Commit)) -> TestResult<Merged> {
     let TwoBases {
         mut case, p1, p2, ..
     } = history;
@@ -1062,10 +1142,10 @@ fn case_vb1b() -> TestResult<Merged> {
     })
 }
 
-/// VB1c: P1's tree once d is squashed into it, as `jj squash --from d --into
-/// P1` computes it: P1's tree with d's change from d's parent tree.
-fn case_vb1c() -> TestResult<Merged> {
-    let (TwoBases { case, p1, .. }, d) = resolved_k4_merge(&[("f", line("y"))])?;
+/// P1's tree once d is squashed into it, as `jj squash --from d --into P1`
+/// computes it: P1's tree with d's change from d's parent tree.
+fn squash_into_p1((history, d): (TwoBases, Commit)) -> TestResult<Merged> {
+    let TwoBases { case, p1, .. } = history;
     let parent_tree = d.parent_tree(case.tx.repo()).block_on()?;
     let tree = MergedTree::merge(Merge::from_vec(vec![
         (p1.tree(), "P1".to_owned()),
@@ -1078,6 +1158,22 @@ fn case_vb1c() -> TestResult<Merged> {
         parents: vec![p1, d],
         tree,
     })
+}
+
+/// VB1a: d rebased onto P1. The result's conflict must hold P1's `x` and d's
+/// `y`.
+fn case_vb1a(d_writes: &[Write]) -> TestResult<Merged> {
+    rebase_onto_p1(resolved_k4_merge(d_writes)?)
+}
+
+/// VB1b: d rebased once P2 is abandoned.
+fn case_vb1b() -> TestResult<Merged> {
+    abandon_p2(resolved_k4_merge(&[("f", line("y"))])?)
+}
+
+/// VB1c: d squashed into P1.
+fn case_vb1c() -> TestResult<Merged> {
+    squash_into_p1(resolved_k4_merge(&[("f", line("y"))])?)
 }
 
 /// Z is the merge of `history`'s P1 and P2, as a commit; c and q are children
@@ -1123,6 +1219,25 @@ fn case_vb1_sibling_d1() -> TestResult<Merged> {
         &[("f", line("y"))],
     )?;
     case_sibling_rebase(history, &[("f", None)], &[("f", line("y"))])
+}
+
+/// The sibling rebase of VB2's conflict: c resolves it to A's text, q to B's
+/// text with `B2`.
+fn case_vb2_sibling() -> TestResult<Merged> {
+    case_sibling_rebase(
+        six_line_history("a", "b1 b2 b3")?,
+        &[("f", lines("a 2 3 4 5 6"))],
+        &[("f", lines("b1 B2 b3 4 5 6"))],
+    )
+}
+
+/// VB3: d resolves K4's hunk to `y` and changes line 5, outside that hunk; d
+/// rebased onto P1.
+fn case_vb3() -> TestResult<Merged> {
+    rebase_onto_p1(resolved_merge(
+        six_line_history("x", "y 2 3")?,
+        &[("f", lines("y 2 3 4 FIVE 6"))],
+    )?)
 }
 
 #[test]
@@ -1614,6 +1729,11 @@ fn virtual_base_never_in_a_resolved_tree() -> TestResult {
         ("VB1c, d squashed into P1", case_vb1c),
         ("sibling rebase of K4's conflict", case_vb1_sibling),
         ("sibling rebase of D1's conflict", case_vb1_sibling_d1),
+        ("VB2a, d rebased onto P1", || rebase_onto_p1(b2_history()?)),
+        ("VB2b, P2 abandoned", || abandon_p2(b2_history()?)),
+        ("VB2, d squashed into P1", || squash_into_p1(b2_history()?)),
+        ("sibling rebase of VB2's conflict", case_vb2_sibling),
+        ("VB3, d rebased onto P1", case_vb3),
     ];
     for (name, build) in cases {
         let merged = build()?;
@@ -1713,11 +1833,15 @@ fn older_fold_counts_as_changed() -> TestResult {
 }
 
 /// VB1a: d, K4's merge resolved to `y`, rebased onto P1. The rebase cancels
-/// every term of `[x, x - VB + y, y]` but VB; the path stays a conflict of P1's
-/// `x` and d's `y` against VB.
+/// every term of `[x, x - VB + y, y]` but VB, a side, which the merge replaces
+/// with V's terms: the path is a conflict of P1's `x` and d's `y` against `o`,
+/// as jj 0.45.1 gives.
 #[test]
 fn vb1a_rebase_onto_one_parent() -> TestResult {
-    assert_conflict(&case_vb1a(&[("f", line("y"))])?, Base::Virtual(&["x", "y"]))
+    assert_conflict(
+        &case_vb1a(&[("f", line("y"))])?,
+        Base::Text("o\n".to_owned()),
+    )
 }
 
 /// VB1a where d also changes another file, so that the rebase cancels the
@@ -1725,7 +1849,7 @@ fn vb1a_rebase_onto_one_parent() -> TestResult {
 #[test]
 fn vb1a_rebase_onto_one_parent_with_another_change() -> TestResult {
     let merged = case_vb1a(&[("f", line("y")), ("h", line("h"))])?;
-    assert_conflict(&merged, Base::Virtual(&["x", "y"]))?;
+    assert_conflict(&merged, Base::Text("o\n".to_owned()))?;
     let h_value = value_at(&merged.tree, "h")?;
     let Ok(Some(TreeValue::File { id, .. })) = h_value.clone().into_resolved() else {
         panic!("expected d's file h, resolved, got {h_value:?}");
@@ -1738,27 +1862,373 @@ fn vb1a_rebase_onto_one_parent_with_another_change() -> TestResult {
 /// abandoned.
 #[test]
 fn vb1b_abandon_a_parent() -> TestResult {
-    assert_conflict(&case_vb1b()?, Base::Virtual(&["x", "y"]))
+    assert_conflict(&case_vb1b()?, Base::Text("o\n".to_owned()))
 }
 
 /// VB1c: d, K4's merge resolved to `y`, squashed into P1.
 #[test]
 fn vb1c_squash_into_a_parent() -> TestResult {
-    assert_conflict(&case_vb1c()?, Base::Virtual(&["x", "y"]))
+    assert_conflict(&case_vb1c()?, Base::Text("o\n".to_owned()))
 }
 
 /// c and q, children of a commit that holds K4's conflict, resolve it to `x`
-/// and to `y`; c rebased onto q holds a conflict of the two against VB.
+/// and to `y`; c rebased onto q holds a conflict of the two against `o`.
 #[test]
 fn vb1_sibling_rebase() -> TestResult {
-    assert_conflict(&case_vb1_sibling()?, Base::Virtual(&["x", "y"]))
+    assert_conflict(&case_vb1_sibling()?, Base::Text("o\n".to_owned()))
 }
 
-/// The sibling rebase of D1's conflict: a conflict of `y` and the deletion
-/// against M.
+/// The sibling rebase of D1's conflict, whose base is M: a conflict of `y`
+/// and the deletion against `o`.
 #[test]
 fn vb1_sibling_rebase_d1() -> TestResult {
-    assert_conflict(&case_vb1_sibling_d1()?, Base::Marker)
+    assert_conflict(&case_vb1_sibling_d1()?, Base::Text("o\n".to_owned()))
+}
+
+/// VB2a: d, a merge of P1 and P2 that edits a line inside the hunk where A and
+/// B disagree, rebased onto P1: a conflict of d's and A's changes from o, as
+/// jj 0.45.1 gives.
+#[test]
+fn vb2a_rebase_with_an_edit_in_the_disputed_hunk() -> TestResult {
+    assert_conflict(
+        &rebase_onto_p1(b2_history()?)?,
+        Base::Text(SIX_LINES.to_owned()),
+    )
+}
+
+/// VB2b: VB2's d once P2 is abandoned.
+#[test]
+fn vb2b_abandon_with_an_edit_in_the_disputed_hunk() -> TestResult {
+    assert_conflict(
+        &abandon_p2(b2_history()?)?,
+        Base::Text(SIX_LINES.to_owned()),
+    )
+}
+
+/// VB2's d squashed into P1.
+#[test]
+fn vb2_squash_with_an_edit_in_the_disputed_hunk() -> TestResult {
+    assert_conflict(
+        &squash_into_p1(b2_history()?)?,
+        Base::Text(SIX_LINES.to_owned()),
+    )
+}
+
+/// The sibling rebase of VB2's conflict.
+#[test]
+fn vb2_sibling_rebase_with_an_edit_in_the_disputed_hunk() -> TestResult {
+    assert_conflict(&case_vb2_sibling()?, Base::Text(SIX_LINES.to_owned()))
+}
+
+/// VB3: d resolves K4's hunk to `y` and changes line 5, outside that hunk.
+/// Rebased onto P1, d holds a conflict of its own and A's changes from o, whose
+/// terms do not merge, so that jj shows it with conflict markers.
+#[test]
+fn vb3_rebase_with_an_edit_outside_the_disputed_hunk() -> TestResult {
+    let merged = case_vb3()?;
+    assert_conflict(&merged, Base::Text(SIX_LINES.to_owned()))?;
+    let contents = merged
+        .value()?
+        .simplify()
+        .map(|term| merged.case.read(term.as_ref()).unwrap_or_default());
+    assert_eq!(
+        files::try_merge(&contents, merged.case.store().merge_options()),
+        None
+    );
+    Ok(())
+}
+
+/// VB4a and VB4b: K4's d, resolved to `y`, once P1 takes d's `f`, as `jj
+/// restore --from d --into P1 f` gives it. d's rebase merges `[y, -x, VB]`,
+/// which expands to `[y, -x, x, -o, y]`: d holds `y`, resolved, as jj 0.45.1
+/// gives, so that `jj resolve` with either side's tool has nothing to resolve.
+#[test]
+fn vb4a_restore_into_one_parent() -> TestResult {
+    let (TwoBases { mut case, p1, .. }, d) = resolved_k4_merge(&[("f", line("y"))])?;
+    let mut builder = MergedTreeBuilder::new(p1.tree());
+    builder.set_or_remove(repo_path_buf("f"), value_at(&d.tree(), "f")?);
+    let p1_tree = builder.write_tree().block_on()?;
+    case.tx
+        .repo_mut()
+        .rewrite_commit(&p1)
+        .set_tree(p1_tree)
+        .write_unwrap();
+    let rebased =
+        rebase_descendants_with_options_return_map(case.tx.repo_mut(), &RebaseOptions::default());
+    let tree = case.store().get_commit(&rebased[d.id()])?.tree();
+    let merged = Merged {
+        case,
+        parents: vec![],
+        tree,
+    };
+    assert_resolved_text(&merged, "y\n")
+}
+
+/// VB4c and VB4d: K4's d, resolved to `y`, once P2 is rebased onto A, as `jj
+/// rebase -s P2 -d A` does. P2 then holds `o`, and d's rebase merges `[o, -x,
+/// VB]`, which expands to `[o, -x, x, -o, y]`: d holds `y`, resolved, as jj
+/// 0.45.1 gives.
+#[test]
+fn vb4c_rebase_one_parent_onto_a_merge_base() -> TestResult {
+    let (
+        TwoBases {
+            mut case, a, p2, ..
+        },
+        d,
+    ) = resolved_k4_merge(&[("f", line("y"))])?;
+    let new_p2 = rebase_commit(case.tx.repo_mut(), p2, vec![a.id().clone()]).block_on()?;
+    let p2_value = value_at(&new_p2.tree(), "f")?;
+    assert_eq!(
+        p2_value
+            .as_resolved()
+            .and_then(|term| case.read(term.as_ref())),
+        Some(b"o\n".to_vec()),
+        "expected P2 to hold o, got {}",
+        describe(&case, &p2_value)
+    );
+    let rebased =
+        rebase_descendants_with_options_return_map(case.tx.repo_mut(), &RebaseOptions::default());
+    let tree = case.store().get_commit(&rebased[d.id()])?.tree();
+    let merged = Merged {
+        case,
+        parents: vec![],
+        tree,
+    };
+    assert_resolved_text(&merged, "y\n")
+}
+
+/// VB5: w, K4's merge with six lines at `f`, left conflicted, with line 5,
+/// outside the conflict, changed to `FIVE` in the working copy. The snapshot
+/// applies the change to each term of w's conflict, its virtual base too, so
+/// a merge that later replaces that base with the terms of V must find the
+/// change in them. s and u, children of w, resolve `f` to `x` and to `y`, each
+/// with `FIVE`: u rebased onto s is a conflict whose every side holds `FIVE`,
+/// `xF + yF - oF`, as jj 0.45.1 gives.
+#[test]
+fn vb5_an_edit_outside_the_conflict_survives_its_expansion() -> TestResult {
+    assert_edits_survive_expansion(&[("5", "FIVE")])
+}
+
+/// VB5 with a second edit, line 6 changed to `SIX`, to the same working copy
+/// after the first was snapshotted: the working copy still holds the marker
+/// lines of the virtual base that the first snapshot replaced, and the second
+/// snapshot applies the change to each term of V too.
+#[test]
+fn vb5_a_second_edit_of_the_same_working_copy_survives_expansion() -> TestResult {
+    assert_edits_survive_expansion(&[("5", "FIVE"), ("6", "SIX")])
+}
+
+/// Makes VB5's history, with each of `edits`, a line of `f` outside the
+/// conflict and its replacement, made to the working copy of w and
+/// snapshotted in turn, and asserts that u rebased onto s, whose texts make
+/// the same edits, is a conflict whose every side holds them.
+fn assert_edits_survive_expansion(edits: &[(&str, &str)]) -> TestResult {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = six_line_history("x", "y 2 3")?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let store = case.store().clone();
+    let mut file_ids = value_at(&w.tree(), "f")?
+        .to_file_merge()
+        .expect("files at f");
+    let contents = extract_as_single_hunk(&file_ids, &store, f()).block_on()?;
+    let options = ConflictMaterializeOptions {
+        marker_style: ConflictMarkerStyle::Diff,
+        marker_len: None,
+        merge: store.merge_options().clone(),
+    };
+    let mut working_copy = String::from_utf8(
+        materialize_merge_result_to_bytes(&contents, &ConflictLabels::unlabeled(), &options).into(),
+    )?;
+    let marker_len = choose_materialized_conflict_marker_len(&contents);
+    let mut words = "2 3 4 5 6".to_owned();
+    for (line, replacement) in edits {
+        let (from, to) = (format!("\n{line}\n"), format!("\n{replacement}\n"));
+        let edited = working_copy.replacen(&from, &to, 1);
+        assert_ne!(edited, working_copy);
+        working_copy = edited;
+        let content = working_copy.as_bytes();
+        file_ids = update_from_content(&file_ids, &store, f(), content, marker_len).block_on()?;
+        words = words.replacen(line, replacement, 1);
+    }
+    let new_value = file_ids.map(|id| {
+        id.clone().map(|id| TreeValue::File {
+            id,
+            executable: false,
+            copy_id: CopyId::placeholder(),
+        })
+    });
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", lines(&format!("x {words}")))])?;
+    let u = case.commit(&[&w], &[("f", lines(&format!("y {words}")))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?;
+    let [x_edited, o_edited, y_edited] = ["x", "1", "y"].map(|first| {
+        let content = lines(&format!("{first} {words}")).unwrap();
+        case.file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(&case, &value, &conflict(&[&x_edited, &o_edited, &y_edited]));
+    Ok(())
+}
+
+/// Q1: a user's file that quotes a virtual base that a merge in this
+/// repository wrote merges as any text does: two commits that edit it outside
+/// the quote merge clean, with both edits, and so does a rebase of one onto
+/// the other.
+#[test]
+fn user_file_quoting_a_virtual_base_merges_as_text() -> TestResult {
+    let Merged { mut case, tree, .. } = case_k4(Made::AFirst, Order::AsNamed)?;
+    let vb = virtual_base_term(&case, &value_at(&tree, "f")?);
+    let vb = String::from_utf8(case.read(vb.as_ref()).expect("VB is a file"))?;
+    let quote = |intro: &str, outro: &str| {
+        Some(format!("{intro}\nExample of a jj conflict base:\n{vb}{outro}\n").into_bytes())
+    };
+    let root = case.root();
+    let o = case.commit(&[&root], &[("f", quote("intro", "outro"))])?;
+    let a = case.commit(&[&o], &[("f", quote("INTRO", "outro"))])?;
+    let b = case.commit(&[&o], &[("f", quote("intro", "OUTRO"))])?;
+    let expected = String::from_utf8(quote("INTRO", "OUTRO").unwrap())?;
+    let rebased = rebase_commit(case.tx.repo_mut(), b.clone(), vec![a.id().clone()]).block_on()?;
+    let merged = Merged::new(case, &[&a, &b])?;
+    assert_resolved_text(&merged, &expected)?;
+    let merged = Merged {
+        tree: rebased.tree(),
+        ..merged
+    };
+    assert_resolved_text(&merged, &expected)
+}
+
+/// Q2: a 160 KB user file that quotes a 3,000-line virtual base, with one line
+/// of a side changed, merges as text, with both edits, in under 5 seconds: no
+/// merge reads merged text for marker lines.
+#[test]
+fn large_user_file_quoting_a_virtual_base_merges_quickly() -> TestResult {
+    let side = |name: &str| {
+        let text = (1..=1500)
+            .map(|i| format!("{name}-side-line-{i:04}-of-the-merge-base"))
+            .join(" ");
+        lines(&text)
+    };
+    let TwoBases { case, p1, p2, .. } = two_bases(
+        &[("f", side("o"))],
+        &[("f", side("a"))],
+        &[("f", side("b"))],
+        Made::AFirst,
+        &[("f", side("a"))],
+        &[("f", side("b"))],
+    )?;
+    let Merged { mut case, tree, .. } = Merged::new(case, &[&p1, &p2])?;
+    let vb = virtual_base_term(&case, &value_at(&tree, "f")?);
+    let vb = String::from_utf8(case.read(vb.as_ref()).expect("VB is a file"))?;
+    assert!(vb.lines().count() >= 3000, "VB has fewer than 3,000 lines");
+    let quoted = vb.replacen(
+        "\na-side-line-0700-of-the-merge-base\n",
+        "\nA-side-line-0700-of-the-merge-base\n",
+        1,
+    );
+    assert_ne!(quoted, vb);
+    let padding = |from: usize| {
+        let mut text = (from..from + 1700)
+            .map(|i| format!("padding-line-{i:05}"))
+            .join("\n");
+        text.push('\n');
+        text
+    };
+    let text = |top: &str, bottom: &str| {
+        format!("{top}\n{}{quoted}{}{bottom}\n", padding(0), padding(1700))
+    };
+    assert!(text("top", "bottom").len() >= 160 * 1024);
+    let root = case.root();
+    let o = case.commit(&[&root], &[("f", Some(text("top", "bottom").into()))])?;
+    let a = case.commit(&[&o], &[("f", Some(text("TOP", "bottom").into()))])?;
+    let b = case.commit(&[&o], &[("f", Some(text("top", "BOTTOM").into()))])?;
+    let start = Instant::now();
+    let merged = Merged::new(case, &[&a, &b])?;
+    let elapsed = start.elapsed();
+    assert_resolved_text(&merged, &text("TOP", "BOTTOM"))?;
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the merge took {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Q3: VB1a with 3,000-line sides: d, resolved to B's text, rebased onto P1
+/// is a conflict of P1's and d's text against o's, in under 5 seconds.
+#[test]
+fn vb1a_with_long_sides_conflicts_quickly() -> TestResult {
+    let text = |name: &str| (1..=3000).map(|i| format!("{name}{i}")).join(" ");
+    let history = two_bases(
+        &[("f", lines(&text("o")))],
+        &[("f", lines(&text("x")))],
+        &[("f", lines(&text("y")))],
+        Made::AFirst,
+        &[("f", lines(&text("x")))],
+        &[("f", lines(&text("y")))],
+    )?;
+    let resolved = resolved_merge(history, &[("f", lines(&text("y")))])?;
+    let start = Instant::now();
+    let merged = rebase_onto_p1(resolved)?;
+    let elapsed = start.elapsed();
+    let o_text = String::from_utf8(lines(&text("o")).unwrap())?;
+    assert_conflict(&merged, Base::Text(o_text))?;
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the rebase took {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Where a merge leaves two virtual bases as sides, it replaces them one at a
+/// time, each that names the other before the one it names, and otherwise in
+/// the order of their file ids, so that the result does not depend on the
+/// order of the merge's terms. `outer` is the virtual base of a conflict whose
+/// base is `inner`: it goes first, and its V's base `inner` cancels the side
+/// `inner`, in either order. `inner` and `other` name neither one the other,
+/// and both are replaced.
+#[test]
+fn virtual_bases_expand_in_naming_order() -> TestResult {
+    let mut case = Case::new();
+    let root = case.root();
+    let [o, p, q, s1, s2, s3, x, y] =
+        ["o", "p", "q", "s1", "s2", "s3", "x", "y"].map(|value| case.text(value));
+    let vb = |v: &MergedTreeValue| -> TestResult<Option<TreeValue>> {
+        let (side1, side3) = (resolved(s1.as_ref()), resolved(s3.as_ref()));
+        Ok(Some(
+            virtual_merge_base(case.store(), f(), v, &side1, &side3).block_on()?,
+        ))
+    };
+    let inner = vb(&conflict(&[&x, &o, &y]))?;
+    let outer = vb(&conflict(&[&p, &inner, &q]))?;
+    let other = vb(&conflict(&[&y, &o, &x]))?;
+    assert_ne!(inner, other);
+    let side1 = case.commit(&[&root], &[("f", line("s1"))])?;
+    let side3 = case.commit(&[&root], &[("f", line("s3"))])?;
+    let both = conflict(&[&x, &o, &y, &s2, &y, &o, &x]);
+    let cases = [
+        ("outer first", &outer, &inner, conflict(&[&p, &s2, &q])),
+        ("inner first", &inner, &outer, conflict(&[&p, &s2, &q])),
+        ("inner, then other", &inner, &other, both.clone()),
+        ("other, then inner", &other, &inner, both),
+    ];
+    for (name, first, second, expected) in cases {
+        let base_value = conflict(&[&s1, first, &s2, second, &s3]);
+        let base = case.commit_with_values(&[&root], vec![(repo_path_buf("f"), base_value)])?;
+        let tree = MergedTree::merge(Merge::from_vec(vec![
+            (side1.tree(), "side 1".to_owned()),
+            (base.tree(), "base".to_owned()),
+            (side3.tree(), "side 3".to_owned()),
+        ]))
+        .block_on()?;
+        let value = value_at(&tree, "f")?;
+        assert!(
+            same_terms(&value, &expected),
+            "{name}: expected {}, got {}",
+            describe(&case, &expected),
+            describe(&case, &value)
+        );
+    }
+    Ok(())
 }
 
 /// A stated limit, which the fix keeps: m is a conflicted merge of a and b; c1,
@@ -1780,10 +2250,10 @@ fn rebase_across_a_conflicted_parent_gives_the_base() -> TestResult {
 }
 
 /// A user's text that holds lines like a virtual base's marker lines, and a
-/// whole block of them with a hex that no merge wrote.
-const USER_MARKER_TEXT: &str =
-    "1\n<<<<<<< jj virtual merge base 0123456789abcdef0123456789abcdef\n2\n======= \
-     0123456789abcdef0123456789abcdef\n3\n>>>>>>> 0123456789abcdef0123456789abcdef\n4\n";
+/// whole block of them, with a salt and a term, whose hex no merge wrote.
+const USER_MARKER_TEXT: &str = "1\n<<<<<<< jj virtual merge base 0123456789abcdef0123456789abcdef \
+                                0 absent\n2\n======= 0123456789abcdef0123456789abcdef\n3\n>>>>>>> \
+                                0123456789abcdef0123456789abcdef\n4\n";
 
 /// A file that holds marker lines that no merge wrote merges as any text does:
 /// in a merge, in a rebase, and where a rebase cancels every other term of a
@@ -1843,19 +2313,17 @@ fn non_text_conflicts_keep_their_own_m() -> TestResult {
 
     // z1 holds `[absent, M1, y]` at `f`; w, its child, holds `[absent, M2, y]`.
     // Rebased onto `o`, w's merge `o + (M1 - y) + (y - M2)` would resolve to
-    // `o` if M1 and M2 were one file.
+    // `o` if M1 and M2 were one file. M1 is a side, which the merge replaces
+    // with the terms of V that it names, `[absent, o, y]`: the result is
+    // `[absent, M2, y]`.
     let base = case.commit(&[&root], &[("f", line("o"))])?;
     let z1_value = conflict(&[&None, &m1, &y]);
     let z1 = case.commit_with_values(&[&base], vec![(repo_path_buf("f"), z1_value)])?;
     let w_value = conflict(&[&None, &m2, &y]);
     let w = case.commit_with_values(&[&z1], vec![(repo_path_buf("f"), w_value)])?;
     let rebased = rebase_commit(case.tx.repo_mut(), w, vec![base.id().clone()]).block_on()?;
-    let value = value_at(&rebased.tree(), "f")?.simplify();
-    assert!(
-        value.adds().any(|add| *add == m1) && value.removes().any(|remove| *remove == m2),
-        "expected a conflict that holds M1 as a side and M2 as its base, got {}",
-        describe(&case, &value)
-    );
+    let value = value_at(&rebased.tree(), "f")?;
+    assert_same_value(&case, &value, &conflict(&[&None, &m2, &y]));
     Ok(())
 }
 
@@ -2206,8 +2674,9 @@ fn virtual_base_keeps_merged_hunks() -> TestResult {
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
     let hex = opening_hex(&lines);
+    let open = assert_names_terms(&content, &v);
     let expected = [
-        format!("{OPEN}{hex}"),
+        open.to_owned(),
         "x".to_owned(),
         format!("{SEPARATOR}{hex}"),
         "y".to_owned(),
@@ -2237,8 +2706,9 @@ fn virtual_base_sides_between_markers() -> TestResult {
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
     let hex = opening_hex(&lines);
+    let open = assert_names_terms(&content, &v);
     let expected = [
-        format!("{OPEN}{hex}"),
+        open.to_owned(),
         "x1".to_owned(),
         "x2".to_owned(),
         format!("{SEPARATOR}{hex}"),
@@ -2262,8 +2732,9 @@ fn virtual_base_sides_between_markers() -> TestResult {
     let (_, content) = virtual_base(&case, &v, &p1, &p2)?;
     let lines = text_lines(&content);
     let hex = opening_hex(&lines);
+    let open = assert_names_terms(&content, &v);
     let expected = [
-        format!("{OPEN}{hex}"),
+        open.to_owned(),
         "x".to_owned(),
         format!("{SEPARATOR}{hex}"),
         "y".to_owned(),
@@ -2427,16 +2898,32 @@ fn virtual_base_add_add() -> TestResult {
     let (_, content) = virtual_base(&case, &v, &resolved(c.as_ref()), &resolved(d.as_ref()))?;
     let lines = text_lines(&content);
     let hex = opening_hex(&lines);
+    let open = assert_names_terms(&content, &v);
     assert_eq!(
         lines,
         [
-            format!("{OPEN}{hex}"),
+            open.to_owned(),
             "x".to_owned(),
             format!("{SEPARATOR}{hex}"),
             "y".to_owned(),
             format!("{CLOSE}{hex}"),
         ]
     );
+    Ok(())
+}
+
+/// A stated limit: where V is unresolved only because of its terms'
+/// executable bits, their contents merge, so VB holds no block, and no merge
+/// can tell that it is VB.
+#[test]
+fn virtual_base_of_an_executable_bit_conflict_holds_no_block() -> TestResult {
+    let case = Case::new();
+    let [c, d, x] = ["c", "d", "x"].map(|value| case.text(value));
+    let x_executable = case.file(f(), b"x\n", true, CopyId::placeholder());
+    let v = conflict(&[&x_executable, &None, &x]);
+    let (_, content) = virtual_base(&case, &v, &resolved(c.as_ref()), &resolved(d.as_ref()))?;
+    assert_eq!(content, b"x\n");
+    assert_eq!(virtual_base_terms(&content), None);
     Ok(())
 }
 
@@ -2532,10 +3019,10 @@ fn virtual_base_executable_and_copy_id() -> TestResult {
     Ok(())
 }
 
-/// VB and M show that a merge wrote them: the verifier accepts the files that
-/// `virtual_merge_base` writes, wherever they sit and with any text around
-/// their blocks, and no text in which a block's hex does not match the sides
-/// it encloses, a block does not close, or no block is.
+/// VB and M show that a merge wrote them, and name V's terms: the verifier
+/// reads V's terms from the files that `virtual_merge_base` writes, and from no
+/// text in which any byte differs (text around a block, a side, the text
+/// outside the blocks, the salt), a block does not close, or no block is.
 #[test]
 fn virtual_base_verifies() -> TestResult {
     let case = Case::new();
@@ -2543,14 +3030,10 @@ fn virtual_base_verifies() -> TestResult {
     let (p1, p2) = (resolved(c.as_ref()), resolved(d.as_ref()));
     let v = conflict(&[&x, &o, &y]);
     let (_, vb) = virtual_base(&case, &v, &p1, &p2)?;
-    let (_, m) = virtual_base(&case, &conflict(&[&None, &o, &y]), &p1, &p2)?;
-    for content in [&vb, &m] {
-        assert!(
-            is_virtual_base_content(content),
-            "expected the verifier to accept {:?}",
-            String::from_utf8_lossy(content)
-        );
-    }
+    assert_names_terms(&vb, &v);
+    let v_m = conflict(&[&None, &o, &y]);
+    let (_, m) = virtual_base(&case, &v_m, &p1, &p2)?;
+    assert_names_terms(&m, &v_m);
 
     // The path is not hashed: the same V at another path gives the same text.
     let g = repo_path("g");
@@ -2565,15 +3048,32 @@ fn virtual_base_verifies() -> TestResult {
     assert_eq!(read_file(case.store(), g, &id), vb);
 
     let text = String::from_utf8(vb)?;
-    let surrounded = format!("before\n{text}after\n");
-    assert!(is_virtual_base_content(surrounded.as_bytes()));
-    let changed_side = text.replace("\nx\n", "\nz\n");
-    assert_ne!(changed_side, text);
-    assert!(!is_virtual_base_content(changed_side.as_bytes()));
-    let unclosed = &text[..text.rfind(CLOSE).unwrap()];
-    assert!(!is_virtual_base_content(unclosed.as_bytes()));
-    assert!(!is_virtual_base_content(USER_MARKER_TEXT.as_bytes()));
-    assert!(!is_virtual_base_content(b"no block\n"));
+    let file = |words: &str| case.file(f(), &lines(words).unwrap(), false, CopyId::placeholder());
+    let v_with_text = conflict(&[&file("x 2 3"), &file("1 2 3"), &file("y 2 3")]);
+    let (_, with_text) = virtual_base(&case, &v_with_text, &p1, &p2)?;
+    let with_text = String::from_utf8(with_text)?;
+    assert_names_terms(with_text.as_bytes(), &v_with_text);
+    let changes = [
+        ("text around it", format!("before\n{text}after\n")),
+        ("a changed side", text.replace("\nx\n", "\nz\n")),
+        (
+            "changed text after the block",
+            with_text.replace("\n2\n", "\ntwo\n"),
+        ),
+        ("a changed salt", text.replacen(" 0 file:", " 1 file:", 1)),
+        (
+            "no closing line",
+            text[..text.rfind(CLOSE).unwrap()].to_owned(),
+        ),
+        ("a user's marker lines", USER_MARKER_TEXT.to_owned()),
+        ("no block", "no block\n".to_owned()),
+    ];
+    for (name, changed) in changes {
+        assert!(
+            virtual_base_terms(changed.as_bytes()).is_none(),
+            "{name}: expected the verifier to refuse {changed:?}"
+        );
+    }
     Ok(())
 }
 

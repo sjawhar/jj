@@ -15,7 +15,10 @@
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::assert_no_virtual_merge_base_text;
 use crate::common::create_commit;
+use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits_with;
 
 #[test]
 fn test_duplicate() {
@@ -2525,6 +2528,38 @@ fn test_duplicate_description_template() {
        [END]
     [EOF]
     ");
+}
+
+#[test]
+fn test_duplicate_merge_with_an_edit_in_the_disputed_hunk_onto_one_parent_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" and "b" lines 1 to 3; "d" merges "p1" and "p2"
+    // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
+    // where "a" and "b" disagree. The duplicate of "d" onto "p1" holds a
+    // conflict of "d"'s and "a"'s changes from "o", as before virtual merge
+    // bases.
+    create_criss_cross_commits_with(
+        &work_dir,
+        "1\n2\n3\n4\n5\n6\n",
+        "a\n2\n3\n4\n5\n6\n",
+        "b1\nb2\nb3\n4\n5\n6\n",
+    );
+    create_commit_with_files(
+        &work_dir,
+        "d",
+        &["p1", "p2"],
+        &[("f", "b1\nB2\nb3\n4\n5\n6\n")],
+    );
+    work_dir.run_jj(["duplicate", "d", "-o", "p1"]).success();
+    let duplicate = "children(p1) & ~d";
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", duplicate]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, duplicate);
 }
 
 #[must_use]

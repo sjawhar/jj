@@ -42,7 +42,6 @@ use crate::files;
 use crate::files::FileMergeHunkLevel;
 use crate::merge::Merge;
 use crate::merge::SameChange;
-use crate::merge_rule;
 use crate::merged_tree::all_merged_tree_entries;
 use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
@@ -492,19 +491,16 @@ async fn try_resolve_file_conflict(
             BackendResult::Ok(content)
         })
         .await?;
-    match files::try_merge(&contents, options) {
-        // VB and M are only ever terms of a conflict, so a merge whose text is
-        // one of them does not resolve.
-        Some(merged_content) if !merge_rule::is_virtual_base_content(&merged_content) => {
-            let id = store
-                .write_file(filename, &mut merged_content.as_slice())
-                .await?;
-            Ok(Some(TreeValue::File {
-                id,
-                executable,
-                copy_id: copy_id.clone(),
-            }))
-        }
-        _ => Ok(None),
+    if let Some(merged_content) = files::try_merge(&contents, options) {
+        let id = store
+            .write_file(filename, &mut merged_content.as_slice())
+            .await?;
+        Ok(Some(TreeValue::File {
+            id,
+            executable,
+            copy_id: copy_id.clone(),
+        }))
+    } else {
+        Ok(None)
     }
 }

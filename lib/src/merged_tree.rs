@@ -15,6 +15,8 @@
 //! A lazily merged view of a set of trees.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::iter;
 use std::pin::Pin;
@@ -52,7 +54,7 @@ use crate::matchers::Matcher;
 use crate::merge::Diff;
 use crate::merge::Merge;
 use crate::merge::MergeBuilder;
-use crate::merge_rule;
+use crate::merged_tree_builder::MergedTreeBuilder;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
@@ -61,6 +63,7 @@ use crate::tree::ToTreeMergeExt as _;
 use crate::tree::Tree;
 use crate::tree::TreeMergeExt as _;
 use crate::tree_merge::merge_trees;
+use crate::virtual_base;
 
 /// Presents a view of a merged set of trees at the root directory, as well as
 /// conflict labels.
@@ -338,18 +341,23 @@ impl MergedTree {
     /// conflicted, the corresponding label will be ignored, and its existing
     /// labels will be used instead.
     ///
-    /// A path whose resolved value would be a virtual merge base, which an
-    /// input tree can hold only as a term of a conflict, stays a conflict.
+    /// A virtual merge base ([`crate::virtual_base`]) is only ever a base of a
+    /// conflict: where the merge leaves one as a side of a path, the merge
+    /// replaces it with the terms of the conflict that it stands for (see
+    /// [`Self::merge_with_overrides`]).
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
-        merge_rule::merge_keeping_virtual_bases(merge, &[], true).await
+        Self::merge_with_overrides(merge, &[], true).await
     }
 
     /// Merges the provided trees into a single `MergedTree`, without attempting
     /// to resolve file conflicts.
+    ///
+    /// Unlike [`Self::merge`], this keeps a virtual merge base that the merge
+    /// leaves as a side, so `merge_no_resolve(..).resolve()` can differ from
+    /// `merge(..)` where an input tree at a base of the merge holds a conflict
+    /// whose base is a virtual merge base.
     pub fn merge_no_resolve(merge: Merge<(Self, String)>) -> Self {
-        let tree = Self::merge_unsimplified(merge);
-        let (labels, tree_ids) = tree.labels.simplify_with(&tree.tree_ids);
-        Self::new(tree.store, tree_ids, labels)
+        Self::merge_unsimplified(merge).simplified()
     }
 
     /// The merge of the provided trees with each term of each tree kept, as
@@ -375,6 +383,300 @@ impl MergedTree {
             .flatten();
         Self::new(store, flattened_tree_ids, flattened_labels)
     }
+
+    /// This merge with its terms simplified, with their labels.
+    fn simplified(self) -> Self {
+        let (labels, tree_ids) = self.labels.simplify_with(&self.tree_ids);
+        Self::new(self.store, tree_ids, labels)
+    }
+
+    /// Merges the trees of `merge`, with `overrides` written over their terms,
+    /// and resolves the result if `resolve` is set. Each override has one term
+    /// for each term of the trees, in the order [`Self::merge_unsimplified`]
+    /// gives.
+    ///
+    /// A virtual merge base, VB or M ([`crate::virtual_base`]), is only ever a
+    /// base of a conflict, but a tree at a base of `merge` brings the bases of
+    /// its conflicts into the merge as sides. At each path outside `overrides`
+    /// where such a tree has a conflict, the merge's terms are simplified, and
+    /// a side that is such a base and is VB or M is replaced with the terms of
+    /// V that it names. The terms are simplified again after each replacement,
+    /// until no side is VB or M; a VB or M among V's bases stays a base. Where
+    /// two sides are VB or M, the one that names the other goes first, and
+    /// otherwise the one with the lower file id, so that the result does not
+    /// depend on the order of `merge`. The decision reads the merge's terms
+    /// and the files that may be such sides, never merged text. The terms that
+    /// replace a side take its label.
+    pub(crate) async fn merge_with_overrides(
+        merge: Merge<(Self, String)>,
+        overrides: &[(RepoPathBuf, MergedTreeValue)],
+        resolve: bool,
+    ) -> BackendResult<Self> {
+        let inverted_bases = inverted_bases(&merge, overrides)?;
+        let tree = Self::merge_unsimplified(merge);
+        let mut expansions = vec![];
+        for (path, candidates) in inverted_bases {
+            let terms = tree.term_values(&path).await?;
+            if let Some(expansion) = Expansion::new(tree.store(), &path, terms, candidates).await? {
+                expansions.push((path, expansion));
+            }
+        }
+        let tree = if overrides.is_empty() && expansions.is_empty() {
+            tree.simplified()
+        } else {
+            write_expanded(tree, overrides, expansions).await?
+        };
+        if resolve {
+            tree.resolve().await
+        } else {
+            Ok(tree)
+        }
+    }
+
+    /// The value that each term of this merge holds at `path`, one for each
+    /// term, none of them merged with the others.
+    pub(crate) async fn term_values(&self, path: &RepoPath) -> BackendResult<MergedTreeValue> {
+        let trees = self.trees().await?;
+        trees.try_map_async(|tree| tree.path_value(path)).await
+    }
+}
+
+/// The files that the trees at the bases of `merge` hold as bases of their
+/// conflicts, by path, outside the paths of `overrides`: in the merge, each is
+/// a side.
+fn inverted_bases(
+    merge: &Merge<(MergedTree, String)>,
+    overrides: &[(RepoPathBuf, MergedTreeValue)],
+) -> BackendResult<BTreeMap<RepoPathBuf, HashSet<TreeValue>>> {
+    let override_paths: HashSet<&RepoPath> =
+        overrides.iter().map(|(path, _)| path.as_ref()).collect();
+    let mut bases: BTreeMap<RepoPathBuf, HashSet<TreeValue>> = BTreeMap::new();
+    for (tree, _) in merge.removes().filter(|(tree, _)| tree.has_conflict()) {
+        for (path, value) in tree.conflicts() {
+            let value = value?;
+            if path
+                .ancestors()
+                .any(|ancestor| override_paths.contains(ancestor))
+            {
+                continue;
+            }
+            let files = value
+                .removes()
+                .flatten()
+                .filter(|term| matches!(term, TreeValue::File { .. }));
+            bases.entry(path).or_default().extend(files.cloned());
+        }
+    }
+    bases.retain(|_, files| !files.is_empty());
+    Ok(bases)
+}
+
+/// A remove of a merge and the add after it.
+type TermPair = (Option<TreeValue>, Option<TreeValue>);
+
+/// The terms of a merge at a path once each side that is VB or M is replaced
+/// with the terms of V that it names (see [`MergedTree::merge_with_overrides`]):
+/// the merge's own terms, each in its place, and the terms that each replaced
+/// side brings beyond the one that takes its place.
+struct Expansion {
+    adds: Vec<Option<TreeValue>>,
+    removes: Vec<Option<TreeValue>>,
+    /// The terms that replaced sides bring, as pairs of a remove and an add,
+    /// by the index among `adds` of the side that each came from.
+    extra: BTreeMap<usize, Vec<TermPair>>,
+}
+
+impl Expansion {
+    /// `terms` with each side that is VB or M replaced, where `candidates` are
+    /// the files that may be such sides, or `None` if no side is.
+    async fn new(
+        store: &Store,
+        path: &RepoPath,
+        terms: MergedTreeValue,
+        mut candidates: HashSet<TreeValue>,
+    ) -> BackendResult<Option<Self>> {
+        let (removes, adds) = terms.into_removes_adds();
+        let mut expansion = Self {
+            adds: adds.collect(),
+            removes: removes.collect(),
+            extra: BTreeMap::new(),
+        };
+        // The terms of V that each candidate names, if it is VB or M.
+        let mut named: HashMap<TreeValue, Option<MergedTreeValue>> = HashMap::new();
+        loop {
+            let counts = expansion.counts();
+            let sides = candidates
+                .iter()
+                .filter(|&candidate| counts.get(&Some(candidate.clone())).is_some_and(|&n| n > 0))
+                .cloned()
+                .collect_vec();
+            for side in &sides {
+                if !named.contains_key(side) {
+                    let terms = virtual_base::stored_virtual_base_terms(store, path, side).await?;
+                    named.insert(side.clone(), terms);
+                }
+            }
+            let sides = sides
+                .iter()
+                .filter_map(|side| Some((side, named[side].as_ref()?)))
+                .collect_vec();
+            // A side that another side's V names goes after that side.
+            let next = sides
+                .iter()
+                .filter(|(side, _)| {
+                    !sides
+                        .iter()
+                        .any(|(_, terms)| terms.iter().any(|term| term.as_ref() == Some(*side)))
+                })
+                .min_by_key(|(side, _)| match side {
+                    TreeValue::File { id, .. } => id.clone(),
+                    _ => unreachable!("VB and M are files"),
+                });
+            let Some(&(side, terms)) = next else {
+                break;
+            };
+            let (side, terms) = (side.clone(), terms.clone());
+            candidates.extend(terms.adds().flatten().cloned());
+            expansion.replace(&side, terms);
+        }
+        Ok((!expansion.extra.is_empty()).then_some(expansion))
+    }
+
+    /// How many more times each value is an add than a remove.
+    fn counts(&self) -> HashMap<Option<TreeValue>, isize> {
+        let pairs = self.extra.values().flatten();
+        let adds = self.adds.iter().chain(pairs.clone().map(|(_, add)| add));
+        let removes = self.removes.iter().chain(pairs.map(|(remove, _)| remove));
+        let mut counts: HashMap<Option<TreeValue>, isize> = HashMap::new();
+        for add in adds {
+            *counts.entry(add.clone()).or_default() += 1;
+        }
+        for remove in removes {
+            *counts.entry(remove.clone()).or_default() -= 1;
+        }
+        counts
+    }
+
+    /// Replaces an add that holds `side` with `terms`: their first add takes
+    /// the side's place, and the other terms go to `extra`. Each of their adds
+    /// that equals a remove of the merge cancels it first, both made absent,
+    /// so that where the two would cancel, the merge's own sides are left, and
+    /// keep their labels.
+    fn replace(&mut self, side: &TreeValue, terms: MergedTreeValue) {
+        let side = Some(side.clone());
+        let (removes, adds) = terms.into_removes_adds();
+        let mut adds = adds
+            .map(|add| {
+                if add.is_some() {
+                    let extra_removes = self
+                        .extra
+                        .values_mut()
+                        .flat_map(|pairs| pairs.iter_mut().map(|(remove, _)| remove));
+                    let mut merge_removes = self.removes.iter_mut().chain(extra_removes);
+                    if let Some(remove) = merge_removes.find(|remove| **remove == add) {
+                        *remove = None;
+                        return None;
+                    }
+                }
+                add
+            })
+            .collect_vec();
+        let in_place = adds.remove(0);
+        let pairs = iter::zip(removes, adds);
+        if let Some(index) = self.adds.iter().position(|add| *add == side) {
+            self.adds[index] = in_place;
+            self.extra.entry(index).or_default().extend(pairs);
+            return;
+        }
+        for extra in self.extra.values_mut() {
+            if let Some(index) = extra.iter().position(|(_, add)| *add == side) {
+                extra[index].1 = in_place;
+                extra.extend(pairs);
+                return;
+            }
+        }
+        unreachable!("a side is an add");
+    }
+
+    /// The terms, with `num_pairs` pairs after the merge's own terms for each
+    /// add that a replaced side held at any path.
+    fn into_merge(mut self, num_pairs: &BTreeMap<usize, usize>) -> MergedTreeValue {
+        let merge = Merge::from_removes_adds(self.removes, self.adds);
+        append_pairs(merge, num_pairs, |origin, n| {
+            let mut pairs = self.extra.remove(&origin).unwrap_or_default();
+            pairs.resize(n, (None, None));
+            pairs
+        })
+    }
+}
+
+/// `tree`, an unsimplified merge, with `overrides` and `expansions` written
+/// over its terms, and simplified once, with its labels. The terms that a
+/// replaced side brings beyond the one that takes its place go after the
+/// merge's own terms, as many pairs for each add of the merge that a replaced
+/// side held as at the path where it brings the most, and take that add's
+/// label.
+async fn write_expanded(
+    tree: MergedTree,
+    overrides: &[(RepoPathBuf, MergedTreeValue)],
+    expansions: Vec<(RepoPathBuf, Expansion)>,
+) -> BackendResult<MergedTree> {
+    let mut num_pairs: BTreeMap<usize, usize> = BTreeMap::new();
+    for (_, expansion) in &expansions {
+        for (&origin, pairs) in &expansion.extra {
+            let num = num_pairs.entry(origin).or_default();
+            *num = (*num).max(pairs.len());
+        }
+    }
+    let MergedTree {
+        store,
+        tree_ids,
+        labels,
+    } = tree;
+    let empty_tree_id = store.empty_tree_id().clone();
+    let tree_ids = append_pairs(tree_ids, &num_pairs, |_, n| {
+        vec![(empty_tree_id.clone(), empty_tree_id.clone()); n]
+    });
+    let labels = if labels.has_labels() {
+        let labels = labels.into_merge();
+        let origin_labels: HashMap<usize, String> = num_pairs
+            .keys()
+            .map(|&origin| (origin, labels.get_add(origin).cloned().unwrap_or_default()))
+            .collect();
+        ConflictLabels::from_merge(append_pairs(labels, &num_pairs, |origin, n| {
+            let label = &origin_labels[&origin];
+            vec![(label.clone(), label.clone()); n]
+        }))
+    } else {
+        ConflictLabels::unlabeled()
+    };
+    let mut builder = MergedTreeBuilder::new(MergedTree::new(store, tree_ids, labels));
+    for (path, value) in overrides {
+        builder.set_or_remove(path.clone(), value.clone());
+    }
+    for (path, expansion) in expansions {
+        builder.set_or_remove(path, expansion.into_merge(&num_pairs));
+    }
+    builder.write_tree_no_resolve().await
+}
+
+/// `merge` with pairs of a remove and an add after its terms: for each origin
+/// of `num_pairs` in order, the number of pairs it maps to, which `pairs`
+/// gives for the origin and that number.
+fn append_pairs<T>(
+    merge: Merge<T>,
+    num_pairs: &BTreeMap<usize, usize>,
+    mut pairs: impl FnMut(usize, usize) -> Vec<(T, T)>,
+) -> Merge<T> {
+    let (removes, adds) = merge.into_removes_adds();
+    let (mut removes, mut adds) = (removes.collect_vec(), adds.collect_vec());
+    for (&origin, &num) in num_pairs {
+        for (remove, add) in pairs(origin, num) {
+            removes.push(remove);
+            adds.push(add);
+        }
+    }
+    Merge::from_removes_adds(removes, adds)
 }
 
 /// A single entry in a tree diff.

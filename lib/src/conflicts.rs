@@ -56,6 +56,7 @@ use crate::merge::SameChange;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
 use crate::tree_merge::MergeOptions;
+use crate::virtual_base;
 
 /// Minimum length of conflict markers.
 pub const MIN_CONFLICT_MARKER_LEN: usize = 7;
@@ -1054,6 +1055,12 @@ fn parse_git_style_conflict_hunk(input: &[u8], expected_marker_len: usize) -> Me
 /// Parses conflict markers in `content` and returns an updated version of
 /// `file_ids` with the new contents. If no (valid) conflict markers remain, a
 /// single resolves `FileId` will be returned.
+///
+/// A base that is a virtual merge base, and that the new contents change,
+/// becomes the virtual merge base of the conflict it stands for with the same
+/// change made to each of that conflict's terms, or, where the change cannot
+/// be made to each of them, a plain file of the new contents (see
+/// [`virtual_base`]).
 pub async fn update_from_content(
     file_ids: &Merge<Option<FileId>>,
     store: &Store,
@@ -1106,28 +1113,47 @@ pub async fn update_from_content(
 
     // Now write the new files contents we found by parsing the file with conflict
     // markers.
-    let new_file_ids: Vec<Option<FileId>> = try_join_all(zip(&contents, &simplified_file_ids).map(
-        async |(content, file_id)| -> BackendResult<Option<FileId>> {
-            if file_id.is_some() || !content.is_empty() {
-                let file_id = store.write_file(path, &mut content.as_slice()).await?;
-                Ok(Some(file_id))
-            } else {
-                // The missing side of a conflict is still represented by
-                // the empty string we materialized it as
-                Ok(None)
+    let write = async |content: &Vec<u8>, file_id: &Option<FileId>| {
+        if file_id.is_some() || !content.is_empty() {
+            let file_id = store.write_file(path, &mut content.as_slice()).await?;
+            Ok(Some(file_id))
+        } else {
+            // The missing side of a conflict is still represented by
+            // the empty string we materialized it as
+            BackendResult::Ok(None)
+        }
+    };
+    // A base that is a virtual merge base stands for the terms of the conflict
+    // it names, so a change to it is a change to those terms.
+    let write_base = async |content: &Vec<u8>, file_id: &Option<FileId>, old_content: &BString| {
+        if file_id.is_some() && content[..] != old_content[..] {
+            let contents = contents.iter().map(Vec::as_slice);
+            if let Some(file_id) =
+                virtual_base::rewrite_virtual_base(store, path, old_content, content, contents)
+                    .await?
+            {
+                return Ok(Some(file_id));
             }
-        },
-    ))
-    .await?;
+        }
+        write(content, file_id).await
+    };
+    let adds = zip(contents.adds(), simplified_file_ids.adds())
+        .map(|(content, file_id)| write(content, file_id));
+    let removes = itertools::izip!(
+        contents.removes(),
+        simplified_file_ids.removes(),
+        old_contents.removes()
+    )
+    .map(|(content, file_id, old_content)| write_base(content, file_id, old_content));
+    let (adds, removes) = try_join!(try_join_all(adds), try_join_all(removes))?;
+    let new_file_ids = Merge::from_removes_adds(removes, adds);
 
     // If the conflict was simplified, expand the conflict to the original
     // number of sides.
-    let new_file_ids = if new_file_ids.len() != file_ids.iter().len() {
-        file_ids
-            .clone()
-            .update_from_simplified(Merge::from_vec(new_file_ids))
+    let new_file_ids = if new_file_ids.iter().len() != file_ids.iter().len() {
+        file_ids.clone().update_from_simplified(new_file_ids)
     } else {
-        Merge::from_vec(new_file_ids)
+        new_file_ids
     };
     Ok(new_file_ids)
 }

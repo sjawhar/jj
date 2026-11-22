@@ -117,6 +117,7 @@ pub mod tree_builder;
 pub mod ui_path;
 pub mod union_find;
 pub mod view;
+pub mod virtual_base;
 pub mod working_copy;
 pub mod workspace;
 pub use jj_core::workspace_store;

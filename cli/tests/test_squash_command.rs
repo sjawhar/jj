@@ -22,6 +22,7 @@ use crate::common::TestWorkDir;
 use crate::common::assert_no_virtual_merge_base_text;
 use crate::common::create_commit_with_files;
 use crate::common::create_criss_cross_commits;
+use crate::common::create_criss_cross_commits_with;
 use crate::common::fake_editor_path;
 
 #[test]
@@ -2584,7 +2585,7 @@ fn test_squash_with_editor_and_empty_message() -> TestResult {
 }
 
 #[test]
-fn test_squash_resolved_merge_into_a_parent_keeps_virtual_base_conflicted() {
+fn test_squash_resolved_merge_into_a_parent_conflicts() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
@@ -2592,9 +2593,43 @@ fn test_squash_resolved_merge_into_a_parent_keeps_virtual_base_conflicted() {
     // "d" merges "p1" and "p2" and resolves "f" to "y", so its parent tree is a
     // conflict whose base is the virtual merge base of "a" and "b". Squashing
     // "d" into "p1" applies "d"'s change from that parent tree to "p1", which
-    // cancels every term but the virtual merge base: "f" stays a conflict.
+    // cancels every term but the virtual merge base, now a side: the merge
+    // replaces it with the conflict of "a" and "b" that it stands for, so "f"
+    // is a conflict of "x" and "y" against "o".
     create_criss_cross_commits(&work_dir);
     create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir
+        .run_jj(["squash", "--from", "d", "--into", "p1", "-u"])
+        .success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "p1"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "p1");
+}
+
+#[test]
+fn test_squash_merge_with_an_edit_in_the_disputed_hunk_into_a_parent_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" and "b" lines 1 to 3; "d" merges "p1" and "p2"
+    // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
+    // where "a" and "b" disagree. Squashing "d" into "p1" gives "p1" a conflict
+    // of "d"'s and "a"'s changes from "o", as before virtual merge bases.
+    create_criss_cross_commits_with(
+        &work_dir,
+        "1\n2\n3\n4\n5\n6\n",
+        "a\n2\n3\n4\n5\n6\n",
+        "b1\nb2\nb3\n4\n5\n6\n",
+    );
+    create_commit_with_files(
+        &work_dir,
+        "d",
+        &["p1", "p2"],
+        &[("f", "b1\nB2\nb3\n4\n5\n6\n")],
+    );
     work_dir
         .run_jj(["squash", "--from", "d", "--into", "p1", "-u"])
         .success();

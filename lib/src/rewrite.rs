@@ -72,8 +72,8 @@ pub async fn merge_commit_trees(repo: &dyn Repo, commits: &[Commit]) -> BackendR
 ///
 /// The merge bases of `commits` are still merged and resolved, which writes
 /// trees and files to the store, and a virtual merge base can be written to the
-/// store as a file (see [`merge_rule::virtual_merge_base`]). Only the outer
-/// merge is left unresolved.
+/// store as a file (see [`crate::virtual_base::virtual_merge_base`]). Only the
+/// outer merge is left unresolved.
 pub async fn merge_commit_trees_no_resolve(
     repo: &dyn Repo,
     commits: &[Commit],
@@ -154,9 +154,9 @@ trait CommitFold {
 /// against V, the merge of their merge bases. With no merge base, V is the
 /// root commit, and with one, that commit. Two or more merge bases are merged
 /// the same way, in the order [`CommitFold::SORTS_BASES`] gives, before the
-/// merge that needs them goes on. V of a set of merge bases is merged once:
-/// where the same set comes up again, at a later step or at another level, the
-/// fold takes the V it merged before.
+/// merge that needs them goes on. V of merge bases is merged once for each
+/// list of them in that order: where the same list comes up again, at a later
+/// step or at another level, the fold takes the V it merged before.
 ///
 /// Each merge is resolved but the last one, and the last one too if `resolve`
 /// is set. The merges that wait for their V are kept in a `Vec`, so merge
@@ -177,11 +177,10 @@ async fn fold_commits<F: CommitFold>(
     }
 
     /// A work item whose next commit waits for V, with the merge bases V
-    /// merges, in the order the index returns them and sorted.
+    /// merges, in the order the index returns them.
     struct Waiting<M> {
         item: WorkItem<M>,
         base_ids: Vec<CommitId>,
-        sorted_base_ids: Vec<CommitId>,
     }
 
     let Some(first_id) = commit_ids.first() else {
@@ -196,8 +195,8 @@ async fn fold_commits<F: CommitFold>(
     // The work items below `item`, the last of which waits for the merge that
     // `item` builds.
     let mut waiting: Vec<Waiting<F::Merged>> = vec![];
-    // V of each set of two or more merge bases merged so far, by their sorted
-    // ids.
+    // V of each set of two or more merge bases merged so far, by their ids in
+    // the order the fold merges them in.
     let mut merged_bases: HashMap<Vec<CommitId>, F::Merged> = HashMap::new();
     loop {
         let (base, base_ids) = if let Some(next_id) = item.commit_ids.get(item.pos) {
@@ -211,16 +210,13 @@ async fn fold_commits<F: CommitFold>(
                 let base = fold.commit(store, base_id).await?;
                 (base, base_ids)
             } else {
-                let mut sorted_base_ids = base_ids.clone();
-                sorted_base_ids.sort_unstable();
-                if let Some(base) = merged_bases.get(&sorted_base_ids) {
+                let mut fold_ids = base_ids.clone();
+                if F::SORTS_BASES {
+                    fold_ids.sort_unstable();
+                }
+                if let Some(base) = merged_bases.get(&fold_ids) {
                     (base.clone(), base_ids)
                 } else {
-                    let fold_ids = if F::SORTS_BASES {
-                        sorted_base_ids.clone()
-                    } else {
-                        base_ids.clone()
-                    };
                     let merged = fold.commit(store, &fold_ids[0]).await?;
                     let bases = WorkItem {
                         commit_ids: fold_ids,
@@ -230,15 +226,14 @@ async fn fold_commits<F: CommitFold>(
                     waiting.push(Waiting {
                         item: mem::replace(&mut item, bases),
                         base_ids,
-                        sorted_base_ids,
                     });
                     continue;
                 }
             }
         } else if let Some(below) = waiting.pop() {
-            let base = mem::replace(&mut item, below.item).merged;
-            merged_bases.insert(below.sorted_base_ids, base.clone());
-            (base, below.base_ids)
+            let bases = mem::replace(&mut item, below.item);
+            merged_bases.insert(bases.commit_ids, bases.merged.clone());
+            (bases.merged, below.base_ids)
         } else {
             return Ok(item.merged);
         };
