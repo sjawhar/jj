@@ -3367,6 +3367,76 @@ fn test_rebase_keeps_an_edit_outside_a_conflict_whose_base_is_a_virtual_base() {
     assert_no_virtual_merge_base_text(&work_dir, "u");
 }
 
+#[test]
+fn test_rebase_keeps_an_edit_where_the_merge_bases_merge() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" to "x" and line 9 to "9a", and "b" line 1 to
+    // "y"; "p1" and "p2", merges of "a" and "b", hold "x" and "y", each with
+    // "9a". "w" merges "p1" and "p2" and keeps their conflict at line 1; line
+    // 9, where "a" and "b" merge, is changed to "9b" in the working copy. "s"
+    // and "u", children of "w", resolve "f" to "x" and to "y", each with "9b".
+    // Rebasing "u" onto "s" gives a conflict, and no file holds a virtual
+    // merge base's text.
+    let text = |first: &str, nine: &str| format!("{first}\n2\n3\n4\n5\n6\n7\n8\n{nine}\n10\n");
+    create_commit_with_files(&work_dir, "o", &[], &[("f", &*text("o", "9"))]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", &*text("x", "9a"))]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", &*text("y", "9"))]);
+    create_commit_with_files(&work_dir, "p1", &["a", "b"], &[("f", &*text("x", "9a"))]);
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", &*text("y", "9a"))]);
+    create_commit_with_files(&work_dir, "w", &["p1", "p2"], &[]);
+    let materialized = work_dir.read_file("f").to_string();
+    let edited = materialized.replacen("\n9a\n", "\n9b\n", 1);
+    assert_ne!(edited, materialized);
+    work_dir.write_file("f", edited);
+    create_commit_with_files(&work_dir, "s", &["w"], &[("f", &*text("x", "9b"))]);
+    create_commit_with_files(&work_dir, "u", &["w"], &[("f", &*text("y", "9b"))]);
+    work_dir.run_jj(["rebase", "-r", "u", "-d", "s"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "u"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "u");
+}
+
+#[test]
+fn test_rebase_after_an_edit_where_a_virtual_base_opens_in_a_resolved_hunk() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" to "x1" and "x2", and "b" to "y1"; "p1", a
+    // merge of "a" and "b", keeps "a"'s text, and "p2" adds "Q" and "W" around
+    // "x2". "w" merges "p1" and "p2" and keeps their conflict, which holds
+    // only the tail of the virtual merge base's block; line 5 is changed to
+    // "FIVE" in the working copy. "s", a child of "w", resolves "f" to "p2"'s
+    // text with "FIVE". Rebased onto "p1", "s" holds no marker line of a
+    // virtual merge base, whole or cut.
+    let ten = |head: &str, five: &str| format!("{head}2\n3\n4\n{five}\n6\n7\n8\n9\n10\n");
+    create_commit_with_files(&work_dir, "o", &[], &[("f", &*ten("1\n", "5"))]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", &*ten("x1\nx2\n", "5"))]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", &*ten("y1\n", "5"))]);
+    create_commit_with_files(
+        &work_dir,
+        "p1",
+        &["a", "b"],
+        &[("f", &*ten("x1\nx2\n", "5"))],
+    );
+    let p2_text = ten("x1\nQ\nx2\nW\n", "5");
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", &*p2_text)]);
+    create_commit_with_files(&work_dir, "w", &["p1", "p2"], &[]);
+    let materialized = work_dir.read_file("f").to_string();
+    let edited = materialized.replacen("\n5\n", "\nFIVE\n", 1);
+    assert_ne!(edited, materialized);
+    work_dir.write_file("f", edited);
+    let s_text = ten("x1\nQ\nx2\nW\n", "FIVE");
+    create_commit_with_files(&work_dir, "s", &["w"], &[("f", &*s_text)]);
+    work_dir.run_jj(["rebase", "-r", "s", "-d", "p1"]).success();
+    assert_no_virtual_merge_base_text(&work_dir, "s");
+}
+
 /// The six lines of "f" in the histories whose merge bases change some of
 /// them.
 const SIX_LINES: &str = "1\n2\n3\n4\n5\n6\n";

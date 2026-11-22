@@ -93,10 +93,11 @@ pub fn create_criss_cross_commits_with(work_dir: &TestWorkDir, o: &str, a: &str,
     create_commit_with_files(work_dir, "p2", &["a", "b"], &[("f", b)]);
 }
 
-/// Asserts that no file of `revision`, resolved or conflicted, shows a line
-/// that opens a virtual merge base: where a merge leaves a virtual merge base
-/// as a side, it merges the terms of the conflict it stands for instead, so no
-/// term of the result holds its text.
+/// Asserts that no file of `revision`, resolved or conflicted, shows a marker
+/// line of a virtual merge base, whole or cut: where a merge leaves a virtual
+/// merge base as a side, it merges the terms of the conflict it stands for
+/// instead, and a snapshot never writes its marker lines into another term,
+/// so no term of the result holds them.
 pub fn assert_no_virtual_merge_base_text(work_dir: &TestWorkDir, revision: &str) {
     let files = work_dir.run_jj(["file", "list", "-r", revision]).success();
     for path in files.stdout.raw().lines() {
@@ -108,9 +109,22 @@ pub fn assert_no_virtual_merge_base_text(work_dir: &TestWorkDir, revision: &str)
                 .stdout
                 .raw()
                 .lines()
-                .any(|line| line.contains("<<<<<<< jj virtual merge base")),
+                .any(is_virtual_merge_base_marker),
             "{path} in {revision} holds a virtual merge base's text: {}",
             content.stdout.raw()
         );
     }
+}
+
+/// Whether `line`, as jj shows a file, after the `-`, `+` or ` ` of a diff if
+/// any, is a marker line of a virtual merge base: an opening line, or a
+/// separator or closing line with its 32 hex digits.
+fn is_virtual_merge_base_marker(line: &str) -> bool {
+    let line = line.strip_prefix(['-', '+', ' ']).unwrap_or(line);
+    line.starts_with("<<<<<<< jj virtual merge base")
+        || ["======= ", ">>>>>>> "].iter().any(|prefix| {
+            line.strip_prefix(prefix).is_some_and(|hex| {
+                hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
 }

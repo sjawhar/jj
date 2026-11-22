@@ -364,7 +364,7 @@ impl MergedTree {
     /// [`Self::merge_no_resolve`] builds it before it simplifies the terms:
     /// the terms of the first tree, then those of the second, inverted, and so
     /// on, each with its label.
-    pub(crate) fn merge_unsimplified(merge: Merge<(Self, String)>) -> Self {
+    fn merge_unsimplified(merge: Merge<(Self, String)>) -> Self {
         debug_assert!(
             merge
                 .iter()

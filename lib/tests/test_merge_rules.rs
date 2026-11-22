@@ -2027,6 +2027,30 @@ fn assert_edits_survive_expansion(edits: &[(&str, &str)]) -> TestResult {
         mut case, p1, p2, ..
     } = six_line_history("x", "y 2 3")?;
     let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, edits)?;
+    let words = edits
+        .iter()
+        .fold("2 3 4 5 6".to_owned(), |words, (line, replacement)| {
+            words.replacen(line, replacement, 1)
+        });
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", lines(&format!("x {words}")))])?;
+    let u = case.commit(&[&w], &[("f", lines(&format!("y {words}")))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?;
+    let [x_edited, o_edited, y_edited] = ["x", "1", "y"].map(|first| {
+        let content = lines(&format!("{first} {words}")).unwrap();
+        case.file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(&case, &value, &conflict(&[&x_edited, &o_edited, &y_edited]));
+    Ok(())
+}
+
+/// The value at `f` of `w`, a conflict, once each of `edits`, a line of `f`
+/// and its replacement, or an empty line and a line to append, is made to the
+/// file that jj materializes for the conflict and snapshotted in turn, as jj
+/// snapshots a working copy.
+fn snapshot_edits(case: &Case, w: &Commit, edits: &[(&str, &str)]) -> TestResult<MergedTreeValue> {
     let store = case.store().clone();
     let mut file_ids = value_at(&w.tree(), "f")?
         .to_file_merge()
@@ -2041,34 +2065,218 @@ fn assert_edits_survive_expansion(edits: &[(&str, &str)]) -> TestResult {
         materialize_merge_result_to_bytes(&contents, &ConflictLabels::unlabeled(), &options).into(),
     )?;
     let marker_len = choose_materialized_conflict_marker_len(&contents);
-    let mut words = "2 3 4 5 6".to_owned();
     for (line, replacement) in edits {
-        let (from, to) = (format!("\n{line}\n"), format!("\n{replacement}\n"));
-        let edited = working_copy.replacen(&from, &to, 1);
+        let edited = if line.is_empty() {
+            format!("{working_copy}{replacement}\n")
+        } else {
+            let (from, to) = (format!("\n{line}\n"), format!("\n{replacement}\n"));
+            working_copy.replacen(&from, &to, 1)
+        };
         assert_ne!(edited, working_copy);
         working_copy = edited;
         let content = working_copy.as_bytes();
         file_ids = update_from_content(&file_ids, &store, f(), content, marker_len).block_on()?;
-        words = words.replacen(line, replacement, 1);
     }
-    let new_value = file_ids.map(|id| {
+    Ok(file_ids.map(|id| {
         id.clone().map(|id| TreeValue::File {
             id,
             executable: false,
             copy_id: CopyId::placeholder(),
         })
-    });
+    }))
+}
+
+/// Whether `content` holds a marker line of a virtual base, whole or cut: an
+/// opening line, or a separator or closing line with a hex.
+fn holds_any_marker(content: &[u8]) -> bool {
+    String::from_utf8_lossy(content).lines().any(|line| {
+        line.starts_with(OPEN.trim_end())
+            || marker_hex(line, SEPARATOR).is_some()
+            || marker_hex(line, CLOSE).is_some()
+    })
+}
+
+/// VB5b: w, the merge of P1 and P2, left conflicted, where the merge bases
+/// A and B merge at line 9 (A's `9a` against o's and B's `9`), and line 9,
+/// `9a` in VB and in the working copy, changed to `9b` there. The snapshot
+/// writes `9b` into each term of V at that line, so that u rebased onto s,
+/// which both hold `9b`, is `xF + yF - oF`, as jj 0.45.1 gives, whose every
+/// side holds `9b`.
+#[test]
+fn vb5b_an_edit_where_the_merge_bases_merge_survives_expansion() -> TestResult {
+    let text = |first: &str, nine: &str| lines(&format!("{first} 2 3 4 5 6 7 8 {nine} 10"));
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", text("o", "9"))],
+        &[("f", text("x", "9a"))],
+        &[("f", text("y", "9"))],
+        Made::AFirst,
+        &[("f", text("x", "9a"))],
+        &[("f", text("y", "9a"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("9a", "9b")])?;
     let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
-    let s = case.commit(&[&w], &[("f", lines(&format!("x {words}")))])?;
-    let u = case.commit(&[&w], &[("f", lines(&format!("y {words}")))])?;
+    let s = case.commit(&[&w], &[("f", text("x", "9b"))])?;
+    let u = case.commit(&[&w], &[("f", text("y", "9b"))])?;
     let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
     let value = value_at(&rebased.tree(), "f")?;
-    let [x_edited, o_edited, y_edited] = ["x", "1", "y"].map(|first| {
-        let content = lines(&format!("{first} {words}")).unwrap();
+    let [x_edited, o_edited, y_edited] = ["x", "o", "y"].map(|first| {
+        let content = text(first, "9b").unwrap();
         case.file(f(), &content, false, CopyId::placeholder())
     });
     assert_same_value(&case, &value, &conflict(&[&x_edited, &o_edited, &y_edited]));
     Ok(())
+}
+
+/// VB6: P2 adds `Q` and `W` inside the lines of A's side of the block where
+/// the merge bases disagree, so w, the merge of P1 and P2, left conflicted,
+/// conflicts only at the block's tail, and VB's opening line is in a hunk
+/// that resolves. Line 5 changed to `FIVE` in the working copy, then s, a
+/// child of w that resolves `f` to P2's text with `FIVE`, rebased onto P1: no
+/// term of the result holds a marker line of a virtual base, whole or cut.
+#[test]
+fn vb6_an_edit_where_the_opening_line_resolves_keeps_every_marker_line() -> TestResult {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
+        Made::AFirst,
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("5", "FIVE")])?;
+    let w_value = new_value.clone();
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", lines("x1 Q x2 W 2 3 4 FIVE 6 7 8 9 10"))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), s, vec![p1.id().clone()]).block_on()?;
+    for (name, value) in [("w", w_value), ("s", value_at(&rebased.tree(), "f")?)] {
+        let simplified = value.simplify();
+        let marked = |term: &Option<TreeValue>| {
+            case.read(term.as_ref())
+                .is_some_and(|content| holds_any_marker(&content))
+        };
+        assert!(
+            !simplified.adds().any(&marked),
+            "{name}: a side holds a marker line of a virtual base: {}",
+            describe(&case, &simplified)
+        );
+        // w's base is the virtual base of the edited terms: its every marker
+        // line is whole, so that it names them.
+        for remove in simplified.removes().filter(|&term| marked(term)) {
+            let content = case.read(remove.as_ref()).unwrap();
+            assert!(
+                virtual_base_terms(&content).is_some(),
+                "{name}: a base holds cut marker lines: {}",
+                describe(&case, &simplified)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Appends `END` to the working copy of k, the merge of `history`'s P1 and P2,
+/// left conflicted, and snapshots it; s and u, children of k, hold `s_text`
+/// and `u_text`. Returns u rebased onto s.
+fn append_then_rebase(
+    history: TwoBases,
+    s_text: Option<Vec<u8>>,
+    u_text: Option<Vec<u8>>,
+) -> TestResult<Merged> {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = history;
+    let k = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &k, &[("", "END")])?;
+    let k = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&k], &[("f", s_text)])?;
+    let u = case.commit(&[&k], &[("f", u_text)])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u.clone(), vec![s.id().clone()]).block_on()?;
+    Ok(Merged {
+        case,
+        parents: vec![s, u],
+        tree: rebased.tree(),
+    })
+}
+
+/// Asserts that no term of the merge's value at `f` holds a marker line of a
+/// virtual base, whole or cut.
+fn assert_no_marker_line(merged: &Merged) -> TestResult {
+    let value = merged.value()?;
+    let marked = |term: &Option<TreeValue>| {
+        merged
+            .case
+            .read(term.as_ref())
+            .is_some_and(|content| holds_any_marker(&content))
+    };
+    assert!(
+        !value.iter().any(marked),
+        "a term holds a marker line of a virtual base: {}",
+        describe(&merged.case, &value)
+    );
+    Ok(())
+}
+
+/// K4-append: a line appended after K4's kept conflict goes, outside the
+/// virtual base's block, into each term of V, so that u rebased onto s, which
+/// both hold it, is `[x END, -o END, y END]`, as jj 0.45.1 gives.
+#[test]
+fn k4_append_goes_into_each_term_of_v() -> TestResult {
+    let merged = append_then_rebase(k4_history(Made::AFirst)?, lines("x END"), lines("y END"))?;
+    let [x_end, o_end, y_end] = ["x", "o", "y"].map(|first| {
+        let content = lines(&format!("{first} END")).unwrap();
+        merged
+            .case
+            .file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(
+        &merged.case,
+        &merged.value()?,
+        &conflict(&[&x_end, &o_end, &y_end]),
+    );
+    Ok(())
+}
+
+/// X1-append: VB6's history, a line appended after the kept conflict, and u,
+/// which holds P2's text with it, rebased onto s, which holds P1's: no term
+/// holds a marker line.
+#[test]
+fn x1_append_keeps_every_marker_line() -> TestResult {
+    let history = two_bases(
+        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
+        Made::AFirst,
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
+    )?;
+    let merged = append_then_rebase(
+        history,
+        lines("x1 x2 2 3 4 5 6 7 8 9 10 END"),
+        lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10 END"),
+    )?;
+    assert_no_marker_line(&merged)
+}
+
+/// MD-append: A deletes `f` and B changes it, so the kept conflict's base is
+/// M; a line appended after the conflict, and u, which holds B's text with it,
+/// rebased onto s, which holds only the line: no term holds a marker line.
+#[test]
+fn md_append_keeps_every_marker_line() -> TestResult {
+    let history = two_bases(
+        &[("f", line("o"))],
+        &[("f", None)],
+        &[("f", line("y"))],
+        Made::AFirst,
+        &[("f", None)],
+        &[("f", line("y"))],
+    )?;
+    let merged = append_then_rebase(history, line("END"), lines("y END"))?;
+    assert_no_marker_line(&merged)
 }
 
 /// Q1: a user's file that quotes a virtual base that a merge in this

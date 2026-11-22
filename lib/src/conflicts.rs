@@ -1056,10 +1056,10 @@ fn parse_git_style_conflict_hunk(input: &[u8], expected_marker_len: usize) -> Me
 /// `file_ids` with the new contents. If no (valid) conflict markers remain, a
 /// single resolves `FileId` will be returned.
 ///
-/// A base that is a virtual merge base, and that the new contents change,
-/// becomes the virtual merge base of the conflict it stands for with the same
-/// change made to each of that conflict's terms, or, where the change cannot
-/// be made to each of them, a plain file of the new contents (see
+/// A base that is a virtual merge base stands for the terms of the conflict it
+/// names: the changes the new contents make to the materialized file are made
+/// to those terms by region, and the base becomes their virtual merge base,
+/// never a plain file that holds its marker lines (see
 /// [`virtual_base`]).
 pub async fn update_from_content(
     file_ids: &Merge<Option<FileId>>,
@@ -1099,14 +1099,14 @@ pub async fn update_from_content(
     };
 
     let mut contents = simplified_file_ids.map(|_| vec![]);
-    for hunk in hunks {
+    for hunk in &hunks {
         if let Some(slice) = hunk.as_resolved() {
             for content in &mut contents {
                 content.extend_from_slice(slice);
             }
         } else {
-            for (content, slice) in zip(&mut contents, hunk) {
-                content.extend(Vec::from(slice));
+            for (content, slice) in zip(&mut contents, hunk.iter()) {
+                content.extend_from_slice(slice);
             }
         }
     }
@@ -1125,12 +1125,20 @@ pub async fn update_from_content(
     };
     // A base that is a virtual merge base stands for the terms of the conflict
     // it names, so a change to it is a change to those terms.
-    let write_base = async |content: &Vec<u8>, file_id: &Option<FileId>, old_content: &BString| {
-        if file_id.is_some() && content[..] != old_content[..] {
+    let write_base = async |index: usize, content: &Vec<u8>, file_id: &Option<FileId>| {
+        if let Some(old_id) = file_id {
             let contents = contents.iter().map(Vec::as_slice);
-            if let Some(file_id) =
-                virtual_base::rewrite_virtual_base(store, path, old_content, content, contents)
-                    .await?
+            let old_index = 2 * index + 1;
+            if let Some(file_id) = virtual_base::rewrite_virtual_base(
+                store,
+                path,
+                old_id,
+                &old_contents,
+                old_index,
+                &hunks,
+                contents,
+            )
+            .await?
             {
                 return Ok(Some(file_id));
             }
@@ -1139,12 +1147,9 @@ pub async fn update_from_content(
     };
     let adds = zip(contents.adds(), simplified_file_ids.adds())
         .map(|(content, file_id)| write(content, file_id));
-    let removes = itertools::izip!(
-        contents.removes(),
-        simplified_file_ids.removes(),
-        old_contents.removes()
-    )
-    .map(|(content, file_id, old_content)| write_base(content, file_id, old_content));
+    let removes = zip(contents.removes(), simplified_file_ids.removes())
+        .enumerate()
+        .map(|(index, (content, file_id))| write_base(index, content, file_id));
     let (adds, removes) = try_join!(try_join_all(adds), try_join_all(removes))?;
     let new_file_ids = Merge::from_removes_adds(removes, adds);
 
