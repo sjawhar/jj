@@ -450,23 +450,24 @@ impl MergedTree {
             start = end;
         }
         let tree = Self::merge_unsimplified(merge);
-        let mut expansions = vec![];
-        let mut replacements = 0;
+        let store = tree.store();
+        let mut replaced = vec![];
         for (path, candidates) in inverted_bases {
             let terms = tree.term_values(&path).await?;
-            let store = tree.store();
-            let expansion = Expansion::new(
-                store,
-                &path,
-                terms,
-                candidates,
-                &substitutes,
-                &mut replacements,
-            )
-            .await?;
-            if let Some(expansion) = expansion {
-                expansions.push((path, expansion));
+            let mut named = HashMap::new();
+            if replaces_at(store, &path, &terms, &candidates, &mut named).await? {
+                replaced.push((path, terms, named));
             }
+        }
+        let mut replacements = Replacements {
+            in_merge: 0,
+            replaced_paths: replaced.len(),
+        };
+        let mut expansions = vec![];
+        for (path, terms, named) in replaced {
+            let expansion =
+                Expansion::new(store, &path, terms, &substitutes, named, &mut replacements).await?;
+            expansions.push((path, expansion));
         }
         let tree = if overrides.is_empty() && expansions.is_empty() {
             tree.simplified()
@@ -524,13 +525,56 @@ type LabeledTerm = (Option<TreeValue>, String);
 /// The terms of V that a VB or M names, with their labels.
 type NamedTerms = (MergedTreeValue, Merge<String>);
 
-/// The most VB and M terms that one merge replaces, across all its paths. A
-/// VB names at most one VB or M for each level of merge bases below it, so a
-/// rewrite of the top merge of a braid of 8,000 levels of merge bases replaces
-/// 7,999; a planted set of files that name one another can stand for more, at
-/// one path or at many, and the merge then fails, as a user error, rather than
-/// spend time and memory on them.
-const MAX_REPLACEMENTS: usize = 10_000;
+/// The most VB and M terms that a merge replaces at one path. A VB names at
+/// most one VB or M for each level of merge bases below it, so a rewrite of the
+/// top merge of a braid of 8,000 levels of merge bases replaces 7,999 at its
+/// one path; a planted set of files that name one another can stand for more,
+/// and the merge then fails, as a user error, rather than spend time and
+/// memory on them.
+const MAX_REPLACEMENTS_AT_A_PATH: usize = 10_000;
+
+/// The most VB and M terms that a merge replaces in all is this, and
+/// [`MAX_REPLACEMENTS_PER_REPLACED_PATH`] more for each path where it replaces
+/// one: a real merge of many conflicted paths replaces about one at each, and
+/// planted files at many paths get about this many each.
+const MAX_REPLACEMENTS_IN_A_MERGE: usize = 10_000;
+
+/// See [`MAX_REPLACEMENTS_IN_A_MERGE`].
+const MAX_REPLACEMENTS_PER_REPLACED_PATH: usize = 100;
+
+/// How many VB and M terms a merge has replaced, and at how many paths it
+/// replaces them.
+struct Replacements {
+    in_merge: usize,
+    replaced_paths: usize,
+}
+
+impl Replacements {
+    /// Counts one more replacement at `path`, where `at_path` were made
+    /// before it; fails, as a user error, once it passes the bound at a path
+    /// or the bound of the merge.
+    fn count(&mut self, path: &RepoPath, at_path: &mut usize) -> BackendResult<()> {
+        *at_path += 1;
+        self.in_merge += 1;
+        let path = path.as_internal_file_string();
+        if *at_path > MAX_REPLACEMENTS_AT_A_PATH {
+            return Err(BackendError::Unsupported(format!(
+                "The merge at {path} names more than {MAX_REPLACEMENTS_AT_A_PATH} virtual bases \
+                 at that path, the bound at one path"
+            )));
+        }
+        let bound =
+            MAX_REPLACEMENTS_IN_A_MERGE + MAX_REPLACEMENTS_PER_REPLACED_PATH * self.replaced_paths;
+        if self.in_merge > bound {
+            let paths = self.replaced_paths;
+            return Err(BackendError::Unsupported(format!(
+                "The merge at {path} names more than {bound} virtual bases in all, the bound of a \
+                 merge that replaces them at {paths} paths"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// A tree of a merge that comes with the unresolved merge that it resolves
 /// (see [`MergedTree::merge_with_unresolved`]): the range of its terms among
@@ -583,34 +627,20 @@ impl Slot {
 }
 
 impl Expansion {
-    /// `terms` with every VB and M replaced, sides and bases alike, nested
-    /// ones too, where a side that is one of `candidates` is VB or M once
-    /// `terms` are simplified; `None` where none is. Each of `substitutes`
-    /// first enters as the terms of its unresolved merge at `path` in place of
-    /// its own terms. Each VB and M replaced counts in `replacements`, the
-    /// count of the whole merge, which fails once it passes
-    /// [`MAX_REPLACEMENTS`].
+    /// `terms` at `path`, where [`replaces_at`] holds, with every VB and M
+    /// replaced, sides and bases alike, nested ones too, with `named` the
+    /// terms already looked up. Each of `substitutes` first enters as the
+    /// terms of its unresolved merge at `path` in place of its own terms.
+    /// Each VB and M replaced counts in `replacements`, which fails past its
+    /// bounds.
     async fn new(
         store: &Store,
         path: &RepoPath,
         terms: MergedTreeValue,
-        candidates: HashSet<TreeValue>,
         substitutes: &[Substitute<'_>],
-        replacements: &mut usize,
-    ) -> BackendResult<Option<Self>> {
-        let mut named = HashMap::new();
-        let mut side_is_virtual_base = false;
-        for side in terms.simplify().adds().flatten() {
-            if candidates.contains(side)
-                && named_terms(store, path, &mut named, side).await?.is_some()
-            {
-                side_is_virtual_base = true;
-                break;
-            }
-        }
-        if !side_is_virtual_base {
-            return Ok(None);
-        }
+        mut named: HashMap<TreeValue, Option<NamedTerms>>,
+        replacements: &mut Replacements,
+    ) -> BackendResult<Self> {
         let mut expansion = Self {
             terms: vec![None; terms.as_slice().len()],
             extra: BTreeMap::new(),
@@ -650,6 +680,7 @@ impl Expansion {
             let first = Slot::Own(substitute.slots.start);
             pending.extend(expansion.replace(first, unresolved_terms, labels));
         }
+        let mut at_path = 0;
         while let Some(slot) = pending.pop_front() {
             let Some(value) = expansion.term(slot).cloned() else {
                 continue;
@@ -657,17 +688,10 @@ impl Expansion {
             let Some((terms, labels)) = named_terms(store, path, &mut named, &value).await? else {
                 continue;
             };
-            *replacements += 1;
-            if *replacements > MAX_REPLACEMENTS {
-                // A user error: the merge's input, not the backend, is at fault.
-                let path = path.as_internal_file_string();
-                return Err(BackendError::Unsupported(format!(
-                    "The merge at {path} names more than {MAX_REPLACEMENTS} virtual bases"
-                )));
-            }
+            replacements.count(path, &mut at_path)?;
             pending.extend(expansion.replace(slot, terms, labels));
         }
-        Ok(Some(expansion))
+        Ok(expansion)
     }
 
     /// The term at `slot`.
@@ -768,6 +792,24 @@ impl Expansion {
             pairs
         })
     }
+}
+
+/// Whether a merge replaces the VB and M at `path`, whose terms are `terms`:
+/// whether a side that is one of `candidates` is VB or M once `terms` are
+/// simplified. The terms it looks up go to `named`.
+async fn replaces_at(
+    store: &Store,
+    path: &RepoPath,
+    terms: &MergedTreeValue,
+    candidates: &HashSet<TreeValue>,
+    named: &mut HashMap<TreeValue, Option<NamedTerms>>,
+) -> BackendResult<bool> {
+    for side in terms.simplify().adds().flatten() {
+        if candidates.contains(side) && named_terms(store, path, named, side).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The terms that `value` names, with their labels, if it is VB or M, looked

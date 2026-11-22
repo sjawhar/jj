@@ -96,7 +96,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the conflicts that every virtual merge base there stands for in their
   place, and a rebase takes the merges of the old and the new parents there as
   their terms, not as the text they resolve to. Such a merge fails, naming the
-  path, where the virtual merge bases stand for more than 10,000.
+  path and the bound, where it would replace more than 10,000 virtual merge
+  bases at one path, or more than 10,000 in all and 100 for each path where it
+  replaces one.
   Merge bases, and the parents of a merge of three or more commits, are
   merged in the order of their commit ids. This affects criss-cross histories,
   and merges whose base is itself conflicted.

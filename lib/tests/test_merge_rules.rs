@@ -2572,9 +2572,10 @@ fn base_chain_rebase(
     Ok((case, result, start.elapsed()))
 }
 
-/// Two chains of 13 levels at two paths, 8,191 replacements each: one alone
-/// is rewritten, but the bound counts the replacements of the whole merge, so
-/// the two together fail at the second path.
+/// Two chains of 13 levels at two paths, 8,191 replacements each, under the
+/// bound at one path: one alone is rewritten, but together they pass the
+/// bound of the merge, 10,000 and 100 for each of its 2 paths, so the rebase
+/// fails at the second path, naming that bound.
 #[test]
 fn planted_chains_at_two_paths_are_refused_together() -> TestResult {
     let (_case, alone, _) = base_chain_rebase(&[("f", 13)])?;
@@ -2585,14 +2586,15 @@ fn planted_chains_at_two_paths_are_refused_together() -> TestResult {
     };
     assert_eq!(
         err.to_string(),
-        "The merge at g names more than 10000 virtual bases"
+        "The merge at g names more than 10200 virtual bases in all, the bound of a merge that \
+         replaces them at 2 paths"
     );
     Ok(())
 }
 
 /// CH2 twenty deep: a full replacement would replace 2^20 - 1 files, more than
-/// one merge replaces, so the rebase fails at once, naming the path
-/// and the bound.
+/// a merge replaces at one path, so the rebase fails at once, naming the path
+/// and that bound.
 #[test]
 fn planted_chain_named_as_bases_is_refused() -> TestResult {
     let (_case, result, elapsed) = base_chain_rebase(&[("f", 20)])?;
@@ -2601,7 +2603,7 @@ fn planted_chain_named_as_bases_is_refused() -> TestResult {
     };
     assert_eq!(
         err.to_string(),
-        "The merge at f names more than 10000 virtual bases"
+        "The merge at f names more than 10000 virtual bases at that path, the bound at one path"
     );
     assert!(
         elapsed < Duration::from_secs(5),
@@ -2619,6 +2621,42 @@ fn planted_chain_named_as_bases_four_deep_is_replaced() -> TestResult {
     let [b, c, leaf] = ["b", "c", "leaf"].map(|value| case.text(value));
     let value = value_at(&rebased.tree(), "f")?;
     assert_same_value(&case, &value, &conflict(&[&c, &b, &leaf]));
+    Ok(())
+}
+
+/// WIDE: K4's history over 10,001 files, d resolving every file to `y`,
+/// rebased onto P1. The merge replaces one VB at each of 10,001 paths, more
+/// than 10,000 in all, but each path adds 100 to the bound of the merge, so
+/// the rebase completes, with K4's conflict `[x, -o, y]` at every path.
+#[test]
+fn wide_merge_replaces_one_virtual_base_at_each_path() -> TestResult {
+    const NUM_PATHS: usize = 10_001;
+    let mut case = Case::new();
+    let paths = (0..NUM_PATHS)
+        .map(|index| repo_path_buf(format!("f{index}")))
+        .collect_vec();
+    let values = |case: &Case, text: &str| {
+        paths
+            .iter()
+            .map(|path| {
+                let file = case.file(path, text.as_bytes(), false, CopyId::placeholder());
+                (path.clone(), resolved(file.as_ref()))
+            })
+            .collect_vec()
+    };
+    let root = case.root();
+    let o = case.commit_with_values(&[&root], values(&case, "o\n"))?;
+    let a = case.commit_with_values(&[&o], values(&case, "x\n"))?;
+    let b = case.commit_with_values(&[&o], values(&case, "y\n"))?;
+    let p1 = case.commit_with_values(&[&a, &b], values(&case, "x\n"))?;
+    let p2 = case.commit_with_values(&[&a, &b], values(&case, "y\n"))?;
+    let d = case.commit_with_values(&[&p1, &p2], values(&case, "y\n"))?;
+    let rebased = rebase_commit(case.tx.repo_mut(), d, vec![p1.id().clone()]).block_on()?;
+    let [o, x, y] = ["o", "x", "y"].map(|value| case.text(value));
+    for path in ["f0", "f10000"] {
+        let value = value_at(&rebased.tree(), path)?;
+        assert_same_value(&case, &value, &conflict(&[&x, &o, &y]));
+    }
     Ok(())
 }
 
