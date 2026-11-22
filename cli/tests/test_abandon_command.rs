@@ -16,10 +16,10 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit;
 use crate::common::create_commit_with_files;
 use crate::common::create_criss_cross_commits;
-use crate::common::create_criss_cross_commits_with;
 
 #[test]
 fn test_basics() {
@@ -559,18 +559,7 @@ fn test_abandon_parent_of_a_merge_with_an_edit_in_the_disputed_hunk_conflicts() 
     // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
     // where "a" and "b" disagree. Abandoning "p2" gives "d" a conflict of its
     // own and "a"'s changes from "o", as before virtual merge bases.
-    create_criss_cross_commits_with(
-        &work_dir,
-        "1\n2\n3\n4\n5\n6\n",
-        "a\n2\n3\n4\n5\n6\n",
-        "b1\nb2\nb3\n4\n5\n6\n",
-    );
-    create_commit_with_files(
-        &work_dir,
-        "d",
-        &["p1", "p2"],
-        &[("f", "b1\nB2\nb3\n4\n5\n6\n")],
-    );
+    create_b2_merge(&work_dir);
     work_dir.run_jj(["abandon", "p2"]).success();
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
     f    2-sided conflict

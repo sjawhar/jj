@@ -93,6 +93,25 @@ pub fn create_criss_cross_commits_with(work_dir: &TestWorkDir, o: &str, a: &str,
     create_commit_with_files(work_dir, "p2", &["a", "b"], &[("f", b)]);
 }
 
+/// The six lines of "f" in the histories whose merge bases change some of
+/// them.
+pub const SIX_LINES: &str = "1\n2\n3\n4\n5\n6\n";
+/// "a"'s text in the block history: line 1 of `SIX_LINES` changed to "a".
+pub const A_LINES: &str = "a\n2\n3\n4\n5\n6\n";
+/// "b"'s text in the block history: lines 1 to 3 of `SIX_LINES` changed.
+pub const B_LINES: &str = "b1\nb2\nb3\n4\n5\n6\n";
+/// `B_LINES` with "b2" changed to "B2".
+pub const B2_LINES: &str = "b1\nB2\nb3\n4\n5\n6\n";
+
+/// Makes the block history: a criss-cross history in which "a" changes line 1
+/// of "f" and "b" lines 1 to 3, and "d", a merge of "p1" and "p2" that
+/// resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk where
+/// "a" and "b" disagree.
+pub fn create_b2_merge(work_dir: &TestWorkDir) {
+    create_criss_cross_commits_with(work_dir, SIX_LINES, A_LINES, B_LINES);
+    create_commit_with_files(work_dir, "d", &["p1", "p2"], &[("f", B2_LINES)]);
+}
+
 /// Asserts that no file of `revision`, resolved or conflicted, shows a marker
 /// line of a virtual merge base, whole or cut: where a merge leaves a virtual
 /// merge base as a side, it merges the terms of the conflict it stands for

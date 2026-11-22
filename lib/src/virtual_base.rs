@@ -21,21 +21,24 @@
 //! terms, with V's sides between marker lines where they do not merge, as git
 //! builds a virtual merge base. Otherwise it is M: one block whose sides each
 //! name a term of V. VB and M are only ever bases of conflicts: where a merge
-//! leaves one as a side, [`MergedTree::merge`] replaces it with the terms of V
-//! that it names.
+//! leaves one as a side, [`MergedTree::merge`] replaces every one at that path
+//! with the terms of V that it names.
 //!
 //! A block is an opening marker line, `<<<<<<< jj virtual merge base <hex>
 //! <salt> <term>...`, its sides, a line `======= <hex>` between two sides, and
 //! a closing marker line `>>>>>>> <hex>`. The terms name V's terms after
-//! `simplify()`, adds and removes alternating, and every block names the same
-//! ones. `<hex>` is 32 hex digits of a hash over a fixed tag, the block's
-//! ordinal among the file's blocks, the terms, the text between the previous
-//! block (or the start of the file) and this one, the block's sides, the text
-//! after the block if it is the last one, and the salt. So the hashes cover
-//! every byte of the file: a file that anyone changed is no longer VB or M. The
-//! writer takes the lowest salt at which no marker line is a line of either
-//! side of the merge, and the reader hashes each block once, with the salt
-//! that the block carries.
+//! `simplify()`, adds and removes alternating, each with the label of the
+//! commit it comes from, and every block names the same ones. `<hex>` is 32
+//! hex digits of a hash over a fixed tag, the block's ordinal among the file's
+//! blocks, the terms, the text between the previous block (or the start of the
+//! file) and this one, the block's sides, the text after the block if it is
+//! the last one, and the salt. So the hashes cover every byte of the file: a
+//! file that anyone changed is no longer VB or M. The writer takes the lowest
+//! salt at which no marker line is a line of either side of the merge, and the
+//! reader hashes each block once, with the salt that the block carries. As
+//! anyone can write a file whose hashes check out, a file counts as VB or M
+//! only where the terms it names are in the store and none of its sides is VB
+//! or M, as for every VB and M that a merge writes.
 //!
 //! [`MergedTree::merge`]: crate::merged_tree::MergedTree::merge
 
@@ -65,6 +68,7 @@ use crate::backend::MergedTreeValueExt as _;
 use crate::backend::SymlinkId;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
+use crate::conflict_labels::ConflictLabels;
 use crate::diff::ContentDiff;
 use crate::diff::DiffHunkKind;
 use crate::diff::DiffHunkRange;
@@ -88,8 +92,8 @@ const SEPARATOR: &str = "======= ";
 const CLOSE: &str = ">>>>>>> ";
 
 /// Writes to the store the virtual base against which two parents that both
-/// changed `base`, V, an unresolved merge at `path`, are merged, and returns it
-/// as a file value.
+/// changed `base`, V, an unresolved merge at `path` whose terms have the labels
+/// `labels`, are merged, and returns it as a file value.
 ///
 /// Where `base` is a conflict of text files (each add a regular file whose
 /// first 8,000 bytes hold no NUL byte, each remove such a file or absent, read
@@ -97,20 +101,23 @@ const CLOSE: &str = ">>>>>>> ";
 /// hunk that merges keeps its merged text, and each hunk that does not is a
 /// block that holds `base`'s sides at that hunk, in `base`'s order. Otherwise
 /// the file is M, one block whose sides each name a term of `base`, in
-/// `base`'s order. Every block names `base`'s terms, and its marker lines are
-/// at the lowest salt at which no line of any term of either parent equals one
-/// of them (see the module's documentation). The file is executable where the
-/// executable bits of `base` merge to `true`, and keeps the copy id of `base`
-/// where its copy ids merge, else the placeholder. The result does not depend
-/// on the order of the parents.
+/// `base`'s order. Every block names `base`'s terms, each with its label, so
+/// that a merge that replaces the file with those terms labels each with the
+/// commit it comes from, and its marker lines are at the lowest salt at which
+/// no line of any term of either parent equals one of them (see the module's
+/// documentation). The file is executable where the executable bits of `base`
+/// merge to `true`, and keeps the copy id of `base` where its copy ids merge,
+/// else the placeholder. The result does not depend on the order of the
+/// parents.
 pub async fn virtual_merge_base(
     store: &Store,
     path: &RepoPath,
     base: &MergedTreeValue,
+    labels: &ConflictLabels,
     parent1: &MergedTreeValue,
     parent2: &MergedTreeValue,
 ) -> BackendResult<TreeValue> {
-    let base = base.simplify();
+    let (base, labels) = simplified_with_labels(base, labels);
     let base_contents = text_file_contents(store, path, &base);
     let contents1 = file_term_contents(store, path, parent1);
     let contents2 = file_term_contents(store, path, parent2);
@@ -121,7 +128,22 @@ pub async fn virtual_merge_base(
             .chain(contents2.iter())
             .map(|content| content.as_slice()),
     );
-    write_virtual_base(store, path, &base, base_contents, &parent_lines).await
+    let id = write_virtual_base(store, path, &base, &labels, base_contents, &parent_lines).await?;
+    // The executable bit and the copy id depend on `base` alone, not on the
+    // order of the parents.
+    let executable = base
+        .to_executable_merge()
+        .and_then(|bits| bits.resolve_trivial(SameChange::Accept).copied().flatten())
+        .unwrap_or(false);
+    let copy_id = base
+        .to_copy_id_merge()
+        .and_then(|ids| ids.resolve_trivial(SameChange::Accept).cloned().flatten())
+        .unwrap_or_else(CopyId::placeholder);
+    Ok(TreeValue::File {
+        id,
+        executable,
+        copy_id,
+    })
 }
 
 /// The terms of V that `content` names, if `content` is VB or M as
@@ -130,6 +152,12 @@ pub async fn virtual_merge_base(
 /// the writer hashes it, with the salt that the block carries. Text that no
 /// merge wrote is neither VB nor M, nor is VB or M with any byte changed.
 pub fn virtual_base_terms(content: &[u8]) -> Option<MergedTreeValue> {
+    named_terms(content).map(|(terms, _)| terms)
+}
+
+/// The terms of V that `content` names, with their labels, if `content` is
+/// VB or M (see [`virtual_base_terms`]).
+fn named_terms(content: &[u8]) -> Option<(MergedTreeValue, Merge<String>)> {
     let blocks = blocks(content)?;
     let [first, ..] = &blocks[..] else {
         return None;
@@ -138,11 +166,13 @@ pub fn virtual_base_terms(content: &[u8]) -> Option<MergedTreeValue> {
     if blocks.iter().any(|block| block.terms != names) {
         return None;
     }
-    let terms = str::from_utf8(names)
+    let (terms, labels): (Vec<_>, Vec<_>) = str::from_utf8(names)
         .ok()?
         .split(' ')
         .map(parse_term_name)
-        .collect::<Option<Vec<_>>>()?;
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
     if terms.len().is_multiple_of(2) {
         return None;
     }
@@ -161,23 +191,25 @@ pub fn virtual_base_terms(content: &[u8]) -> Option<MergedTreeValue> {
         }
         text_start = block.end;
     }
-    Some(Merge::from_vec(terms))
+    Some((Merge::from_vec(terms), Merge::from_vec(labels)))
 }
 
-/// The terms of V that `value` stands for, if `value` is VB or M: a file whose
-/// content names them (see [`virtual_base_terms`]), each of which the store
-/// holds.
+/// The terms of V that `value` stands for, with their labels, if `value` is
+/// VB or M: a file whose content names them (see [`virtual_base_terms`]),
+/// and that [`holds_terms`] accepts. Otherwise `value` is a plain file.
 pub(crate) async fn stored_virtual_base_terms(
     store: &Store,
     path: &RepoPath,
     value: &TreeValue,
-) -> BackendResult<Option<MergedTreeValue>> {
+) -> BackendResult<Option<(MergedTreeValue, Merge<String>)>> {
     let TreeValue::File { id, .. } = value else {
         return Ok(None);
     };
     let content = read_file(store, path, id).await?;
-    match virtual_base_terms(&content) {
-        Some(terms) if holds_terms(store, path, &terms).await? => Ok(Some(terms)),
+    match named_terms(&content) {
+        Some((terms, labels)) if holds_terms(store, path, &terms).await? => {
+            Ok(Some((terms, labels)))
+        }
         _ => Ok(None),
     }
 }
@@ -194,12 +226,16 @@ pub(crate) async fn stored_virtual_base_terms(
 /// lines are; VB keeps every other line, its marker lines included. An
 /// insertion next to VB lines that the materialized hunk does not hold goes
 /// outside the block they belong to, and so does a hunk that resolves where
-/// none was. A change to VB's own lines in a hunk that conflicts is taken as
-/// it is. The changes are then made to V's terms by region (see
-/// [`edited_terms`]), and the file is the VB or M of the edited terms, or
-/// their text where they resolve. Where the new hunks do not match the old
-/// ones, or no change can be made, the base stays `old_id`: a snapshot never
-/// writes a plain file that holds VB's marker lines.
+/// none was. In a hunk that conflicts, a change to VB's lines is taken as it
+/// is where a side of the conflict holds each line it changes; a change to
+/// lines that only VB holds, which jj shows only in the conflict's base, is
+/// not made. The changes are then made to V's terms by region (see
+/// [`edited_terms`]); for M, an insertion before or after its block goes into
+/// each term of text, an absent one read as empty, and a term that is not text
+/// is left as it is (see [`edited_m_terms`]). The file is the VB or M of the
+/// edited terms, or their text where they resolve. Where the new hunks do not
+/// match the old ones, or no change can be made, the base stays `old_id`: a
+/// snapshot never writes a plain file that holds VB's or M's marker lines.
 pub(crate) async fn rewrite_virtual_base(
     store: &Store,
     path: &RepoPath,
@@ -210,7 +246,7 @@ pub(crate) async fn rewrite_virtual_base(
     contents: impl IntoIterator<Item = &[u8]>,
 ) -> BackendResult<Option<FileId>> {
     let old = old_contents.as_slice()[index].as_slice();
-    let Some(terms) = virtual_base_terms(old) else {
+    let Some((terms, labels)) = named_terms(old) else {
         return Ok(None);
     };
     if !holds_terms(store, path, &terms).await? {
@@ -223,16 +259,11 @@ pub(crate) async fn rewrite_virtual_base(
     let new_contents = match text_file_contents(store, path, &terms).await? {
         Some(term_contents) => edited_terms(old, &term_contents, &edits, same_change)
             .map(|new_contents| (term_contents, new_contents)),
-        None if terms
-            .iter()
-            .flatten()
-            .all(|term| matches!(term, TreeValue::File { .. })) =>
-        {
+        None => {
             let term_contents = file_term_contents(store, path, &terms).await?;
-            let new_contents = edited_m_terms(old, &term_contents, &edits);
+            let new_contents = edited_m_terms(old, &terms, &term_contents, &edits);
             Some((term_contents, new_contents))
         }
-        None => None,
     };
     let Some((term_contents, new_contents)) = new_contents else {
         return Ok(Some(old_id.clone()));
@@ -259,7 +290,10 @@ pub(crate) async fn rewrite_virtual_base(
             copy_id,
         }));
     }
-    let base = Merge::from_vec(new_terms).simplify();
+    let (base, labels) = simplified_with_labels(
+        &Merge::from_vec(new_terms),
+        &ConflictLabels::from_merge(labels),
+    );
     if base == terms {
         return Ok(Some(old_id.clone()));
     }
@@ -269,12 +303,14 @@ pub(crate) async fn rewrite_virtual_base(
             _ => Some(old_id.clone()),
         });
     }
+    // The base is the VB of the edited terms where they are a conflict of text
+    // files, M otherwise, whatever the old base was: where an edit makes every
+    // term of M's V text (an absent term written as the person's text), it is
+    // the VB of the edited terms.
     let base_contents = text_file_contents(store, path, &base).await?;
     let parent_lines = marker_like_lines(contents);
-    match write_virtual_base(store, path, &base, base_contents, &parent_lines).await? {
-        TreeValue::File { id, .. } => Ok(Some(id)),
-        _ => unreachable!("a virtual base is a file"),
-    }
+    let id = write_virtual_base(store, path, &base, &labels, base_contents, &parent_lines).await?;
+    Ok(Some(id))
 }
 
 /// A change to a text: the range it replaces, and the text that takes its
@@ -311,11 +347,21 @@ fn output_edits(
             if new_hunk.as_slice().len() != old_contents.as_slice().len() {
                 return None;
             }
-            let changes = line_changes(&vb[region.clone()], &new_hunk.as_slice()[index]);
-            edits.extend(changes.into_iter().map(|(range, text)| Edit {
-                range: region.start + range.start..region.start + range.end,
-                text,
-            }));
+            // A change to lines that only VB holds, its marker lines and lines
+            // of a block's side that no side of the conflict holds, which jj
+            // shows only in the conflict's base, is not made: VB keeps them.
+            let old_text = &vb[region.clone()];
+            let held = held_lines(old_contents, &hunk, index);
+            let changes = line_changes(old_text, &new_hunk.as_slice()[index]);
+            edits.extend(
+                changes
+                    .into_iter()
+                    .filter(|(range, _)| all_held(old_text, &held, range))
+                    .map(|(range, text)| Edit {
+                        range: region.start + range.start..region.start + range.end,
+                        text,
+                    }),
+            );
         } else {
             let empty = BString::default();
             let new_text = match new_hunks.next_if(|hunk| hunk.is_resolved()) {
@@ -755,10 +801,17 @@ fn term_offset(segments: &[Segment<'_>], point: usize, term: usize) -> usize {
         .map_or(0, |segment| segment.hunk.ranges[term].end)
 }
 
-/// The texts of V's terms, `contents`, with `edits`, changes to M, `m`, made:
-/// an insertion before or after M's block goes into each term at its start or
-/// its end; no other change is made, as M holds none of V's text.
-fn edited_m_terms(m: &[u8], contents: &Merge<BString>, edits: &[Edit]) -> Vec<Vec<u8>> {
+/// The texts of V's terms, `terms` with the contents `contents`, with
+/// `edits`, changes to M, `m`, made: an insertion before or after M's block
+/// goes into each term of text, at its start or its end, an absent term read
+/// as empty; a term that is not text is left as it is, and no other change is
+/// made, as M holds none of V's text.
+fn edited_m_terms(
+    m: &[u8],
+    terms: &MergedTreeValue,
+    contents: &Merge<BString>,
+    edits: &[Edit],
+) -> Vec<Vec<u8>> {
     let (mut before, mut after) = (vec![], vec![]);
     for edit in edits {
         if !edit.range.is_empty() || holds_marker_line(&edit.text) {
@@ -770,48 +823,96 @@ fn edited_m_terms(m: &[u8], contents: &Merge<BString>, edits: &[Edit]) -> Vec<Ve
             after.extend_from_slice(&edit.text);
         }
     }
-    contents
-        .iter()
-        .map(|content| [before.as_slice(), content.as_slice(), after.as_slice()].concat())
+    zip(terms.iter(), contents.iter())
+        .map(|(term, content)| {
+            let is_text = match term {
+                None => true,
+                Some(TreeValue::File { .. }) => !is_binary_content(content),
+                Some(_) => false,
+            };
+            if is_text {
+                [before.as_slice(), content.as_slice(), after.as_slice()].concat()
+            } else {
+                content.as_slice().to_vec()
+            }
+        })
         .collect()
 }
 
-/// Writes to the store the VB or M of `base`, V after `simplify()`, whose
-/// contents are `base_contents` if it is a conflict of text files, with marker
-/// lines that are none of `parent_lines`.
+/// The ranges of the text of the term at `index` of `contents`, in `hunk`,
+/// whose lines a side of `contents` holds there too, by a line diff of each.
+fn held_lines(contents: &Merge<BString>, hunk: &LineHunk, index: usize) -> Vec<Range<usize>> {
+    let text = &contents.as_slice()[index].as_slice()[hunk.ranges[index].clone()];
+    zip(contents.as_slice(), &hunk.ranges)
+        .step_by(2)
+        .flat_map(|(content, range)| {
+            ContentDiff::by_line([text, &content.as_slice()[range.clone()]])
+                .hunk_ranges()
+                .filter(|diff_hunk| matches!(diff_hunk.kind, DiffHunkKind::Matching))
+                .map(|diff_hunk| diff_hunk.ranges[0].clone())
+                .collect_vec()
+        })
+        .collect()
+}
+
+/// Whether each line of `range` of `text` is in one of `held`.
+fn all_held(text: &[u8], held: &[Range<usize>], range: &Range<usize>) -> bool {
+    let mut start = range.start;
+    text[range.clone()].lines_with_terminator().all(|line| {
+        let end = start + line.len();
+        let is_held = held
+            .iter()
+            .any(|held| held.start <= start && end <= held.end);
+        start = end;
+        is_held
+    })
+}
+
+/// Writes to the store the VB or M of `base`, V after `simplify()`, each of
+/// whose terms has the label of `labels` at its place, whose contents are
+/// `base_contents` if it is a conflict of text files, with marker lines that
+/// are none of `parent_lines`.
 async fn write_virtual_base(
     store: &Store,
     path: &RepoPath,
     base: &MergedTreeValue,
+    labels: &Merge<String>,
     base_contents: Option<Merge<BString>>,
     parent_lines: &HashSet<&[u8]>,
-) -> BackendResult<TreeValue> {
+) -> BackendResult<FileId> {
+    let names = zip(base.iter(), labels.iter())
+        .map(|(term, label)| term_name(term.as_ref(), label))
+        .collect_vec();
     let hunks = match base_contents {
         Some(base_contents) => text_hunks(&base_contents, store),
         None => {
-            let names = base
-                .iter()
-                .map(|term| term_name(term.as_ref()).into_bytes());
-            vec![VirtualBaseHunk::Block(names.collect())]
+            let sides = names.iter().map(|name| format!("{name}\n").into_bytes());
+            vec![VirtualBaseHunk::Block(sides.collect())]
         }
     };
-    let content = virtual_base_content(hunks, base, parent_lines);
-    let id = store.write_file(path, &mut content.as_slice()).await?;
-    // The executable bit and the copy id depend on `base` alone, not on the
-    // order of the parents.
-    let executable = base
-        .to_executable_merge()
-        .and_then(|bits| bits.resolve_trivial(SameChange::Accept).copied().flatten())
-        .unwrap_or(false);
-    let copy_id = base
-        .to_copy_id_merge()
-        .and_then(|ids| ids.resolve_trivial(SameChange::Accept).cloned().flatten())
-        .unwrap_or_else(CopyId::placeholder);
-    Ok(TreeValue::File {
-        id,
-        executable,
-        copy_id,
-    })
+    let content = virtual_base_content(hunks, &names.join(" "), parent_lines);
+    store.write_file(path, &mut content.as_slice()).await
+}
+
+/// The labels of the terms of `base`, V, from `labels`, after `simplify()`,
+/// with `base` simplified too; an empty label for each term where `labels`
+/// has none.
+fn simplified_with_labels(
+    base: &MergedTreeValue,
+    labels: &ConflictLabels,
+) -> (MergedTreeValue, Merge<String>) {
+    let labels = if labels.num_sides() == Some(base.num_sides()) {
+        labels.clone()
+    } else {
+        ConflictLabels::unlabeled()
+    };
+    let (labels, base) = labels.simplify_with(base);
+    let labels = if labels.has_labels() {
+        labels.into_merge()
+    } else {
+        Merge::repeated(String::new(), base.num_sides())
+    };
+    (base, labels)
 }
 
 /// The lines of `contents` that start like a marker line: only those can
@@ -851,16 +952,15 @@ fn text_hunks(contents: &Merge<BString>, store: &Store) -> Vec<VirtualBaseHunk> 
     }
 }
 
-/// The content of VB or M of `terms`, V's terms, made of `hunks`: the text of
-/// each resolved hunk, and each block's sides, each ending with a newline
-/// unless it is empty, between marker lines at the lowest salt at which none
-/// is one of `parent_lines`.
+/// The content of VB or M whose opening lines name V's terms as `names`,
+/// made of `hunks`: the text of each resolved hunk, and each block's sides,
+/// each ending with a newline unless it is empty, between marker lines at the
+/// lowest salt at which none is one of `parent_lines`.
 fn virtual_base_content(
     hunks: Vec<VirtualBaseHunk>,
-    terms: &MergedTreeValue,
+    names: &str,
     parent_lines: &HashSet<&[u8]>,
 ) -> Vec<u8> {
-    let names = terms.iter().map(|term| term_name(term.as_ref())).join(" ");
     // Each block with the text before it, and the text after the last block.
     let mut blocks: Vec<(Vec<u8>, Vec<Vec<u8>>)> = vec![];
     let mut text = vec![];
@@ -897,7 +997,7 @@ fn virtual_base_content(
         .map(|salt| {
             hashers
                 .iter()
-                .map(|hasher| marker_lines(&salted_hex(hasher, salt), salt, &names))
+                .map(|hasher| marker_lines(&salted_hex(hasher, salt), salt, names))
                 .collect_vec()
         })
         .find(|markers| {
@@ -982,12 +1082,14 @@ fn salted_hex(hasher: &Blake2b512, salt: u64) -> String {
     hex_util::encode_hex(&hasher.finalize()[..16])
 }
 
-/// The name of a term of V in an opening marker line and in a side of M:
-/// `absent`; `file:<id>`, then `:x` if the file is executable and
+/// The name of a term of V, with its label, in an opening marker line and in a
+/// side of M: `absent`; `file:<id>`, then `:x` if the file is executable and
 /// `:copy-<id>` if its copy id is not the placeholder; `symlink:<id>`;
-/// `tree:<id>`; or `submodule:<id>`.
-fn term_name(term: Option<&TreeValue>) -> String {
-    match term {
+/// `tree:<id>`; or `submodule:<id>`; then, unless `label` is empty, `@` and
+/// the label with each byte other than an ASCII letter, a digit, `-`, `.`,
+/// `_`, `~` or `/` written as `%` and two hex digits.
+fn term_name(term: Option<&TreeValue>, label: &str) -> String {
+    let mut name = match term {
         None => "absent".to_owned(),
         Some(TreeValue::File {
             id,
@@ -1006,15 +1108,31 @@ fn term_name(term: Option<&TreeValue>) -> String {
         Some(TreeValue::Symlink(id)) => format!("symlink:{}", id.hex()),
         Some(TreeValue::Tree(id)) => format!("tree:{}", id.hex()),
         Some(TreeValue::GitSubmodule(id)) => format!("submodule:{}", id.hex()),
+    };
+    if !label.is_empty() {
+        name.push('@');
+        for byte in label.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+                name.push(char::from(byte));
+            } else {
+                write!(name, "%{byte:02X}").unwrap();
+            }
+        }
     }
+    name
 }
 
-/// The term that `name` names, if [`term_name`] gives `name` for it.
-fn parse_term_name(name: &str) -> Option<Option<TreeValue>> {
-    let term = if name == "absent" {
+/// The term that `name` names, and its label, if [`term_name`] gives `name`
+/// for them.
+fn parse_term_name(name: &str) -> Option<(Option<TreeValue>, String)> {
+    let (term_part, label) = match name.split_once('@') {
+        Some((term_part, encoded)) => (term_part, decode_label(encoded)?),
+        None => (name, String::new()),
+    };
+    let term = if term_part == "absent" {
         None
     } else {
-        let mut parts = name.split(':');
+        let mut parts = term_part.split(':');
         let kind = parts.next()?;
         let hex = parts.next()?;
         Some(match kind {
@@ -1041,8 +1159,25 @@ fn parse_term_name(name: &str) -> Option<Option<TreeValue>> {
             _ => return None,
         })
     };
-    // Each term has one name, so that the hashes cover the terms themselves.
-    (term_name(term.as_ref()) == name).then_some(term)
+    // Each term and label has one name, so that the hashes cover them.
+    (term_name(term.as_ref(), &label) == name).then_some((term, label))
+}
+
+/// The label that `encoded` writes as [`term_name`] writes one.
+fn decode_label(encoded: &str) -> Option<String> {
+    let mut bytes = vec![];
+    let mut rest = encoded.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = tail.get(..2)?;
+            bytes.push(u8::from_str_radix(str::from_utf8(hex).ok()?, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// A block of VB or M: the offsets of its opening line and of the end of its
@@ -1135,9 +1270,11 @@ fn is_hex(hex: &[u8]) -> bool {
 
 /// Whether `terms`, the terms of V that a VB or M names, can be V's: the store
 /// holds each of them, and no side of V is itself VB or M, which no merge
-/// writes as a side. A submodule's commit is not an object of the store, so it
-/// counts as held. A chain of files that each name the one before as a side
-/// is thus refused at its first link, so that expanding it takes one step.
+/// writes as a side. V's bases can be VB or M, once or more. A submodule's
+/// commit is not an object of the store, so it counts as held. A planted chain
+/// of files that each name the one before as a side is thus refused at its
+/// first link; one that names the one before as bases is bounded where a merge
+/// replaces the files (see `MergedTree::merge`).
 async fn holds_terms(
     store: &Store,
     path: &RepoPath,

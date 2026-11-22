@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::A_LINES;
+use crate::common::B_LINES;
+use crate::common::B2_LINES;
 use crate::common::CommandOutput;
+use crate::common::SIX_LINES;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit;
 use crate::common::create_commit_with_files;
 use crate::common::create_criss_cross_commits;
@@ -3103,7 +3108,7 @@ fn test_rebase_merge_onto_one_parent_conflicts() {
     // for, takes the virtual merge base's label.
     insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @r#"
     <<<<<<< conflict 1 of 1
-    %%%%%%% diff from: zsuskuln 1eaf5eb0 "a"
+    %%%%%%% diff from: rlvkpnrz 00d5a0ff "o"
     \\\\\\\        to: vruxwmqv 6e354dd6 "p1" (rebase destination)
     -o
     +x
@@ -3201,8 +3206,7 @@ fn test_rebase_merge_with_an_edit_in_the_disputed_hunk_onto_one_parent_conflicts
     // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
     // where "a" and "b" disagree. Rebasing "d" onto "p1" gives a conflict of
     // "d"'s and "a"'s changes from "o", as before virtual merge bases.
-    create_criss_cross_commits_with(&work_dir, SIX_LINES, "a\n2\n3\n4\n5\n6\n", B_LINES);
-    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", B2_LINES)]);
+    create_b2_merge(&work_dir);
     work_dir.run_jj(["rebase", "-r", "d", "-d", "p1"]).success();
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
     f    2-sided conflict
@@ -3219,9 +3223,9 @@ fn test_rebase_sibling_with_an_edit_in_the_disputed_hunk_conflicts() {
 
     // "z" merges "p1" and "p2" and keeps their conflict; "c" resolves it to
     // "a"'s text and "q" to "b"'s text with "b2" changed to "B2".
-    create_criss_cross_commits_with(&work_dir, SIX_LINES, "a\n2\n3\n4\n5\n6\n", B_LINES);
+    create_criss_cross_commits_with(&work_dir, SIX_LINES, A_LINES, B_LINES);
     create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
-    create_commit_with_files(&work_dir, "c", &["z"], &[("f", "a\n2\n3\n4\n5\n6\n")]);
+    create_commit_with_files(&work_dir, "c", &["z"], &[("f", A_LINES)]);
     create_commit_with_files(&work_dir, "q", &["z"], &[("f", B2_LINES)]);
     work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
@@ -3350,11 +3354,11 @@ fn test_rebase_keeps_an_edit_outside_a_conflict_whose_base_is_a_virtual_base() {
         "--config=ui.conflict-marker-style=snapshot",
     ]), @r#"
     <<<<<<< conflict 1 of 1
-    +++++++ lylxulpl 420b18f3 "s" (rebase destination)
+    +++++++ lylxulpl d4946a06 "s" (rebase destination)
     x
-    ------- zsuskuln 41579c34 "a"
+    ------- rlvkpnrz 43d2ae9c "o"
     1
-    +++++++ nkmrtpmo 44641e88 "u" (rebased revision)
+    +++++++ nkmrtpmo e426b116 "u" (rebased revision)
     y
     >>>>>>> conflict 1 of 1 ends
     2
@@ -3436,14 +3440,6 @@ fn test_rebase_after_an_edit_where_a_virtual_base_opens_in_a_resolved_hunk() {
     work_dir.run_jj(["rebase", "-r", "s", "-d", "p1"]).success();
     assert_no_virtual_merge_base_text(&work_dir, "s");
 }
-
-/// The six lines of "f" in the histories whose merge bases change some of
-/// them.
-const SIX_LINES: &str = "1\n2\n3\n4\n5\n6\n";
-/// "b"'s text where "b" changes lines 1 to 3 of `SIX_LINES`.
-const B_LINES: &str = "b1\nb2\nb3\n4\n5\n6\n";
-/// `B_LINES` with "b2" changed to "B2".
-const B2_LINES: &str = "b1\nB2\nb3\n4\n5\n6\n";
 
 /// Makes a commit named `name` with `parents` that deletes the file "f".
 fn create_commit_deleting_f(work_dir: &TestWorkDir, name: &str, parents: &[&str]) {

@@ -17,8 +17,10 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::iter;
+use std::iter::zip;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -36,6 +38,7 @@ use itertools::EitherOrBoth;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
 
+use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CopyId;
 use crate::backend::MergedTreeVal;
@@ -343,8 +346,8 @@ impl MergedTree {
     ///
     /// A virtual merge base ([`crate::virtual_base`]) is only ever a base of a
     /// conflict: where the merge leaves one as a side of a path, the merge
-    /// replaces it with the terms of the conflict that it stands for, one side
-    /// at a time.
+    /// replaces every one at that path, sides and bases alike, with the terms
+    /// of the conflict that it stands for.
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
         Self::merge_with_overrides(merge, &[], true).await
     }
@@ -398,15 +401,16 @@ impl MergedTree {
     /// A virtual merge base, VB or M ([`crate::virtual_base`]), is only ever a
     /// base of a conflict, but a tree at a base of `merge` brings the bases of
     /// its conflicts into the merge as sides. At each path outside `overrides`
-    /// where such a tree has a conflict, the merge's terms are simplified, and
-    /// a side that is such a base and is VB or M is replaced with the terms of
-    /// V that it names. The terms are simplified again after each replacement,
-    /// until no side is VB or M; a VB or M among V's bases stays a base. Where
-    /// two sides are VB or M, the one that names the other goes first, and
-    /// otherwise the one with the lower file id, so that the result does not
-    /// depend on the order of `merge`. The decision reads the merge's terms
-    /// and the files that may be such sides, never merged text. The terms that
-    /// replace a side take its label.
+    /// where such a tree has a conflict, and where, once the merge's terms are
+    /// simplified, such a base is a side and is VB or M, every VB and M term
+    /// at that path, sides and bases alike, is replaced with the terms of V
+    /// that it names, inverted where it is a base, and so on for the VB and M
+    /// among those, until none is left. The terms then merge as the terms of
+    /// the merge bases' own conflicts would, whatever the order of `merge`. A
+    /// path where VB or M is only a base is merged as it is. The decision
+    /// reads the merge's terms and the files that may be VB or M, never merged
+    /// text. Each term that replaces a VB or M takes the label that it names
+    /// for that term, the label of the commit it comes from.
     pub(crate) async fn merge_with_overrides(
         merge: Merge<(Self, String)>,
         overrides: &[(RepoPathBuf, MergedTreeValue)],
@@ -471,186 +475,289 @@ fn inverted_bases(
     Ok(bases)
 }
 
-/// A remove of a merge and the add after it.
-type TermPair = (Option<TreeValue>, Option<TreeValue>);
+/// A term of a merge, with its label.
+type LabeledTerm = (Option<TreeValue>, String);
 
-/// The terms of a merge at a path once each side that is VB or M is replaced
+/// The terms of V that a VB or M names, with their labels.
+type NamedTerms = (MergedTreeValue, Merge<String>);
+
+/// The most VB and M terms that a merge replaces at one path. A VB names at
+/// most one VB or M for each level of merge bases below it, so a rewrite of a
+/// history of 8,000 levels of merge bases, such as a braid, replaces 8,000; a
+/// planted set of files that name one another can stand for more, and the
+/// merge then fails rather than spend time and memory on them.
+const MAX_REPLACEMENTS: usize = 10_000;
+
+/// The terms of a merge at a path once every VB and M among them is replaced
 /// with the terms of V that it names (see [`MergedTree::merge_with_overrides`]):
-/// the merge's own terms, each in its place, and the terms that each replaced
-/// side brings beyond the one that takes its place.
+/// the merge's own terms, each in its place, a replaced one absent, and the
+/// terms that the replaced ones bring, as pairs of a remove and an add with
+/// their labels, by the index of the merge's term that each came from.
 struct Expansion {
-    adds: Vec<Option<TreeValue>>,
-    removes: Vec<Option<TreeValue>>,
-    /// The terms that replaced sides bring, as pairs of a remove and an add,
-    /// by the index among `adds` of the side that each came from.
-    extra: BTreeMap<usize, Vec<TermPair>>,
+    terms: Vec<Option<TreeValue>>,
+    extra: BTreeMap<usize, Vec<[LabeledTerm; 2]>>,
+    /// Where each term that is present is, by whether it is an add and by its
+    /// value.
+    present: HashMap<(bool, TreeValue), Vec<Slot>>,
+}
+
+/// Where a term of an [`Expansion`] is: the merge's own term at an index, or
+/// the remove (0) or the add (1) of a pair among those that came from the
+/// merge's term at an index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Slot {
+    Own(usize),
+    Extra(usize, usize, usize),
+}
+
+impl Slot {
+    /// Whether the term is an add.
+    fn is_add(self) -> bool {
+        match self {
+            Self::Own(index) => index.is_multiple_of(2),
+            Self::Extra(_, _, side) => side == 1,
+        }
+    }
+
+    /// The index of the merge's own term that the term came from.
+    fn origin(self) -> usize {
+        match self {
+            Self::Own(index) | Self::Extra(index, _, _) => index,
+        }
+    }
 }
 
 impl Expansion {
-    /// `terms` with each side that is VB or M replaced, where `candidates` are
-    /// the files that may be such sides, or `None` if no side is.
+    /// `terms` with every VB and M replaced, sides and bases alike, nested
+    /// ones too, where a side that is one of `candidates` is VB or M once
+    /// `terms` are simplified; `None` where none is. Fails where the terms
+    /// stand for more than [`MAX_REPLACEMENTS`] VB and M.
     async fn new(
         store: &Store,
         path: &RepoPath,
         terms: MergedTreeValue,
-        mut candidates: HashSet<TreeValue>,
+        candidates: HashSet<TreeValue>,
     ) -> BackendResult<Option<Self>> {
-        let (removes, adds) = terms.into_removes_adds();
-        let mut expansion = Self {
-            adds: adds.collect(),
-            removes: removes.collect(),
-            extra: BTreeMap::new(),
-        };
-        // The terms of V that each candidate names, if it is VB or M.
-        let mut named: HashMap<TreeValue, Option<MergedTreeValue>> = HashMap::new();
-        loop {
-            let counts = expansion.counts();
-            let sides = candidates
-                .iter()
-                .filter(|&candidate| counts.get(&Some(candidate.clone())).is_some_and(|&n| n > 0))
-                .cloned()
-                .collect_vec();
-            for side in &sides {
-                if !named.contains_key(side) {
-                    let terms = virtual_base::stored_virtual_base_terms(store, path, side).await?;
-                    named.insert(side.clone(), terms);
-                }
-            }
-            let sides = sides
-                .iter()
-                .filter_map(|side| Some((side, named[side].as_ref()?)))
-                .collect_vec();
-            // A side that another side's V names goes after that side.
-            let next = sides
-                .iter()
-                .filter(|(side, _)| {
-                    !sides
-                        .iter()
-                        .any(|(_, terms)| terms.iter().any(|term| term.as_ref() == Some(*side)))
-                })
-                .min_by_key(|(side, _)| match side {
-                    TreeValue::File { id, .. } => id.clone(),
-                    _ => unreachable!("VB and M are files"),
-                });
-            let Some(&(side, terms)) = next else {
+        let mut named = HashMap::new();
+        let mut side_is_virtual_base = false;
+        for side in terms.simplify().adds().flatten() {
+            if candidates.contains(side)
+                && named_terms(store, path, &mut named, side).await?.is_some()
+            {
+                side_is_virtual_base = true;
                 break;
-            };
-            let (side, terms) = (side.clone(), terms.clone());
-            candidates.extend(terms.adds().flatten().cloned());
-            expansion.replace(&side, terms);
-        }
-        Ok((!expansion.extra.is_empty()).then_some(expansion))
-    }
-
-    /// How many more times each value is an add than a remove.
-    fn counts(&self) -> HashMap<Option<TreeValue>, isize> {
-        let pairs = self.extra.values().flatten();
-        let adds = self.adds.iter().chain(pairs.clone().map(|(_, add)| add));
-        let removes = self.removes.iter().chain(pairs.map(|(remove, _)| remove));
-        let mut counts: HashMap<Option<TreeValue>, isize> = HashMap::new();
-        for add in adds {
-            *counts.entry(add.clone()).or_default() += 1;
-        }
-        for remove in removes {
-            *counts.entry(remove.clone()).or_default() -= 1;
-        }
-        counts
-    }
-
-    /// Replaces an add that holds `side` with `terms`: their first add takes
-    /// the side's place, and the other terms go to `extra`. Each of their adds
-    /// that equals a remove of the merge cancels it first, both made absent,
-    /// so that where the two would cancel, the merge's own sides are left, and
-    /// keep their labels.
-    fn replace(&mut self, side: &TreeValue, terms: MergedTreeValue) {
-        let side = Some(side.clone());
-        let (removes, adds) = terms.into_removes_adds();
-        let mut adds = adds
-            .map(|add| {
-                if add.is_some() {
-                    let extra_removes = self
-                        .extra
-                        .values_mut()
-                        .flat_map(|pairs| pairs.iter_mut().map(|(remove, _)| remove));
-                    let mut merge_removes = self.removes.iter_mut().chain(extra_removes);
-                    if let Some(remove) = merge_removes.find(|remove| **remove == add) {
-                        *remove = None;
-                        return None;
-                    }
-                }
-                add
-            })
-            .collect_vec();
-        let in_place = adds.remove(0);
-        let pairs = iter::zip(removes, adds);
-        if let Some(index) = self.adds.iter().position(|add| *add == side) {
-            self.adds[index] = in_place;
-            self.extra.entry(index).or_default().extend(pairs);
-            return;
-        }
-        for extra in self.extra.values_mut() {
-            if let Some(index) = extra.iter().position(|(_, add)| *add == side) {
-                extra[index].1 = in_place;
-                extra.extend(pairs);
-                return;
             }
         }
-        unreachable!("a side is an add");
+        if !side_is_virtual_base {
+            return Ok(None);
+        }
+        let mut expansion = Self {
+            terms: vec![None; terms.as_slice().len()],
+            extra: BTreeMap::new(),
+            present: HashMap::new(),
+        };
+        let mut pending = VecDeque::new();
+        for (index, term) in terms.into_iter().enumerate() {
+            expansion.set(Slot::Own(index), term);
+            pending.push_back(Slot::Own(index));
+        }
+        let mut replacements = 0;
+        while let Some(slot) = pending.pop_front() {
+            let Some(value) = expansion.term(slot).cloned() else {
+                continue;
+            };
+            let Some((terms, labels)) = named_terms(store, path, &mut named, &value).await? else {
+                continue;
+            };
+            replacements += 1;
+            if replacements > MAX_REPLACEMENTS {
+                let path = path.as_internal_file_string();
+                let message =
+                    format!("The merge at {path} names more than {MAX_REPLACEMENTS} virtual bases");
+                return Err(BackendError::Other(message.into()));
+            }
+            pending.extend(expansion.replace(slot, terms, labels));
+        }
+        Ok(Some(expansion))
+    }
+
+    /// The term at `slot`.
+    fn term(&self, slot: Slot) -> Option<&TreeValue> {
+        match slot {
+            Slot::Own(index) => self.terms[index].as_ref(),
+            Slot::Extra(origin, pair, side) => self.extra[&origin][pair][side].0.as_ref(),
+        }
+    }
+
+    /// Sets the term at `slot` to `value`.
+    fn set(&mut self, slot: Slot, value: Option<TreeValue>) {
+        if let Some(old) = self.term(slot).cloned()
+            && let Some(slots) = self.present.get_mut(&(slot.is_add(), old))
+        {
+            slots.retain(|&other| other != slot);
+        }
+        if let Some(new) = &value {
+            let key = (slot.is_add(), new.clone());
+            self.present.entry(key).or_default().push(slot);
+        }
+        match slot {
+            Slot::Own(index) => self.terms[index] = value,
+            Slot::Extra(origin, pair, side) => {
+                self.extra.entry(origin).or_default()[pair][side].0 = value;
+            }
+        }
+    }
+
+    /// Replaces the VB or M at `slot` with `terms`, the terms of V that it
+    /// names, with their `labels`, and returns where the terms that it brings
+    /// are. The slot becomes absent, and `terms`, inverted where the slot is a
+    /// remove, go to pairs after the merge's own terms, with the slot's absent
+    /// term cancelling the absent term that starts them. Each of `terms` that
+    /// equals a term of the merge of the other sign cancels it first, both
+    /// made absent, so that where the two would cancel, the merge's own term
+    /// is left, with its label.
+    fn replace(&mut self, slot: Slot, terms: MergedTreeValue, labels: Merge<String>) -> Vec<Slot> {
+        self.set(slot, None);
+        // Each term as it enters the merge, and whether it is an add there.
+        let mut entering = zip(terms, labels)
+            .enumerate()
+            .map(|(index, labeled)| (labeled, index.is_multiple_of(2) == slot.is_add()))
+            .collect_vec();
+        for ((term, _), is_add) in &mut entering {
+            let Some(value) = term.clone() else {
+                continue;
+            };
+            let opposite = self
+                .present
+                .get(&(!*is_add, value))
+                .and_then(|slots| slots.first().copied());
+            if let Some(other) = opposite {
+                self.set(other, None);
+                *term = None;
+            }
+        }
+        let (adds, removes): (Vec<_>, Vec<_>) =
+            entering.into_iter().partition(|(_, is_add)| *is_add);
+        let adds = adds.into_iter().map(|(labeled, _)| labeled);
+        let removes = removes.into_iter().map(|(labeled, _)| labeled);
+        let absent = (None, String::new());
+        let pairs = if slot.is_add() {
+            zip(iter::once(absent).chain(removes), adds).collect_vec()
+        } else {
+            zip(removes, iter::once(absent).chain(adds)).collect_vec()
+        };
+        let origin = slot.origin();
+        let mut new_slots = vec![];
+        for ((remove, remove_label), (add, add_label)) in pairs {
+            let pairs = self.extra.entry(origin).or_default();
+            let pair = pairs.len();
+            pairs.push([(None, remove_label), (None, add_label)]);
+            for (side, value) in [(0, remove), (1, add)] {
+                if value.is_some() {
+                    let new_slot = Slot::Extra(origin, pair, side);
+                    self.set(new_slot, value);
+                    new_slots.push(new_slot);
+                }
+            }
+        }
+        new_slots
     }
 
     /// The terms, with `num_pairs` pairs after the merge's own terms for each
-    /// add that a replaced side held at any path.
+    /// of the merge's terms that a replaced term came from at any path.
     fn into_merge(mut self, num_pairs: &BTreeMap<usize, usize>) -> MergedTreeValue {
-        let merge = Merge::from_removes_adds(self.removes, self.adds);
+        let merge = Merge::from_vec(self.terms);
         append_pairs(merge, num_pairs, |origin, n| {
-            let mut pairs = self.extra.remove(&origin).unwrap_or_default();
+            let mut pairs = self
+                .extra
+                .remove(&origin)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|[(remove, _), (add, _)]| (remove, add))
+                .collect_vec();
             pairs.resize(n, (None, None));
             pairs
         })
     }
 }
 
+/// The terms that `value` names, with their labels, if it is VB or M, looked
+/// up once for each value in `named`.
+async fn named_terms(
+    store: &Store,
+    path: &RepoPath,
+    named: &mut HashMap<TreeValue, Option<NamedTerms>>,
+    value: &TreeValue,
+) -> BackendResult<Option<NamedTerms>> {
+    if !matches!(value, TreeValue::File { .. }) {
+        return Ok(None);
+    }
+    if let Some(found) = named.get(value) {
+        return Ok(found.clone());
+    }
+    let found = virtual_base::stored_virtual_base_terms(store, path, value).await?;
+    named.insert(value.clone(), found.clone());
+    Ok(found)
+}
+
 /// `tree`, an unsimplified merge, with `overrides` and `expansions` written
-/// over its terms, and simplified once, with its labels. The terms that a
-/// replaced side brings beyond the one that takes its place go after the
-/// merge's own terms, as many pairs for each add of the merge that a replaced
-/// side held as at the path where it brings the most, and take that add's
-/// label.
+/// over its terms, and simplified once, with its labels. The terms that
+/// replace VB and M go after the merge's own terms, as many pairs for each of
+/// the merge's terms that they came from as at the path where it brings the
+/// most. Each such term takes the label that the first path to put a term
+/// there gives it, or the label of the merge's term it came from.
 async fn write_expanded(
     tree: MergedTree,
     overrides: &[(RepoPathBuf, MergedTreeValue)],
     expansions: Vec<(RepoPathBuf, Expansion)>,
 ) -> BackendResult<MergedTree> {
-    let mut num_pairs: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut pair_labels: BTreeMap<usize, Vec<[Option<String>; 2]>> = BTreeMap::new();
     for (_, expansion) in &expansions {
         for (&origin, pairs) in &expansion.extra {
-            let num = num_pairs.entry(origin).or_default();
-            *num = (*num).max(pairs.len());
+            let labels = pair_labels.entry(origin).or_default();
+            if labels.len() < pairs.len() {
+                labels.resize(pairs.len(), [None, None]);
+            }
+            for (slots, pair) in zip(labels.iter_mut(), pairs) {
+                for (slot, (term, label)) in zip(slots.iter_mut(), pair) {
+                    if slot.is_none() && term.is_some() && !label.is_empty() {
+                        *slot = Some(label.clone());
+                    }
+                }
+            }
         }
     }
+    let num_pairs: BTreeMap<usize, usize> = pair_labels
+        .iter()
+        .map(|(&origin, labels)| (origin, labels.len()))
+        .collect();
     let MergedTree {
         store,
         tree_ids,
         labels,
     } = tree;
+    let own_labels = if labels.has_labels() {
+        labels.into_merge()
+    } else {
+        Merge::repeated(String::new(), tree_ids.num_sides())
+    };
     let empty_tree_id = store.empty_tree_id().clone();
     let tree_ids = append_pairs(tree_ids, &num_pairs, |_, n| {
         vec![(empty_tree_id.clone(), empty_tree_id.clone()); n]
     });
-    let labels = if labels.has_labels() {
-        let labels = labels.into_merge();
-        let origin_labels: HashMap<usize, String> = num_pairs
-            .keys()
-            .map(|&origin| (origin, labels.get_add(origin).cloned().unwrap_or_default()))
-            .collect();
-        ConflictLabels::from_merge(append_pairs(labels, &num_pairs, |origin, n| {
-            let label = &origin_labels[&origin];
-            vec![(label.clone(), label.clone()); n]
-        }))
-    } else {
-        ConflictLabels::unlabeled()
-    };
-    let mut builder = MergedTreeBuilder::new(MergedTree::new(store, tree_ids, labels));
+    let labels = append_pairs(own_labels.clone(), &num_pairs, |origin, n| {
+        let origin_label = own_labels.as_slice()[origin].clone();
+        let label = |label: Option<&String>| label.cloned().unwrap_or_else(|| origin_label.clone());
+        pair_labels[&origin][..n]
+            .iter()
+            .map(|[remove, add]| (label(remove.as_ref()), label(add.as_ref())))
+            .collect()
+    });
+    let mut builder = MergedTreeBuilder::new(MergedTree::new(
+        store,
+        tree_ids,
+        ConflictLabels::from_merge(labels),
+    ));
     for (path, value) in overrides {
         builder.set_or_remove(path.clone(), value.clone());
     }

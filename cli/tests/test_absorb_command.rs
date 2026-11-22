@@ -17,6 +17,8 @@ use testutils::TestResult;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
 
 #[test]
 fn test_absorb_simple() {
@@ -1122,6 +1124,33 @@ fn test_absorb_interactive() -> TestResult {
     [exit status: 1]
     ");
     Ok(())
+}
+
+#[test]
+fn test_absorb_into_a_merge_base_of_a_resolved_merge() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2", whose merge bases are "a" and "b", and resolves
+    // "f" to "y". A child of "d" changes it to "Y", and absorbing that change
+    // moves it into a merge base; "d", rebased, holds "Y", as before virtual
+    // merge bases.
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir.run_jj(["new", "d"]).success();
+    work_dir.write_file("f", "Y\n");
+    work_dir.run_jj(["absorb"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @"
+    Y
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
 }
 
 #[must_use]

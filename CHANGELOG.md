@@ -90,12 +90,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Git builds one where that conflict is between text files, or give a conflict
   where it is not (for example, with a deletion or a binary file among its
   sides). A virtual merge base names the conflict of the merge bases that it
-  stands for, and is only ever the base of a conflict: where a later merge,
-  such as a rebase, an abandon or a squash, would make it a side of a file's
-  conflict, the merge uses that conflict's terms in its place. Merge bases, and
-  the parents of a merge of three or more commits, are merged in the order of
-  their commit ids. This affects criss-cross histories, and merges whose base
-  is itself conflicted.
+  stands for, each term with the commit it comes from, and is only ever the
+  base of a conflict: where a later merge, such as a rebase, an abandon or a
+  squash, would make one a side of a file's conflict, the merge uses the terms
+  of the conflicts that every virtual merge base there stands for in their
+  place, and fails, naming the path, where they stand for more than 10,000.
+  Merge bases, and the parents of a merge of three or more commits, are
+  merged in the order of their commit ids. This affects criss-cross histories,
+  and merges whose base is itself conflicted.
   [#6369](https://github.com/jj-vcs/jj/issues/6369)
 
 ## [0.46.0] - 2026-10-07

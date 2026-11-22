@@ -20,9 +20,9 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit_with_files;
 use crate::common::create_criss_cross_commits;
-use crate::common::create_criss_cross_commits_with;
 use crate::common::fake_editor_path;
 
 #[test]
@@ -2618,18 +2618,7 @@ fn test_squash_merge_with_an_edit_in_the_disputed_hunk_into_a_parent_conflicts()
     // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
     // where "a" and "b" disagree. Squashing "d" into "p1" gives "p1" a conflict
     // of "d"'s and "a"'s changes from "o", as before virtual merge bases.
-    create_criss_cross_commits_with(
-        &work_dir,
-        "1\n2\n3\n4\n5\n6\n",
-        "a\n2\n3\n4\n5\n6\n",
-        "b1\nb2\nb3\n4\n5\n6\n",
-    );
-    create_commit_with_files(
-        &work_dir,
-        "d",
-        &["p1", "p2"],
-        &[("f", "b1\nB2\nb3\n4\n5\n6\n")],
-    );
+    create_b2_merge(&work_dir);
     work_dir
         .run_jj(["squash", "--from", "d", "--into", "p1", "-u"])
         .success();

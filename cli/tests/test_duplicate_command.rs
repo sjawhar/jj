@@ -16,9 +16,8 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit;
-use crate::common::create_commit_with_files;
-use crate::common::create_criss_cross_commits_with;
 
 #[test]
 fn test_duplicate() {
@@ -2541,18 +2540,7 @@ fn test_duplicate_merge_with_an_edit_in_the_disputed_hunk_onto_one_parent_confli
     // where "a" and "b" disagree. The duplicate of "d" onto "p1" holds a
     // conflict of "d"'s and "a"'s changes from "o", as before virtual merge
     // bases.
-    create_criss_cross_commits_with(
-        &work_dir,
-        "1\n2\n3\n4\n5\n6\n",
-        "a\n2\n3\n4\n5\n6\n",
-        "b1\nb2\nb3\n4\n5\n6\n",
-    );
-    create_commit_with_files(
-        &work_dir,
-        "d",
-        &["p1", "p2"],
-        &[("f", "b1\nB2\nb3\n4\n5\n6\n")],
-    );
+    create_b2_merge(&work_dir);
     work_dir.run_jj(["duplicate", "d", "-o", "p1"]).success();
     let duplicate = "children(p1) & ~d";
     insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", duplicate]), @"
