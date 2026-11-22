@@ -343,8 +343,8 @@ impl MergedTree {
     ///
     /// A virtual merge base ([`crate::virtual_base`]) is only ever a base of a
     /// conflict: where the merge leaves one as a side of a path, the merge
-    /// replaces it with the terms of the conflict that it stands for (see
-    /// [`Self::merge_with_overrides`]).
+    /// replaces it with the terms of the conflict that it stands for, one side
+    /// at a time.
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
         Self::merge_with_overrides(merge, &[], true).await
     }
