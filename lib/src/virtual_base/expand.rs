@@ -328,7 +328,7 @@ impl Expansion {
     /// names, with their labels, and returns where the terms that it brings
     /// are. The slot becomes absent, and the terms, inverted where the slot is
     /// a remove, go to pairs after the merge's own terms, with the slot's
-    /// absent term cancelling the absent term that starts them. Each of the
+    /// absent term canceling the absent term that starts them. Each of the
     /// terms that equals a term of the merge of the other sign cancels it
     /// first, both made absent, so that where the two would cancel, the
     /// merge's own term is left, with its label.

@@ -2401,7 +2401,7 @@ fn amend_the_other_merge_base_of_a_resolved_merge() -> TestResult {
 }
 
 /// Each term that replaces a virtual base takes the label of the commit it
-/// comes from: in VB1a's conflict, `o` is labelled as commit o, not as the
+/// comes from: in VB1a's conflict, `o` is labeled as commit o, not as the
 /// first merge base.
 #[test]
 fn terms_that_replace_a_virtual_base_name_their_commits() -> TestResult {
