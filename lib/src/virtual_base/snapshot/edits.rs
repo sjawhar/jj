@@ -16,7 +16,6 @@
 //! left in place of each range of it that they changed (see the
 //! documentation of [`super`]).
 
-use std::collections::HashMap;
 use std::iter::zip;
 use std::ops::Range;
 
@@ -24,11 +23,10 @@ use bstr::BString;
 use bstr::ByteSlice as _;
 use itertools::Itertools as _;
 
-use super::super::Block;
-use super::super::CLOSE;
-use super::super::SEPARATOR;
-use super::super::marker_hex;
-use super::super::parse_opening_line;
+use super::super::blocks::Block;
+use super::super::blocks::BlockFinder;
+use super::super::blocks::Marker;
+use super::super::blocks::parse_opening_line;
 use crate::diff::ContentDiff;
 use crate::diff::DiffHunkKind;
 use crate::files;
@@ -120,14 +118,14 @@ impl Text {
 
     /// The lines of this text, where each line that came from a base and is
     /// in the form of a marker line is the line that stands for its kind
-    /// and, where it is told, for its block of `vb`, whose blocks are
-    /// `blocks`: the block that holds that very line, which `own` gives, or
-    /// the block that this text holds whole around it (see [`held_blocks`]).
-    fn lines(&self, vb: &[u8], blocks: &[Block<'_>], own: &HashMap<&[u8], usize>) -> Lines {
+    /// and, where it is told, for its block of VB, whose blocks `finder`
+    /// finds: the block whose marker line that very line is, or the block
+    /// that this text holds whole around it (see [`BlockFinder::held`]).
+    fn lines(&self, finder: &BlockFinder<'_>) -> Lines {
         let held = self
             .of_base
             .iter()
-            .flat_map(|base| held_blocks(vb, blocks, &self.bytes, base.clone()))
+            .flat_map(|base| finder.held(&self.bytes, base.clone()))
             .collect_vec();
         let mut next = 0;
         let mut lines = Lines::default();
@@ -142,7 +140,7 @@ impl Text {
                         .get(next)
                         .filter(|(range, _)| range.start <= at)
                         .map(|(_, block)| *block);
-                    let block = own.get(line).copied().or(around);
+                    let block = finder.block_of(line).or(around);
                     lines.push(at, &marker.token_of(block));
                 }
                 None => lines.push(at, line),
@@ -189,28 +187,8 @@ pub(super) struct Edit {
     pub(super) text: Text,
 }
 
-/// The kind of a marker line of a block.
-#[derive(Clone, Copy, Debug)]
-enum Marker {
-    Open,
-    Separator,
-    Close,
-}
-
+/// How a line diff reads the marker lines of VB.
 impl Marker {
-    /// The kind of marker line that `line` is in the form of, if any.
-    fn of_form(line: &[u8]) -> Option<Self> {
-        if parse_opening_line(line).is_some() {
-            Some(Self::Open)
-        } else if marker_hex(line, SEPARATOR).is_some() {
-            Some(Self::Separator)
-        } else if marker_hex(line, CLOSE).is_some() {
-            Some(Self::Close)
-        } else {
-            None
-        }
-    }
-
     /// The line that stands for every marker line of this kind where a line
     /// diff lines VB up with its new text: no line of a text file.
     fn token(self) -> &'static [u8] {
@@ -237,67 +215,49 @@ impl Marker {
     }
 }
 
-/// Whether `line`, a line of text that came from the base of a conflict that
-/// the person kept, is in the form of a marker line of a virtual merge base.
-pub(super) fn is_marker_form(line: &[u8]) -> bool {
-    Marker::of_form(line).is_some()
-}
-
-/// The changes from `vb`, VB or M, whose blocks are `blocks`, to `new`, the
+/// The changes from VB, VB or M whose blocks `finder` finds, to `new`, the
 /// text that a snapshot gives it, in order, none overlapping another, where
 /// `seen` is the text that a snapshot of the file that jj materialized would
 /// give it.
 ///
-/// `seen` is `vb` but for the hunks that the conflict's own merge resolved
-/// to its sides' text, which the file holds in place of VB's. What the
-/// person left as `seen` holds it is no change of theirs, so VB's own text
-/// stands for it (see [`onto_virtual_base`]).
+/// `seen` is VB but for the hunks that the conflict's own merge resolved to
+/// its sides' text, which the file holds in place of VB's. Outside every
+/// block of VB, that text is what the file showed for the base, and it goes
+/// into V's terms as the person left it, as jj's snapshot writes the text of
+/// a hunk that resolves into every term, a plain base among them. Where such
+/// a hunk cuts a block, VB keeps its own text unless the person changed what
+/// the merge made of the block (see [`onto_virtual_base`]).
 ///
 /// The working copy can hold the marker lines of an earlier VB of the same
 /// conflict, which an earlier snapshot replaced, so a block is told by its
 /// sides, not by its hex: text that came from the base of a conflict that the
-/// person kept holds a block of `vb` where it holds, between marker lines of
-/// one hex, the block's sides (see [`held_blocks`]). The blocks that `new`
-/// holds in VB's order line up with themselves, and a line diff of the text
-/// between them gives the changes. In that diff a block that `new` holds out
-/// of that order is one line, so a conflict that the person moved is deleted
-/// in one place and put, whole, in another; and each other line of a base in
-/// the form of a marker line is equal to VB's marker line of that kind, so a
-/// change inside a block's side is a change of those lines alone.
-pub(super) fn base_edits(vb: &[u8], blocks: &[Block<'_>], seen: &Text, new: &Text) -> Vec<Edit> {
-    let markers: HashMap<usize, Marker> = blocks
-        .iter()
-        .flat_map(|block| {
-            let kinds = [Marker::Open]
-                .into_iter()
-                .chain(vec![
-                    Marker::Separator;
-                    block.side_ranges.len().saturating_sub(1)
-                ])
-                .chain([Marker::Close]);
-            let starts = [block.start]
-                .into_iter()
-                .chain(block.side_ranges.iter().map(|side| side.end));
-            zip(starts, kinds)
-        })
-        .collect();
-    let new = &onto_virtual_base(vb, blocks, &markers, seen, new);
+/// person kept holds a block of VB where it holds, between marker lines of
+/// one hex, the block's sides (see [`BlockFinder::held`]). The blocks that
+/// `new` holds in VB's order line up with themselves, and a line diff of the
+/// text between them gives the changes. In that diff a block that `new` holds
+/// out of that order is one line, so a conflict that the person moved is
+/// deleted in one place and put, whole, in another; and each other line of a
+/// base in the form of a marker line is equal to VB's marker line of that
+/// kind, so a change inside a block's side is a change of those lines alone.
+pub(super) fn base_edits(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> Vec<Edit> {
+    let vb = finder.vb;
+    let new = &onto_virtual_base(finder, seen, new);
     let held = new
         .of_base
         .iter()
-        .flat_map(|base| held_blocks(vb, blocks, &new.bytes, base.clone()))
+        .flat_map(|base| finder.held(&new.bytes, base.clone()))
         .collect_vec();
     let mut edits = vec![];
     let (mut vb_at, mut new_at, mut next) = (0, 0, 0);
     for anchor in increasing(&held) {
         let (copy, block) = &held[anchor];
-        let block = &blocks[*block];
+        let block = &finder.blocks[*block];
         let gap = Gap {
             vb: vb_at..block.start,
             new: new_at..copy.start,
             moved: &held[next..anchor],
         };
-        gap_edits(vb, &markers, new, &gap, &mut edits);
+        gap_edits(finder, new, &gap, &mut edits);
         (vb_at, new_at, next) = (block.end, copy.end, anchor + 1);
     }
     let gap = Gap {
@@ -305,56 +265,37 @@ pub(super) fn base_edits(vb: &[u8], blocks: &[Block<'_>], seen: &Text, new: &Tex
         new: new_at..new.bytes.len(),
         moved: &held[next..],
     };
-    gap_edits(vb, &markers, new, &gap, &mut edits);
+    gap_edits(finder, new, &gap, &mut edits);
     edits
 }
 
-/// `new`, the text that the person left for a base, as a change of `vb`,
-/// where `seen` is that base as the file that jj materialized showed it;
-/// `markers` gives the kind of each marker line of `vb` by its offset.
+/// `new`, the text that the person left for a base, as a change of VB, whose
+/// blocks `finder` finds, where `seen` is that base as the file that jj
+/// materialized showed it.
 ///
 /// A line diff of `seen` against `new` gives the person's changes, and one
-/// of `seen` against `vb` the hunks that the conflict's own merge resolved to
-/// its sides' text. The result is `seen` with the person's changes, and with
-/// `vb`'s own lines in each such hunk that no change of the person's touches:
-/// they left it as it was. The hunks that are parts of one block of `vb` are
-/// one in this: where a change touches the lines that they span, the person
-/// changed what the merge made of that block, and all of it stays as they
-/// left it.
-fn onto_virtual_base(
-    vb: &[u8],
-    blocks: &[Block<'_>],
-    markers: &HashMap<usize, Marker>,
-    seen: &Text,
-    new: &Text,
-) -> Text {
-    // The marker lines of VB's blocks, each with the index of its block.
-    let own: HashMap<&[u8], usize> = blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(index, block)| {
-            let side_ends = block.side_ranges.iter().map(|side| side.end);
-            [block.start]
-                .into_iter()
-                .chain(side_ends)
-                .map(move |start| {
-                    let rest = &vb[start..block.end];
-                    let end = rest.find_byte(b'\n').map_or(rest.len(), |end| end + 1);
-                    (&rest[..end], index)
-                })
-        })
-        .collect();
-    let seen_lines = seen.lines(vb, blocks, &own);
+/// of `seen` against VB the hunks that the conflict's own merge resolved to
+/// its sides' text. The result is `seen` with the person's changes. A hunk
+/// that the merge resolved outside every block of VB keeps the text that the
+/// file showed, or the person's, so it goes into V's terms. A hunk that cuts
+/// a block takes VB's own lines back, unless a change of the person's touches
+/// the lines that the file showed for the block: the hunks that are parts of
+/// one block are one in this (see [`resolved_hunks`] and [`untouched`]).
+fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> Text {
+    let vb = finder.vb;
+    let seen_lines = seen.lines(finder);
+    // VB's own lines, with each marker line of its blocks as the line that
+    // stands for it.
     let mut own_lines = Lines::default();
     let mut at = 0;
     for line in vb.lines_with_terminator() {
-        match markers.get(&at) {
-            Some(marker) => own_lines.push(at, &marker.token_of(own.get(line).copied())),
+        match finder.marker_at(at) {
+            Some(marker) => own_lines.push(at, &marker.token_of(finder.block_of(line))),
             None => own_lines.push(at, line),
         }
         at += line.len();
     }
-    let new_lines = new.lines(vb, blocks, &own);
+    let new_lines = new.lines(finder);
     // The person's changes, but for a change of the lines of the base of a
     // conflict that they kept: those lines are VB's, which V's terms give,
     // and they stay as they were. A conflict that the person moved, copied
@@ -371,11 +312,39 @@ fn onto_virtual_base(
             (!of_base).then(|| (range, new.slice(new_start..new_end)))
         })
         .collect_vec();
+    let own_changes = line_changes(&seen_lines.bytes, &own_lines.bytes);
+    let resolved = resolved_hunks(finder, &own_lines, &own_changes);
+    let kept = untouched(finder.blocks, &own_lines, &own_changes, &changes, resolved);
     // Each range of the lines of `seen` to replace, with the text that takes
     // its place.
-    let mut replacements = changes.clone();
+    let mut replacements = changes;
+    replacements.extend(kept);
+    replacements.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut text = Text::default();
+    let mut at = 0;
+    for (range, replacement) in &replacements {
+        let start = seen_lines.original(range.start, seen.bytes.len());
+        text.append(&seen.slice(at..start));
+        text.append(replacement);
+        at = seen_lines.original(range.end, seen.bytes.len());
+    }
+    text.append(&seen.slice(at..seen.bytes.len()));
+    text
+}
+
+/// The hunks that the conflict's own merge resolved to its sides' text where
+/// they cut a block of VB, whose blocks `finder` finds: `own_changes`, the
+/// changes from the lines of the base that the file showed to VB's own lines,
+/// `own_lines`, that take or reach into a block, those of one block together.
+/// A hunk that the merge resolved outside every block is none of these: the
+/// text that the file showed there stays.
+fn resolved_hunks(
+    finder: &BlockFinder<'_>,
+    own_lines: &Lines,
+    own_changes: &[(Range<usize>, Range<usize>)],
+) -> Vec<Resolved> {
+    let (vb, blocks) = (finder.vb, finder.blocks);
     let mut resolved: Vec<Resolved> = vec![];
-    let own_changes = line_changes(&seen_lines.bytes, &own_lines.bytes);
     for (range, own_range) in own_changes.iter().cloned() {
         let start = own_lines.original(own_range.start, vb.len());
         let end = own_lines.original(own_range.end, vb.len());
@@ -388,14 +357,17 @@ fn onto_virtual_base(
             };
             inside.then_some(next)
         });
+        let Some(block) = block else {
+            continue;
+        };
         let mut own = Text::default();
         let mut at = start;
         for line in vb[start..end].lines_with_terminator() {
-            own.push(line, markers.contains_key(&at));
+            own.push(line, finder.marker_at(at).is_some());
             at += line.len();
         }
         match resolved.last_mut() {
-            Some(last) if block.is_some() && last.block == block => {
+            Some(last) if last.block == block => {
                 last.span.end = range.end;
                 last.parts.push((range, own));
             }
@@ -406,45 +378,40 @@ fn onto_virtual_base(
             }),
         }
     }
+    resolved
+}
+
+/// The parts of `resolved`, hunks that the conflict's own merge resolved in
+/// blocks of VB, `blocks`, for which VB keeps its own lines: those of each
+/// block where none of `changes`, the person's changes of the lines of the
+/// base that the file showed, touches the lines that the file showed for the
+/// block. A change that takes some of those lines, or puts text among them,
+/// changes what the merge made of the block, and all of its hunks stay as
+/// the person left them. `own_changes` are the changes from the lines that
+/// the file showed to VB's own lines, `own_lines`.
+fn untouched(
+    blocks: &[Block<'_>],
+    own_lines: &Lines,
+    own_changes: &[(Range<usize>, Range<usize>)],
+    changes: &[(Range<usize>, Text)],
+    resolved: Vec<Resolved>,
+) -> Vec<(Range<usize>, Text)> {
+    let mut kept = vec![];
     for Resolved { block, span, parts } in resolved {
-        let touched = match block {
-            // The lines that the file showed for the block: a change that
-            // takes some of them, or puts text among them, changes what the
-            // merge made of the block.
-            Some(block) => {
-                let block = &blocks[block];
-                let start = offset_among(&own_lines, block.start);
-                let end = offset_among(&own_lines, block.end);
-                let start = span.start.min(lined_up(&own_changes, start, false));
-                let end = span.end.max(lined_up(&own_changes, end, true));
-                let first = changes.partition_point(|(change, _)| change.end <= start);
-                changes[first..]
-                    .first()
-                    .is_some_and(|(change, _)| change.start < end)
-            }
-            None => {
-                let first = changes.partition_point(|(change, _)| change.end < span.start);
-                changes[first..]
-                    .iter()
-                    .take_while(|(change, _)| change.start <= span.end)
-                    .any(|(change, _)| touches(change, &span))
-            }
-        };
+        let block = &blocks[block];
+        let start = offset_among(own_lines, block.start);
+        let end = offset_among(own_lines, block.end);
+        let start = span.start.min(lined_up(own_changes, start, false));
+        let end = span.end.max(lined_up(own_changes, end, true));
+        let first = changes.partition_point(|(change, _)| change.end <= start);
+        let touched = changes[first..]
+            .first()
+            .is_some_and(|(change, _)| change.start < end);
         if !touched {
-            replacements.extend(parts);
+            kept.extend(parts);
         }
     }
-    replacements.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut text = Text::default();
-    let mut at = 0;
-    for (range, replacement) in &replacements {
-        let start = seen_lines.original(range.start, seen.bytes.len());
-        text.append(&seen.slice(at..start));
-        text.append(replacement);
-        at = seen_lines.original(range.end, seen.bytes.len());
-    }
-    text.append(&seen.slice(at..seen.bytes.len()));
-    text
+    kept
 }
 
 /// The offset among `lines` of `original`, the start of a line of the text
@@ -491,149 +458,31 @@ fn lined_up(changes: &[(Range<usize>, Range<usize>)], offset: usize, end: bool) 
     }
 }
 
-/// Hunks that a conflict's own merge resolved to its sides' text, as changes
-/// of the lines of the base that the file showed back to VB's own lines: the
-/// parts of one block of VB, or one hunk outside every block.
+/// Hunks that a conflict's own merge resolved to its sides' text in one block
+/// of VB, as changes of the lines of the base that the file showed back to
+/// VB's own lines.
 struct Resolved {
     /// The index of the block.
-    block: Option<usize>,
+    block: usize,
     /// The lines that the hunks span.
     span: Range<usize>,
     /// Each range of lines to replace, with VB's own lines for it.
     parts: Vec<(Range<usize>, Text)>,
 }
 
-/// Whether two changes of one text touch: they replace some of the same
-/// text, or one, an insertion, is inside the other or at its edge.
-fn touches(one: &Range<usize>, other: &Range<usize>) -> bool {
-    if one.is_empty() || other.is_empty() {
-        one.start <= other.end && other.start <= one.end
-    } else {
-        one.start < other.end && other.start < one.end
-    }
-}
-
-/// The lines of `range` of VB, `vb`, where each marker line of its blocks,
-/// which `markers` gives by its offset, is the line that stands for its
-/// kind.
-fn marked_lines(vb: &[u8], markers: &HashMap<usize, Marker>, range: Range<usize>) -> Lines {
+/// The lines of `range` of VB, whose blocks `finder` finds, where each marker
+/// line of its blocks is the line that stands for its kind.
+fn marked_lines(finder: &BlockFinder<'_>, range: Range<usize>) -> Lines {
     let mut lines = Lines::default();
     let mut at = range.start;
-    for line in vb[range].lines_with_terminator() {
-        match markers.get(&at) {
+    for line in finder.vb[range].lines_with_terminator() {
+        match finder.marker_at(at) {
             Some(marker) => lines.push(at, marker.token()),
             None => lines.push(at, line),
         }
         at += line.len();
     }
     lines
-}
-
-/// The blocks of `vb`, whose blocks are `blocks`, that `range` of `bytes`,
-/// text that came from a base, holds whole: the range of each, and the
-/// block's index. A block is held where a line in the form of an opening
-/// marker line, the lines up to the next closing marker line of its hex, and
-/// the lines between them that separate sides at that hex, hold the sides of
-/// a block of `vb`: the block with that opening line, else the next one with
-/// those sides after the block held before, else the first one.
-///
-/// The lines that are compared are bounded by a multiple of the length of
-/// `range`, so that text that no merge wrote takes time in proportion to its
-/// length: past it, the text holds no more blocks.
-pub(super) fn held_blocks(
-    vb: &[u8],
-    blocks: &[Block<'_>],
-    bytes: &[u8],
-    range: Range<usize>,
-) -> Vec<(Range<usize>, usize)> {
-    let lines = bytes[range.clone()]
-        .lines_with_terminator()
-        .scan(range.start, |offset, line| {
-            let start = *offset;
-            *offset += line.len();
-            Some((start, line))
-        })
-        .collect_vec();
-    // The closing line of each line in the form of an opening line: the next
-    // closing line of its hex, unless another opening line of that hex comes
-    // first.
-    let mut closes = vec![None; lines.len()];
-    let mut next_close: HashMap<&[u8], usize> = HashMap::new();
-    for (index, &(_, line)) in lines.iter().enumerate().rev() {
-        if let Some(hex) = marker_hex(line, CLOSE) {
-            next_close.insert(hex, index);
-        } else if let Some(opening) = parse_opening_line(line) {
-            closes[index] = next_close.remove(opening.hex);
-        }
-    }
-    let longest = blocks
-        .iter()
-        .map(|block| block.sides.iter().map(|side| side.len()).sum::<usize>())
-        .max()
-        .unwrap_or(0);
-    let mut budget = range.len().saturating_mul(MAX_COMPARED);
-    let mut held = vec![];
-    let mut next_block = 0;
-    let mut index = 0;
-    while index < lines.len() {
-        let (start, line) = lines[index];
-        let sides = closes[index].and_then(|close| {
-            let hex = parse_opening_line(line)?.hex;
-            let first_side = start + line.len();
-            let (close_start, close_line) = lines[close];
-            // The sides are no longer than the block's lines between its
-            // opening line and its closing line.
-            let length = close_start - first_side;
-            if length > longest + (close - index) * (SEPARATOR.len() + hex.len() + 1) {
-                return None;
-            }
-            budget = budget.checked_sub(length)?;
-            let mut sides = vec![];
-            let mut side_start = first_side;
-            for &(line_start, line) in &lines[index + 1..=close] {
-                if [SEPARATOR, CLOSE]
-                    .iter()
-                    .any(|prefix| marker_hex(line, prefix) == Some(hex))
-                {
-                    sides.push(&bytes[side_start..line_start]);
-                    side_start = line_start + line.len();
-                }
-            }
-            Some((sides, close, close_start + close_line.len()))
-        });
-        let block = sides.as_ref().and_then(|(sides, _, _)| {
-            let holds = |block: &usize| blocks[*block].sides == *sides;
-            let same_line = |block: &usize| opening_line(vb, &blocks[*block]) == line;
-            let in_order = (next_block..blocks.len()).chain(0..next_block);
-            (0..blocks.len())
-                .filter(holds)
-                .find(same_line)
-                .or_else(|| in_order.clone().find(holds))
-        });
-        match (sides, block) {
-            (Some((_, close, end)), Some(block)) => {
-                held.push((start..end, block));
-                next_block = block + 1;
-                index = close + 1;
-            }
-            _ => index += 1,
-        }
-    }
-    held
-}
-
-/// The most bytes that [`held_blocks`] compares with the sides of VB's blocks
-/// for the lines of a base in the form of an opening marker line, as a
-/// multiple of the length of that base.
-const MAX_COMPARED: usize = 4;
-
-/// The opening marker line of `block`, a block of `vb`, with its newline.
-fn opening_line<'a>(vb: &'a [u8], block: &Block<'_>) -> &'a [u8] {
-    let end = block
-        .side_ranges
-        .first()
-        .map_or(block.end, |side| side.start);
-    &vb[block.start..end]
 }
 
 /// The indices of the most of `held`, blocks that the new text holds, each
@@ -694,20 +543,14 @@ impl Lines {
     }
 }
 
-/// Appends to `edits` the changes from VB, `vb`, to its new text, `new`, in
-/// `gap`, by a line diff; `markers` gives the kind of each marker line of VB
-/// by its offset.
-fn gap_edits(
-    vb: &[u8],
-    markers: &HashMap<usize, Marker>,
-    new: &Text,
-    gap: &Gap<'_>,
-    edits: &mut Vec<Edit>,
-) {
+/// Appends to `edits` the changes from VB, whose blocks `finder` finds, to
+/// its new text, `new`, in `gap`, by a line diff.
+fn gap_edits(finder: &BlockFinder<'_>, new: &Text, gap: &Gap<'_>, edits: &mut Vec<Edit>) {
+    let vb = finder.vb;
     if vb[gap.vb.clone()] == new.bytes[gap.new.clone()] {
         return;
     }
-    let old = marked_lines(vb, markers, gap.vb.clone());
+    let old = marked_lines(finder, gap.vb.clone());
     let mut changed = Lines::default();
     let mut moved = gap.moved.iter().peekable();
     let mut at = gap.new.start;

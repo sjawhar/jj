@@ -101,10 +101,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   conflict of the merge bases into that side's term, and any other change
   (a conflict resolved, deleted or cut into) puts the text the person left
   into every term in place of the lines it touches; a conflict that the
-  person moved or copied takes the terms' own lines with it. A line that looks
-  like a marker line is the person's text. A change of the lines that show
-  the virtual merge base inside a conflict that the person kept is not made:
-  those lines are derived from the merge bases. Where a merge base's own
+  person moved or copied takes the terms' own lines with it. Text that the
+  merge itself resolved outside the conflict of the merge bases, such as a
+  parent's own change, goes into those terms too, as jj's snapshot writes it
+  into a plain base. A line that looks like a marker line is the person's
+  text. A change of the lines that show the virtual merge base inside a
+  conflict that the person kept is not made: those lines are derived from
+  the merge bases. Where a merge base's own
   merge bases disagreed, so that a term is itself a virtual merge base, the
   change is made to the terms which that one stands for, never to its text.
   Where the conflict of the merge bases is between files that are not all
@@ -120,10 +123,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   three or more commits into a descendant, or into a new commit that
   `--insert-after` or `--insert-before` places among its descendants, merges
   the descendant's rebase and the squashed changes as one merge, whatever
-  commits lie between, at each path where the merge's parents conflict or
-  where it replaces a virtual merge base, so the changes there no longer
-  bring back a merge base's own base that the rebase resolved away; every
-  other path is squashed as before. A merge is refused, and writes nothing,
+  commits lie between, at each path where the merge's parents hold a
+  conflict between files or where it replaces a virtual merge base, so the
+  changes there no longer bring back a merge base's own base that the rebase
+  resolved away; every
+  other path is squashed as before. A virtual merge base's marker lines
+  carry a salt at which no line of either side of the merge equals one of
+  them; where the text of the merge bases' conflict holds lines of that
+  shape at the highest salts, and a side holds a marker line there too, the
+  merge writes the placeholder, which holds none of that text, instead of a
+  virtual merge base. A merge is refused, and writes nothing,
   where it would replace more than 10,000 virtual merge bases at one path, or
   more than 10,000 in all and 100 for each path where it replaces one: files
   that pass as virtual merge bases can stand for that many, and so can a

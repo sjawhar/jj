@@ -2328,6 +2328,116 @@ fn vb6_a_line_appended_goes_into_every_term_alone() -> TestResult {
     Ok(())
 }
 
+/// A parent's own change: A sets line 1 of `1 2 3 4 5 6` to `x` and B to
+/// `y`; P1, a merge of A and B, holds `x` and its own change `Z` at line 6,
+/// where every term of V holds `6`, and P2 holds `y`. w, the merge of P1 and
+/// P2, left conflicted: line 1 conflicts with VB as the base, and w's own
+/// merge resolves line 6, outside VB's block, to P1's `Z`. Line 3 is changed
+/// to `EDIT` in w's working copy and snapshotted, and s and u, children of w,
+/// hold w's file with `x` and with `y` at line 1.
+struct OwnChange {
+    case: Case,
+    p1: Commit,
+    w: Commit,
+    s: Commit,
+    u: Commit,
+}
+
+fn own_change_history() -> TestResult<OwnChange> {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6"))],
+        &[("f", lines("x 2 3 4 5 6"))],
+        &[("f", lines("y 2 3 4 5 6"))],
+        Made::AFirst,
+        &[("f", lines("x 2 3 4 5 Z"))],
+        &[("f", lines("y 2 3 4 5 6"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("3", "EDIT")])?;
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", lines("x 2 EDIT 4 5 Z"))])?;
+    let u = case.commit(&[&w], &[("f", lines("y 2 EDIT 4 5 Z"))])?;
+    Ok(OwnChange { case, p1, w, s, u })
+}
+
+/// A parent's own change: the snapshot writes the text that w's own merge
+/// resolved outside VB's block, P1's `Z`, into every term of V, as jj's
+/// snapshot writes it into a plain base, so u rebased onto s, as `jj rebase
+/// -r u -o s` does, is a conflict at line 1 whose every term holds `Z` and
+/// the edit, as jj 0.45.1 gives.
+#[test]
+fn a_parents_own_change_survives_a_sibling_rebase_after_a_snapshot() -> TestResult {
+    let OwnChange { mut case, s, u, .. } = own_change_history()?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?;
+    let [x, one, y] = ["x", "1", "y"].map(|first| {
+        let content = lines(&format!("{first} 2 EDIT 4 5 Z")).unwrap();
+        case.file(f(), &content, false, CopyId::placeholder())
+    });
+    assert_same_value(&case, &value, &conflict(&[&x, &one, &y]));
+    Ok(())
+}
+
+/// A parent's own change: s rebased onto P1, as `jj rebase -r s -o P1` does,
+/// holds P1's own text, `Z` with it, as jj 0.45.1 gives, not the merge bases'
+/// `6`.
+#[test]
+fn a_parents_own_change_survives_a_rebase_onto_it_after_a_snapshot() -> TestResult {
+    let OwnChange {
+        mut case, p1, s, ..
+    } = own_change_history()?;
+    let rebased = rebase_commit(case.tx.repo_mut(), s.clone(), vec![p1.id().clone()]).block_on()?;
+    let merged = Merged {
+        case,
+        parents: vec![p1, s],
+        tree: rebased.tree(),
+    };
+    assert_resolved_text(&merged, "x\n2\n3\n4\n5\nZ\n")
+}
+
+/// A parent's own change: u once w is abandoned, as `jj abandon w` rebases it
+/// onto P1 and P2, holds `y 2 3 4 5 Z`, as jj 0.45.1 gives, not the merge
+/// bases' `6`.
+#[test]
+fn a_parents_own_change_survives_an_abandon_of_the_snapshotted_merge() -> TestResult {
+    let OwnChange { mut case, w, u, .. } = own_change_history()?;
+    case.tx.repo_mut().record_abandoned_commit(&w);
+    let merged = rebased_descendant(case, &u)?;
+    assert_resolved_text(&merged, "y\n2\n3\n4\n5\nZ\n")
+}
+
+/// A third parent's own change: w merges P1 and P2, which hold `x` and `y`
+/// over the merge bases A and B, and Q, a child of o that holds its own
+/// change `Q6` at line 6. Line 3 is changed to `EDIT` in w's working copy and
+/// snapshotted; s and u, children of w, hold `x` and `y` with the edit and
+/// `Q6`. u rebased onto s is a conflict whose every term holds `Q6` and the
+/// edit.
+#[test]
+fn a_third_parents_own_change_survives_a_sibling_rebase_after_a_snapshot() -> TestResult {
+    let mut case = Case::new();
+    let root = case.root();
+    let o = case.commit(&[&root], &[("f", lines("1 2 3 4 5 6"))])?;
+    let a = case.commit(&[&o], &[("f", lines("x 2 3 4 5 6"))])?;
+    let b = case.commit(&[&o], &[("f", lines("y 2 3 4 5 6"))])?;
+    let p1 = case.commit(&[&a, &b], &[("f", lines("x 2 3 4 5 6"))])?;
+    let p2 = case.commit(&[&a, &b], &[("f", lines("y 2 3 4 5 6"))])?;
+    let q = case.commit(&[&o], &[("f", lines("1 2 3 4 5 Q6"))])?;
+    let w = case.commit(&[&p1, &p2, &q], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("3", "EDIT")])?;
+    let w = case.commit_with_values(&[&p1, &p2, &q], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", lines("x 2 EDIT 4 5 Q6"))])?;
+    let u = case.commit(&[&w], &[("f", lines("y 2 EDIT 4 5 Q6"))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?.simplify();
+    assert!(!value.is_resolved(), "{}", describe(&case, &value));
+    for line in ["EDIT", "Q6"] {
+        assert_every_term_holds(&case, &value, line);
+    }
+    Ok(())
+}
+
 /// Appends `END` to the working copy of k, the merge of `history`'s P1 and P2,
 /// left conflicted, and snapshots it; s and u, children of k, hold `s_text`
 /// and `u_text`. Returns u rebased onto s.
@@ -3245,14 +3355,14 @@ fn assert_snapshot_across_hunk_levels(
     let (mut case, commits) = case.reloaded(&snapshot_settings, &[&p1, &p2, &k])?;
     let [p1, p2, k] = <[Commit; 3]>::try_from(commits).expect("three commits");
     let new_value = snapshot_edits_materialized(&case, &k, materialize, &[("4", "FOUR")])?;
-    // The file reads back at the level of the merge that wrote VB. Written by
-    // word under a VB written by line, it holds line 3 as jj's word merge of
-    // it, `A b C`, where that merge left a conflict: the text goes into V's
-    // terms, as jj's snapshot writes the text of a hunk that resolves into
-    // every term of a conflict. Otherwise line 3 is as that merge left it, or
-    // a conflict whose base V's terms keep.
-    let line_3 = match (write_level, materialize_level) {
-        ("line", "word") => "A b C",
+    // Written by word, the file holds line 3 as jj's word merge of it,
+    // `A b C`, in a hunk that resolves: the text goes into V's terms, as
+    // jj's snapshot writes the text of a hunk that resolves into every term
+    // of a conflict, whether the merge that wrote VB left a conflict there
+    // (by line) or resolved it outside VB's block (by word). Written by line,
+    // the file holds line 3 as a conflict whose base V's terms keep.
+    let line_3 = match materialize_level {
+        "word" => "A b C",
         _ => "a b c",
     };
     for term in named_term_texts(&case, &new_value.simplify()) {
@@ -3835,6 +3945,8 @@ enum SquashInto {
     BeforeD,
     /// d, once the squash into n is done and d is rebased onto it.
     DAfterBeforeD,
+    /// c, a child of P1 alone, that writes `g`.
+    ChildOfP1,
 }
 
 /// The value at `f` of the commit that `into` names once P1 is squashed into
@@ -3938,6 +4050,7 @@ fn squash_p1(
             rebase_commit(case.tx.repo_mut(), d.clone(), vec![n.id().clone()]).block_on()?;
             n
         }
+        SquashInto::ChildOfP1 => case.commit(&[&p1], &[("g", line("g"))])?,
     };
     let squashed = squash_commits(case.tx.repo_mut(), &sources, &destination, false)
         .block_on()?
@@ -4073,6 +4186,22 @@ fn squash_of_a_part_of_a_merge_of_three_keeps_a_held_value() -> TestResult {
 #[test]
 fn squash_of_a_merge_of_three_into_a_commit_before_its_child_keeps_a_held_value() -> TestResult {
     assert_squashes_of_p1_keep_a_held_value(&[SquashInto::BeforeD, SquashInto::DAfterBeforeD])
+}
+
+/// c, a child of P1 alone: the squash abandons P1, so c's parents become P1's
+/// own, and the rebase changes c's tree as the merge of those parents
+/// changed from P1's tree. That merge is the term, with a virtual merge base,
+/// against which P1's changes are made, so the two cancel, and c holds P1's
+/// `x`, as jj 0.45.1 gives.
+#[test]
+fn squash_of_a_merge_of_three_into_a_child_of_it_alone_keeps_its_value() -> TestResult {
+    for history in [ThreeBases::T3, ThreeBases::T3x] {
+        for highest in 0..3 {
+            let (case, value, _) = squash_p1(history, highest, SquashInto::ChildOfP1)?;
+            assert_same_value(&case, &value, &resolved(case.text("x").as_ref()));
+        }
+    }
+    Ok(())
 }
 
 /// Where the one merge of a squash leaves a conflict, the tree keeps conflict

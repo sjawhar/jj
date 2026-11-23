@@ -41,31 +41,34 @@
 //! anyone changed is no longer VB or M.
 //!
 //! V's text can hold lines in the form of marker lines, a copy of another VB
-//! among them. The writer takes the lowest salt that is above the salt of
-//! every line of V's text in the form of an opening marker line, and at which
-//! no marker line is a line of either side of the merge. The reader takes the
-//! lines in the form of an opening marker line whose block closes, groups
-//! them by their salt and by what follows it, and tries the groups from the
-//! highest salt down: the blocks are those of the first group whose every
-//! line opens a block whose hash checks out, each after the one before; every
-//! other line is text, whatever its form. So the reader tries the writer's
-//! own blocks first, whatever V's text holds, and a file that no merge wrote
-//! costs it a bounded amount of hashing (`MAX_UNVERIFIED_HASHING`). The
-//! writer reads what it wrote back as the reader does, and writes M where VB
-//! does not read back. As anyone can write a file whose hashes check out, a
-//! file counts as VB or M only where the terms it names are in the store and
-//! none of its sides is VB or M, as for every VB and M that a merge writes.
+//! among them. The writer takes the lowest salt, from the one above the salt
+//! of every line of V's text in the form of an opening marker line (2^64-1
+//! where such a line has that salt, as none is above it), at which no marker
+//! line is a line of either side of the merge. The reader takes the lines in
+//! the form of an opening marker line whose block closes, groups them by
+//! their salt and by what follows it, and tries the groups from the highest
+//! salt down: the blocks are those of the first group whose every line opens
+//! a block whose hash checks out, each after the one before; every other
+//! line is text, whatever its form. So the reader tries the writer's own
+//! blocks first, unless V's text quotes blocks at the salt 2^64-1 too, and a
+//! file that no merge wrote costs it a bounded amount of hashing
+//! (`MAX_UNVERIFIED_HASHING`). The writer reads what it wrote back as the
+//! reader does, and writes M where VB does not read back, and where no salt
+//! is left at which VB's marker lines are none of the sides' lines. As anyone
+//! can write a file whose hashes check out, a file counts as VB or M only
+//! where the terms it names are in the store and none of its sides is VB or
+//! M, as for every VB and M that a merge writes.
+//!
+//! The reader, and the finder of the blocks of VB that the base of a
+//! conflict holds, which a snapshot reads, are in the module `blocks`.
 //!
 //! [`MergedTree::merge`]: crate::merged_tree::MergedTree::merge
 
-use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::iter;
 use std::iter::zip;
 use std::mem;
-use std::ops::Range;
 
 use blake2::Blake2b512;
 use bstr::BString;
@@ -73,9 +76,11 @@ use bstr::ByteSlice as _;
 use digest::Digest;
 use futures::AsyncReadExt as _;
 use futures::try_join;
-use indexmap::IndexMap;
 use itertools::Itertools as _;
 
+use self::blocks::Block;
+use self::blocks::blocks;
+use self::blocks::parse_opening_line;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
@@ -99,6 +104,7 @@ use crate::repo_path::RepoPath;
 use crate::store::Store;
 use crate::tree_merge::MergeOptions;
 
+mod blocks;
 mod expand;
 mod snapshot;
 
@@ -130,13 +136,15 @@ const WORD_LEVEL: &str = "word ";
 /// first 8,000 bytes hold no NUL byte, each remove such a file or absent, read
 /// as an empty file), the file is VB, jj's line merge of `base`'s terms: each
 /// hunk that merges keeps its merged text, and each hunk that does not is a
-/// block that holds `base`'s sides at that hunk, in `base`'s order. Otherwise
+/// block that holds `base`'s sides at that hunk, in `base`'s order. Otherwise,
+/// and where VB would not read back or no salt is left for its marker lines,
 /// the file is M, one block whose sides each name a term of `base`, in
 /// `base`'s order. Every block names `base`'s terms, each with its label, so
 /// that a merge that replaces the file with those terms labels each with the
-/// commit it comes from, and its marker lines are at the lowest salt at which
-/// no line of any term of either parent equals one of them (see the module's
-/// documentation). The file is executable where the executable bits of `base`
+/// commit it comes from, and its marker lines are at a salt at which no line
+/// of any term of either parent equals one of them (see the module's
+/// documentation); the merge is refused where no salt gives even M such
+/// marker lines. The file is executable where the executable bits of `base`
 /// merge to `true`, and keeps the copy id of `base` where its copy ids merge,
 /// else the placeholder. The result does not depend on the order of the
 /// parents.
@@ -275,7 +283,8 @@ pub(crate) async fn stored_virtual_base_terms(
 /// Writes to the store the VB or M of `base`, V after `simplify()`, each of
 /// whose terms has the label of `labels` at its place, whose contents are
 /// `base_contents` if it is a conflict of text files, with marker lines that
-/// are none of `parent_lines` (see [`virtual_base_file`]).
+/// are none of `parent_lines` (see [`virtual_base_file`]). The merge is
+/// refused where no salt gives M such marker lines either.
 async fn write_virtual_base(
     store: &Store,
     path: &RepoPath,
@@ -285,7 +294,14 @@ async fn write_virtual_base(
     parent_lines: &HashSet<&[u8]>,
 ) -> BackendResult<FileId> {
     let options = store.merge_options();
-    let content = virtual_base_file(base, labels, base_contents, options, parent_lines);
+    let Some(content) = virtual_base_file(base, labels, base_contents, options, parent_lines)
+    else {
+        let path = path.as_internal_file_string();
+        return Err(BackendError::Unsupported(format!(
+            "Refused to merge: at {path} no salt gives a virtual merge base marker lines that no \
+             line of the merge's sides holds; no change was made"
+        )));
+    };
     store.write_file(path, &mut content.as_slice()).await
 }
 
@@ -293,42 +309,39 @@ async fn write_virtual_base(
 /// VB records `options`' hunk level, at which it merges `base_contents`. VB
 /// holds V's text, whose lines can have any form, so VB with a block is read
 /// back as any reader will read it, and the content is M, which holds none of
-/// V's text, where it does not name `base` and `labels`. VB with no block,
-/// for a V whose contents merge, is their merged text.
+/// V's text, where it does not name `base` and `labels`, and where no salt is
+/// left at which VB's marker lines are none of `parent_lines` (see
+/// [`Draft::write`]). VB with no block, for a V whose contents merge, is their
+/// merged text. `None` where no salt gives M such marker lines either.
 fn virtual_base_file(
     base: &MergedTreeValue,
     labels: &Merge<String>,
     base_contents: Option<Merge<BString>>,
     options: &MergeOptions,
     parent_lines: &HashSet<&[u8]>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let names = zip(base.iter(), labels.iter())
         .map(|(term, label)| term_name(term.as_ref(), label))
         .collect_vec();
     let joined_names = names.join(" ");
-    let vb = base_contents
-        .map(|base_contents| {
-            let tail = opening_tail(options.hunk_level, &joined_names);
-            let hunks = text_hunks(&base_contents, options);
-            let has_block = hunks
-                .iter()
-                .any(|hunk| matches!(hunk, VirtualBaseHunk::Block(_)));
-            (has_block, virtual_base_content(hunks, &tail, parent_lines))
-        })
-        .filter(|(has_block, vb)| {
-            !has_block
-                || parse_named_terms(vb)
-                    .is_some_and(|named| named.terms == *base && named.labels == *labels)
-        });
-    match vb {
-        Some((_, vb)) => vb,
-        None => {
-            let sides = names.iter().map(|name| format!("{name}\n").into_bytes());
-            let hunks = vec![VirtualBaseHunk::Block(sides.collect())];
-            let tail = opening_tail(FileMergeHunkLevel::Line, &joined_names);
-            virtual_base_content(hunks, &tail, parent_lines)
-        }
-    }
+    let vb = base_contents.and_then(|base_contents| {
+        let tail = opening_tail(options.hunk_level, &joined_names);
+        let hunks = text_hunks(&base_contents, options);
+        let has_block = hunks
+            .iter()
+            .any(|hunk| matches!(hunk, VirtualBaseHunk::Block(_)));
+        let vb = virtual_base_content(hunks, &tail, parent_lines)?;
+        let reads_back = !has_block
+            || parse_named_terms(&vb)
+                .is_some_and(|named| named.terms == *base && named.labels == *labels);
+        reads_back.then_some(vb)
+    });
+    vb.or_else(|| {
+        let sides = names.iter().map(|name| format!("{name}\n").into_bytes());
+        let hunks = vec![VirtualBaseHunk::Block(sides.collect())];
+        let tail = opening_tail(FileMergeHunkLevel::Line, &joined_names);
+        virtual_base_content(hunks, &tail, parent_lines)
+    })
 }
 
 /// The labels of the terms of `base`, V, from `labels`, after `simplify()`,
@@ -392,14 +405,16 @@ fn text_hunks(contents: &Merge<BString>, options: &MergeOptions) -> Vec<VirtualB
 /// The content of VB or M whose opening lines hold `tail` after the salt
 /// (see [`opening_tail`]), made of `hunks`: the text of each resolved hunk,
 /// and each block's sides, each ending with a newline unless it is empty,
-/// between marker lines at the lowest salt that is above the salt of every
-/// line of that text in the form of an opening marker line, and at which no
-/// marker line is one of `parent_lines` (see the module's documentation).
+/// between marker lines at the lowest salt, from the one above the salt of
+/// every line of that text in the form of an opening marker line (see
+/// [`Draft::salt_above_text`]), at which no marker line is one of
+/// `parent_lines` (see the module's documentation). `None` where no such salt
+/// is left.
 fn virtual_base_content(
     hunks: Vec<VirtualBaseHunk>,
     tail: &str,
     parent_lines: &HashSet<&[u8]>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let draft = Draft::new(hunks);
     let first_salt = draft.salt_above_text();
     draft.write(tail, first_salt, parent_lines)
@@ -442,8 +457,9 @@ impl Draft {
     }
 
     /// The lowest salt that is above the salt of every line of the draft's
-    /// text in the form of an opening marker line: the reader then tries the
-    /// blocks written at it before any block that the text quotes.
+    /// text in the form of an opening marker line, so that the reader tries
+    /// the blocks written at it before any block that the text quotes; where
+    /// such a line has the salt 2^64-1, none is above it, and it is that salt.
     fn salt_above_text(&self) -> u64 {
         self.blocks
             .iter()
@@ -458,8 +474,8 @@ impl Draft {
 
     /// The content, with marker lines that hold `tail` after the salt, at
     /// the lowest salt from `first_salt` up at which none is one of
-    /// `parent_lines`.
-    fn write(self, tail: &str, first_salt: u64, parent_lines: &HashSet<&[u8]>) -> Vec<u8> {
+    /// `parent_lines`; `None` where no salt is left.
+    fn write(self, tail: &str, first_salt: u64, parent_lines: &HashSet<&[u8]>) -> Option<Vec<u8>> {
         let Self { blocks, after } = self;
         let last = blocks.len().saturating_sub(1);
         let hashers = blocks
@@ -470,8 +486,11 @@ impl Draft {
                 hasher_with_after(block_hasher(ordinal, tail.as_bytes(), before, sides), after)
             })
             .collect_vec();
-        // Each salt gives other opening lines, so the search ends after at
-        // most one salt more than there are `parent_lines`.
+        // Each salt gives another opening line, and other separator and
+        // closing lines unless two salts give a block one hex, so a search
+        // from salt 0, as M's is, ends within one salt more than there are
+        // `parent_lines`. A search from higher up, as VB's above the salts of
+        // V's text, can run out of salts.
         let markers = (first_salt..=u64::MAX)
             .map(|salt| {
                 hashers
@@ -484,8 +503,7 @@ impl Draft {
                     .iter()
                     .flatten()
                     .all(|line| !parent_lines.contains(line.as_bytes()))
-            })
-            .expect("some salt gives marker lines that no parent holds");
+            })?;
         let mut content = vec![];
         for ((before, sides), [open, separator, close]) in zip(blocks, markers) {
             content.extend(before);
@@ -499,7 +517,7 @@ impl Draft {
             push_line(&mut content, &close);
         }
         content.extend(after);
-        content
+        Some(content)
     }
 }
 
@@ -666,209 +684,6 @@ fn decode_label(encoded: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A block of VB or M: the offsets of its opening line and of the end of its
-/// closing line, the hunk level that its opening line records and the names
-/// of the terms that it carries, and its sides, each with its newlines, and
-/// their offsets.
-struct Block<'a> {
-    start: usize,
-    end: usize,
-    hunk_level: FileMergeHunkLevel,
-    names: &'a [u8],
-    sides: Vec<&'a [u8]>,
-    side_ranges: Vec<Range<usize>>,
-}
-
-/// The most bytes that [`blocks`] hashes for opening marker lines whose blocks
-/// do not verify, as a multiple of the length of the content.
-const MAX_UNVERIFIED_HASHING: usize = 4;
-
-/// The blocks of `content`, in order, as the writer wrote them. A line in the
-/// form of an opening marker line can open a block where the next closing
-/// marker line of its hex follows, with no other opening marker line of that
-/// hex before it, and where it names terms. The writer's blocks all carry
-/// one salt, above the salt of every such line of V's text, and the same
-/// level and names, so those lines are tried in groups of one salt, level
-/// and names, from the highest salt down, and at one salt in the order of
-/// each group's first line. The blocks are those of the first group that
-/// verifies: each line of it opens a block whose hex is the hash of the
-/// block with the group's salt, where the block's ordinal counts the blocks
-/// before it, the text before it starts where the previous block ends (see
-/// [`verified_blocks`]). Every other line is text, whatever its form.
-///
-/// `None` where no group verifies, as for a file that is neither VB nor M;
-/// and where the groups that do not verify would take more than
-/// [`MAX_UNVERIFIED_HASHING`] times the content's length to hash, so that
-/// reading any content takes time in proportion to its length. A file that
-/// the writer wrote takes none of that, as its own group is tried first.
-fn blocks(content: &[u8]) -> Option<Vec<Block<'_>>> {
-    let lines = content
-        .lines_with_terminator()
-        .scan(0, |offset, line| {
-            let start = *offset;
-            *offset += line.len();
-            Some((start, line))
-        })
-        .collect_vec();
-    // Each opening line whose block closes, with its closing line: the next
-    // closing line of its hex, unless another opening line of that hex comes
-    // first.
-    let mut candidates = vec![];
-    let mut next_close: HashMap<&[u8], usize> = HashMap::new();
-    for (index, &(_, line)) in lines.iter().enumerate().rev() {
-        if let Some(hex) = marker_hex(line, CLOSE) {
-            next_close.insert(hex, index);
-        } else if let Some(opening) = parse_opening_line(line)
-            && let Some(close) = next_close.remove(opening.hex)
-        {
-            candidates.push(Candidate {
-                opening,
-                lines: index..close + 1,
-            });
-        }
-    }
-    let mut groups: IndexMap<(u64, &[u8]), Vec<Candidate<'_>>> = IndexMap::new();
-    for candidate in candidates.into_iter().rev() {
-        let key = (candidate.opening.salt, candidate.opening.tail);
-        groups.entry(key).or_default().push(candidate);
-    }
-    let mut groups = groups
-        .into_values()
-        .filter(|group| parse_names(group[0].opening.names).is_some())
-        .collect_vec();
-    groups.sort_by_key(|group| Reverse(group[0].opening.salt));
-    let mut budget = content.len().saturating_mul(MAX_UNVERIFIED_HASHING);
-    for group in &groups {
-        match verified_blocks(content, &lines, group) {
-            Ok(blocks) => return Some(blocks),
-            Err(hashed) => budget = budget.checked_sub(hashed)?,
-        }
-    }
-    None
-}
-
-/// A line in the form of an opening marker line whose block closes: what the
-/// line holds, and the lines of the block, from it to its closing line.
-struct Candidate<'a> {
-    opening: OpeningLine<'a>,
-    lines: Range<usize>,
-}
-
-/// The blocks that `group`, lines of `content` in the form of an opening
-/// marker line with one salt, level and names, in order, open, where each
-/// block verifies: it starts after the block before it, and its hex is the
-/// hash of the block, where the text before it starts where that block ends
-/// (at the start of the content for the first), and the text after it is the
-/// rest of the content for the last block and nothing for another. Each side
-/// ends at a line that is [`SEPARATOR`] and the block's hex, or at the
-/// closing line. `lines` are the lines of `content`, each with its offset.
-/// Where a block does not verify, the error is how many bytes the check
-/// read.
-fn verified_blocks<'a>(
-    content: &'a [u8],
-    lines: &[(usize, &'a [u8])],
-    group: &[Candidate<'a>],
-) -> Result<Vec<Block<'a>>, usize> {
-    let mut blocks = vec![];
-    let mut text_start = 0;
-    let mut read = 0;
-    for (position, candidate) in group.iter().enumerate() {
-        let OpeningLine {
-            hex,
-            salt,
-            tail,
-            hunk_level,
-            names,
-        } = candidate.opening;
-        let (start, line) = lines[candidate.lines.start];
-        if start < text_start {
-            return Err(read);
-        }
-        let mut sides = vec![];
-        let mut side_ranges = vec![];
-        let mut side_start = start + line.len();
-        for &(line_start, line) in &lines[candidate.lines.clone()][1..] {
-            if [SEPARATOR, CLOSE]
-                .iter()
-                .any(|prefix| marker_hex(line, prefix) == Some(hex))
-            {
-                sides.push(&content[side_start..line_start]);
-                side_ranges.push(side_start..line_start);
-                side_start = line_start + line.len();
-            }
-        }
-        let end = side_start;
-        let after: &[u8] = if position + 1 == group.len() {
-            &content[end..]
-        } else {
-            &[]
-        };
-        read += end - text_start + after.len();
-        let hasher = block_hasher(blocks.len(), tail, &content[text_start..start], &sides);
-        if salted_hex(&hasher_with_after(hasher, after), salt).as_bytes() != hex {
-            return Err(read);
-        }
-        blocks.push(Block {
-            start,
-            end,
-            hunk_level,
-            names,
-            sides,
-            side_ranges,
-        });
-        text_start = end;
-    }
-    Ok(blocks)
-}
-
-/// What a line in the form of an opening marker line holds: its hex, its
-/// salt, and what follows the salt, which is the hunk level that it records
-/// and the names of the terms (see [`split_hunk_level`]).
-#[derive(Clone, Copy)]
-struct OpeningLine<'a> {
-    hex: &'a [u8],
-    salt: u64,
-    tail: &'a [u8],
-    hunk_level: FileMergeHunkLevel,
-    names: &'a [u8],
-}
-
-/// What `line` holds if it is in the form of an opening marker line:
-/// [`OPEN`], 32 lowercase hex digits, a salt in decimal, the hunk level and
-/// the names as [`opening_tail`] writes them, and a newline. The level is
-/// read here, once, so that no reader takes it for a name.
-fn parse_opening_line(line: &[u8]) -> Option<OpeningLine<'_>> {
-    let rest = line.strip_prefix(OPEN.as_bytes())?.strip_suffix(b"\n")?;
-    let (hex, rest) = rest.split_once_str(" ")?;
-    let (salt, tail) = rest.split_once_str(" ")?;
-    let salt_text = salt.to_str().ok()?;
-    let salt: u64 = salt_text.parse().ok()?;
-    let canonical = salt.to_string() == salt_text;
-    let (hunk_level, names) = split_hunk_level(tail);
-    (is_hex(hex) && canonical && !tail.is_empty()).then_some(OpeningLine {
-        hex,
-        salt,
-        tail,
-        hunk_level,
-        names,
-    })
-}
-
-/// The hex of `line` if `line` is `prefix`, 32 lowercase hex digits and a
-/// newline.
-fn marker_hex<'a>(line: &'a [u8], prefix: &str) -> Option<&'a [u8]> {
-    let hex = line.strip_prefix(prefix.as_bytes())?.strip_suffix(b"\n")?;
-    is_hex(hex).then_some(hex)
-}
-
-/// Whether `hex` is 32 lowercase hex digits.
-fn is_hex(hex: &[u8]) -> bool {
-    hex.len() == 32
-        && hex
-            .iter()
-            .all(|&byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// Whether `terms`, the terms of V that a VB or M names, can be V's: the store
 /// holds each of them, and no side of V is itself VB or M, which no merge
 /// writes as a side. V's bases can be VB or M, once or more. A submodule's
@@ -975,32 +790,14 @@ async fn read_file(store: &Store, path: &RepoPath, id: &FileId) -> BackendResult
 mod tests {
     use super::*;
 
-    /// A line in the form of an opening marker line, whose block never
-    /// closes.
-    const OPENING_FORM: &str =
-        "<<<<<<< jj virtual merge base 0123456789abcdef0123456789abcdef 0 quoted\n";
-
-    /// The names of three terms, as an opening marker line holds them.
-    const NAMES: &str = "file:01 file:02 file:03";
-
-    /// VB that names [`NAMES`], made of `hunks`.
-    fn vb(hunks: Vec<VirtualBaseHunk>) -> Vec<u8> {
-        virtual_base_content(hunks, NAMES, &HashSet::new())
-    }
-
-    /// A block with the sides `x` and `y`.
-    fn block() -> VirtualBaseHunk {
-        VirtualBaseHunk::Block(vec![b"x\n".to_vec(), b"y\n".to_vec()])
-    }
-
     /// The sides of each of `blocks`.
-    fn sides<'a>(blocks: &[Block<'a>]) -> Vec<Vec<&'a [u8]>> {
+    pub(super) fn sides<'a>(blocks: &[Block<'a>]) -> Vec<Vec<&'a [u8]>> {
         blocks.iter().map(|block| block.sides.clone()).collect()
     }
 
     /// `count` blocks that close and name a term each, a different one for
     /// each block, at `salt`, whose hashes do not check out.
-    fn quoted_blocks(count: usize, salt: u64) -> Vec<u8> {
+    pub(super) fn quoted_blocks(count: usize, salt: u64) -> Vec<u8> {
         (1..=count)
             .map(|n| {
                 let [open, separator, close] =
@@ -1011,116 +808,9 @@ mod tests {
             .into_bytes()
     }
 
-    #[test]
-    fn an_opening_line_whose_block_never_closes_is_text() {
-        let text = format!("1\n{OPENING_FORM}3\n");
-        let content = vb(vec![
-            VirtualBaseHunk::Resolved(text.into_bytes()),
-            block(),
-            VirtualBaseHunk::Resolved(b"after\n".to_vec()),
-        ]);
-        let blocks = blocks(&content).expect("VB reads back");
-        assert_eq!(sides(&blocks), [[b"x\n" as &[u8], b"y\n"]]);
-    }
-
-    #[test]
-    fn a_quoted_block_whose_hash_does_not_check_out_is_text() {
-        // VB's own text quotes another VB whole, closing line and all, after
-        // a line of text before VB's own block, and after it.
-        let quoted = vb(vec![block()]);
-        let before = [b"1\n".as_slice(), &quoted].concat();
-        let content = vb(vec![
-            VirtualBaseHunk::Resolved(before),
-            block(),
-            VirtualBaseHunk::Resolved(quoted),
-        ]);
-        let blocks = blocks(&content).expect("VB reads back");
-        assert_eq!(sides(&blocks), [[b"x\n" as &[u8], b"y\n"]]);
-    }
-
-    #[test]
-    fn vb_of_text_that_starts_with_a_copy_of_a_vb_reads_back() {
-        // As the first text of a file, a byte copy of a VB that ends with its
-        // block verifies by itself: the writer's salt is above the copy's, so
-        // the reader tries the writer's block first.
-        let quoted = vb(vec![VirtualBaseHunk::Block(vec![
-            b"p\n".to_vec(),
-            b"q\n".to_vec(),
-        ])]);
-        assert_eq!(
-            blocks(&quoted).map(|blocks| sides(&blocks)),
-            Some(vec![vec![b"p\n" as &[u8], b"q\n"]])
-        );
-        let content = vb(vec![VirtualBaseHunk::Resolved(quoted), block()]);
-        let blocks = blocks(&content).expect("VB reads back");
-        assert_eq!(sides(&blocks), [[b"x\n" as &[u8], b"y\n"]]);
-    }
-
-    #[test]
-    fn vb_of_text_that_quotes_many_blocks_reads_back() {
-        // The reader tries the writer's blocks before the quoted ones, however
-        // many there are, so reading them back hashes none of the others.
-        let content = vb(vec![
-            VirtualBaseHunk::Resolved(quoted_blocks(200, 7)),
-            block(),
-            VirtualBaseHunk::Resolved(b"after\n".to_vec()),
-        ]);
-        let blocks = blocks(&content).expect("VB reads back");
-        assert_eq!(sides(&blocks), [[b"x\n" as &[u8], b"y\n"]]);
-    }
-
-    #[test]
-    fn checks_of_blocks_that_do_not_verify_are_bounded() {
-        // A file that no merge wrote: its own block is at salt 0, below the
-        // salt of the blocks that its text quotes, so the reader tries those
-        // first, each a hash of about the whole file. One is within the
-        // bound; eight are not, and the file is then not VB, although its
-        // block verifies.
-        let at_salt_0 = |quoted: usize| {
-            let hunks = vec![VirtualBaseHunk::Resolved(quoted_blocks(quoted, 1)), block()];
-            Draft::new(hunks).write(NAMES, 0, &HashSet::new())
-        };
-        assert_eq!(
-            blocks(&at_salt_0(1)).map(|blocks| sides(&blocks)),
-            Some(vec![vec![b"x\n" as &[u8], b"y\n"]])
-        );
-        assert!(blocks(&at_salt_0(8)).is_none());
-    }
-
-    #[test]
-    fn vb_with_any_byte_changed_is_not_vb() {
-        let content = vb(vec![
-            block(),
-            VirtualBaseHunk::Resolved(b"between\n".to_vec()),
-            block(),
-            VirtualBaseHunk::Resolved(b"after\n".to_vec()),
-        ]);
-        assert_eq!(blocks(&content).map(|blocks| blocks.len()), Some(2));
-        let changed = content.replace("after", "AFTER");
-        assert!(blocks(&changed).is_none());
-        let changed = content.replace("between", "BETWEEN");
-        assert!(blocks(&changed).is_none());
-    }
-
-    #[test]
-    fn the_hunk_level_reads_back() {
-        let tail = opening_tail(FileMergeHunkLevel::Word, NAMES);
-        assert_eq!(tail, format!("word {NAMES}"));
-        let by_word = virtual_base_content(vec![block()], &tail, &HashSet::new());
-        let by_line = vb(vec![block()]);
-        let levels = [
-            (&by_word, FileMergeHunkLevel::Word),
-            (&by_line, FileMergeHunkLevel::Line),
-        ];
-        for (content, hunk_level) in levels {
-            let blocks = blocks(content).expect("VB reads back");
-            assert_eq!(recorded_hunk_level(&blocks), hunk_level);
-            assert_eq!(blocks[0].names, NAMES.as_bytes());
-        }
-    }
-
-    #[test]
-    fn vb_that_does_not_read_back_is_written_as_m() {
+    /// V's terms: three files, `x`, `o` and `y`, with those labels, and the
+    /// merge options of a merge by line.
+    fn labeled_terms() -> (MergedTreeValue, Merge<String>, MergeOptions) {
         let file = |id: u8| {
             Some(TreeValue::File {
                 id: FileId::new(vec![id]),
@@ -1134,42 +824,73 @@ mod tests {
             hunk_level: FileMergeHunkLevel::Line,
             same_change: SameChange::Accept,
         };
-        let contents = |prefix: &[u8]| {
-            let content = |last: &str| BString::from([prefix, last.as_bytes()].concat());
-            Merge::from_vec(vec![content("x\n"), content("o\n"), content("y\n")])
-        };
-        let names = "file:01@x file:02@o file:03@y";
-        // VB of terms that differ at their last line, after text that quotes
-        // eight blocks: it reads back.
-        let written = virtual_base_file(
-            &base,
-            &labels,
-            Some(contents(&quoted_blocks(8, 0))),
-            &options,
-            &HashSet::new(),
-        );
-        let blocks_written = blocks(&written).expect("VB reads back");
-        assert_eq!(sides(&blocks_written), [[b"x\n" as &[u8], b"y\n"]]);
-        // No salt is above the highest one, so where the text quotes eight
-        // blocks at that salt, the reader tries them first, past its bound:
-        // VB would not read back, and the file is M.
-        let written = virtual_base_file(
-            &base,
-            &labels,
-            Some(contents(&quoted_blocks(8, u64::MAX))),
-            &options,
-            &HashSet::new(),
-        );
-        let blocks_written = blocks(&written).expect("M reads back");
-        let m_sides = names
-            .split(' ')
-            .map(|name| format!("{name}\n"))
-            .collect_vec();
-        let m_sides = m_sides.iter().map(|side| side.as_bytes()).collect_vec();
+        (base, labels, options)
+    }
+
+    /// The contents of [`labeled_terms`]: `prefix`, then `x`, `o` and `y`, so
+    /// that they conflict at their last line.
+    fn labeled_contents(prefix: &[u8]) -> Merge<BString> {
+        let content = |last: &str| BString::from([prefix, last.as_bytes()].concat());
+        Merge::from_vec(vec![content("x\n"), content("o\n"), content("y\n")])
+    }
+
+    /// Asserts that `written` is M that names [`labeled_terms`].
+    #[track_caller]
+    fn assert_m(written: &[u8]) {
+        let (base, _, _) = labeled_terms();
+        let blocks_written = blocks(written).expect("M reads back");
+        let m_sides = ["file:01@x\n", "file:02@o\n", "file:03@y\n"].map(str::as_bytes);
         assert_eq!(sides(&blocks_written), [m_sides]);
         assert_eq!(
             named_terms(&blocks_written).map(|named| named.terms),
             Some(base)
         );
+    }
+
+    #[test]
+    fn vb_that_does_not_read_back_is_written_as_m() {
+        let (base, labels, options) = labeled_terms();
+        let no_lines = HashSet::new();
+        // VB of terms that differ at their last line, after text that quotes
+        // eight blocks: it reads back.
+        let contents = labeled_contents(&quoted_blocks(8, 0));
+        let written = virtual_base_file(&base, &labels, Some(contents), &options, &no_lines);
+        let written = written.expect("a salt is free");
+        let blocks_written = blocks(&written).expect("VB reads back");
+        assert_eq!(sides(&blocks_written), [[b"x\n" as &[u8], b"y\n"]]);
+        // No salt is above the highest one, so where the text quotes eight
+        // blocks at that salt, the reader tries them first, past its bound:
+        // VB would not read back, and the file is M.
+        let contents = labeled_contents(&quoted_blocks(8, u64::MAX));
+        let written = virtual_base_file(&base, &labels, Some(contents), &options, &no_lines);
+        assert_m(&written.expect("a salt is free"));
+    }
+
+    #[test]
+    fn vb_with_no_salt_left_is_written_as_m() {
+        // V's text holds a line in the form of an opening marker line at salt
+        // 2^64-2, so the writer's first salt is 2^64-1, the last one; or at
+        // 2^64-1, and the writer takes that salt too, as none is above it. VB
+        // reads back at that salt, but where a parent holds VB's separator
+        // line there, no salt is left for VB, and the file is M.
+        let (base, labels, options) = labeled_terms();
+        for salt in [u64::MAX - 1, u64::MAX] {
+            let [opening, _, _] = marker_lines(&"0123456789abcdef".repeat(2), salt, "x");
+            let contents = labeled_contents(format!("{opening}\n").as_bytes());
+            let no_lines = HashSet::new();
+            let written =
+                virtual_base_file(&base, &labels, Some(contents.clone()), &options, &no_lines);
+            let written = written.expect("a salt is free");
+            let blocks_written = blocks(&written).expect("VB reads back");
+            assert_eq!(sides(&blocks_written), [[b"x\n" as &[u8], b"y\n"]]);
+            let separator = written
+                .lines()
+                .find(|line| line.starts_with(SEPARATOR.as_bytes()))
+                .expect("VB's separator line");
+            let parent_lines = HashSet::from([separator]);
+            let written =
+                virtual_base_file(&base, &labels, Some(contents), &options, &parent_lines);
+            assert_m(&written.expect("M's salt 0 is free"));
+        }
     }
 }

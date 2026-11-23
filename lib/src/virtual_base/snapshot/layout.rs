@@ -15,7 +15,6 @@
 //! VB laid out over the hunks of the merge of V's terms, and the changes to
 //! VB made to those terms (see the documentation of [`super`]).
 
-use std::collections::HashSet;
 use std::iter::zip;
 use std::ops::Range;
 
@@ -23,11 +22,10 @@ use bstr::BString;
 use bstr::ByteSlice as _;
 use itertools::Itertools as _;
 
-use super::super::Block;
+use super::super::blocks::BlockFinder;
+use super::super::blocks::is_marker_form;
 use super::edits::Edit;
 use super::edits::Text;
-use super::edits::held_blocks;
-use super::edits::is_marker_form;
 use crate::files;
 use crate::files::RangedMergeHunk;
 use crate::merge::Merge;
@@ -37,8 +35,8 @@ use crate::tree_merge::MergeOptions;
 /// range of VB, its merged text where it resolves and a block where it
 /// conflicts.
 pub(super) struct Layout<'a> {
-    vb: &'a [u8],
-    blocks: &'a [Block<'a>],
+    /// VB and its blocks.
+    finder: &'a BlockFinder<'a>,
     /// The texts of V's terms.
     contents: &'a Merge<BString>,
     /// The hunks of the merge of V's terms, before the ones that resolve are
@@ -49,8 +47,6 @@ pub(super) struct Layout<'a> {
     segments: Vec<Segment>,
     /// The index of the hunk of each block.
     block_hunks: Vec<usize>,
-    /// The marker lines of VB's blocks.
-    marker_lines: HashSet<&'a [u8]>,
 }
 
 /// The range of VB that a hunk takes, and the index of its block where it
@@ -79,17 +75,17 @@ struct TermEdit {
 }
 
 impl<'a> Layout<'a> {
-    /// `vb`, whose blocks are `blocks`, laid out over the hunks of the merge
+    /// VB, whose blocks `finder` finds, laid out over the hunks of the merge
     /// of V's terms, whose texts are `contents`, merged with `options`.
-    /// `None` where `vb` does not hold each hunk's merged text, or each
-    /// conflicting hunk's sides in a block, in order: `vb` is then not the VB
+    /// `None` where VB does not hold each hunk's merged text, or each
+    /// conflicting hunk's sides in a block, in order: VB is then not the VB
     /// of `contents` at those options.
     pub(super) fn new(
-        vb: &'a [u8],
-        blocks: &'a [Block<'a>],
+        finder: &'a BlockFinder<'a>,
         contents: &'a Merge<BString>,
         options: &MergeOptions,
     ) -> Option<Self> {
+        let (vb, blocks) = (finder.vb, finder.blocks);
         let hunks = files::split_ranged_hunks(contents, options);
         let mut segments = Vec::with_capacity(hunks.len());
         let mut block_hunks = Vec::with_capacity(blocks.len());
@@ -126,30 +122,12 @@ impl<'a> Layout<'a> {
         if cursor != vb.len() || block_hunks.len() != blocks.len() {
             return None;
         }
-        let marker_lines = blocks
-            .iter()
-            .flat_map(|block| {
-                let mut at = block.start;
-                let sides = block.side_ranges.iter();
-                let mut lines = sides
-                    .map(|side| {
-                        let line = &vb[at..side.start];
-                        at = side.end;
-                        line
-                    })
-                    .collect_vec();
-                lines.push(&vb[at..block.end]);
-                lines
-            })
-            .collect();
         Some(Self {
-            vb,
-            blocks,
+            finder,
             contents,
             hunks,
             segments,
             block_hunks,
-            marker_lines,
         })
     }
 
@@ -255,7 +233,7 @@ impl<'a> Layout<'a> {
         if touched.next().is_some() {
             return None;
         }
-        let block = &self.blocks[self.segments[hunk].block?];
+        let block = &self.finder.blocks[self.segments[hunk].block?];
         let side = block
             .side_ranges
             .iter()
@@ -334,16 +312,16 @@ impl<'a> Layout<'a> {
 
     /// `range` of VB without the marker lines of VB's blocks.
     fn unmarked(&self, range: Range<usize>) -> Vec<u8> {
-        self.vb[range]
+        self.finder.vb[range]
             .lines_with_terminator()
-            .filter(|line| !self.marker_lines.contains(line))
+            .filter(|line| !self.finder.is_marker_line(line))
             .collect_vec()
             .concat()
     }
 
     /// `text` as it goes into the term at `term`. In the ranges of it that
     /// came from the base of a conflict that the person kept, a whole block
-    /// of VB (see [`held_blocks`]) stands for the term's own text at the
+    /// of VB (see [`BlockFinder::held`]) stands for the term's own text at the
     /// block's hunk, and any other line in the form of a marker line is left
     /// out. The rest is the person's text, whatever its lines look like.
     fn term_text(&self, text: &Text, term: usize) -> Vec<u8> {
@@ -359,7 +337,7 @@ impl<'a> Layout<'a> {
         for base in &text.of_base {
             result.extend_from_slice(&text.bytes[at..base.start]);
             at = base.start;
-            for (copy, block) in held_blocks(self.vb, self.blocks, &text.bytes, base.clone()) {
+            for (copy, block) in self.finder.held(&text.bytes, base.clone()) {
                 unmarked(&text.bytes[at..copy.start], &mut result);
                 let ranges = &self.hunks[self.block_hunks[block]].ranges;
                 let own = &self.contents.as_slice()[term][ranges.as_slice()[term].clone()];
@@ -381,7 +359,9 @@ impl<'a> Layout<'a> {
     fn side_edit(&self, hunk: usize, side: usize, edit: &Edit) -> TermEdit {
         let term = 2 * side;
         let term_range = &self.hunks[hunk].ranges.as_slice()[term];
-        let block = self.segments[hunk].block.map(|block| &self.blocks[block]);
+        let block = self.segments[hunk]
+            .block
+            .map(|block| &self.finder.blocks[block]);
         let side_range = block.map_or(edit.range.clone(), |block| block.side_ranges[side].clone());
         let (start, end) = (edit.range.start, edit.range.end);
         let (from, to) = (start - side_range.start, end - side_range.start);
