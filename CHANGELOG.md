@@ -96,18 +96,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the conflicts that every virtual merge base there stands for in their
   place, and a rebase takes the merges of the old and the new parents there as
   their terms, not as the text they resolve to. A snapshot of such a conflict
-  writes the lines the person changed into those terms, splitting the file
-  into hunks at `merge.hunk-level` as the merge does; a line that looks like a
-  marker line is the person's text. A squash of a merge of three or more
-  commits into a descendant merges the descendant's rebase and the squashed
-  changes as one merge, so the changes no longer bring back a merge base's
-  own base that the rebase resolved away. A merge is refused, and writes
-  nothing, where it would replace more than 10,000 virtual merge bases at one
-  path, or more than 10,000 in all and 100 for each path where it replaces
-  one: files that pass as virtual merge bases can stand for that many, and so
-  can a history that is both deep and wide (a braid of 202 criss-cross levels
-  over 100 files needs about 201 at each path, more than 20,000 in all, where
-  jj 0.45.1 completes).
+  writes the lines the person changed into those terms, laid out at the hunk
+  level that the virtual merge base records, and lines up the file the person
+  left with the conflict by a line diff, so that a conflict the person
+  resolved or deleted goes into every term; a line that looks like a marker
+  line is the person's text. Where a term of the conflict is not a file (a
+  symlink, a submodule or a directory), a snapshot leaves it as it is, so a
+  later merge keeps the person's change only in the terms that are files. A
+  squash of a merge of three or more commits into a descendant, through
+  commits with one parent each, merges the descendant's rebase and the
+  squashed changes as one merge at each path where it replaces a virtual
+  merge base, so the changes there no longer bring back a merge base's own
+  base that the rebase resolved away; every other path is squashed as
+  before. A merge is refused, and writes nothing, where it would replace more
+  than 10,000 virtual merge bases at one path, or more than 10,000 in all and
+  100 for each path where it replaces one: files that pass as virtual merge
+  bases can stand for that many, and so can a history that is both deep and
+  wide (a braid of 202 criss-cross levels over 100 files needs about 201 at
+  each path, more than 20,000 in all, where jj 0.45.1 completes).
   Merge bases, and the parents of a merge of three or more commits, are
   merged in the order of their commit ids. This affects criss-cross histories,
   and merges whose base is itself conflicted.

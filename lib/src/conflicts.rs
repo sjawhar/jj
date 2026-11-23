@@ -1071,7 +1071,10 @@ pub async fn update_from_content(
     let simplified_file_ids = file_ids.simplify();
 
     let old_contents = extract_as_single_hunk(&simplified_file_ids, store, path).await?;
-    let old_hunks = files::merge_hunks(&old_contents, store.merge_options());
+    // The old hunks, each with the range of each term, which a base that is a
+    // virtual merge base reads to map the changes onto the terms it names.
+    let old_ranged_hunks = files::ranged_merge_hunks(&old_contents, store.merge_options());
+    let old_hunks = files::ranged_merge_result(&old_contents, &old_ranged_hunks);
 
     // Parse conflicts from the new content using the arity of the simplified
     // conflicts.
@@ -1126,21 +1129,19 @@ pub async fn update_from_content(
     // A base that is a virtual merge base stands for the terms of the conflict
     // it names, so a change to it is a change to those terms.
     let write_base = async |index: usize, content: &Vec<u8>, file_id: &Option<FileId>| {
-        if let Some(old_id) = file_id {
-            let contents = contents.iter().map(Vec::as_slice);
-            if let Some(file_id) = virtual_base::rewrite_virtual_base(
+        if let Some(old_id) = file_id
+            && let Some(file_id) = virtual_base::rewrite_virtual_base(
                 store,
                 path,
                 old_id,
                 &old_contents,
+                &old_ranged_hunks,
                 index,
                 &hunks,
-                contents,
             )
             .await?
-            {
-                return Ok(Some(file_id));
-            }
+        {
+            return Ok(Some(file_id));
         }
         write(content, file_id).await
     };
