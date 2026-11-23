@@ -52,6 +52,8 @@ use jj_lib::backend::MergedTreeValue;
 use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
+use jj_lib::config::ConfigLayer;
+use jj_lib::config::ConfigSource;
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::conflicts::ConflictMaterializeOptions;
@@ -69,10 +71,12 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::rewrite::CommitWithSelection;
 use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::rewrite::merge_commit_trees_no_resolve;
 use jj_lib::rewrite::rebase_commit;
+use jj_lib::rewrite::squash_commits;
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
@@ -629,6 +633,19 @@ fn k4_history(made: Made) -> TestResult<TwoBases> {
         made,
         &[("f", line("x"))],
         &[("f", line("y"))],
+    )
+}
+
+/// VB6's history: A replaces line 1 of ten by `x1` and `x2`, B by `y1`; P1
+/// keeps A's text, and P2 adds `Q` and `W` to it.
+fn vb6_history() -> TestResult<TwoBases> {
+    two_bases(
+        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
+        Made::AFirst,
+        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
+        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
     )
 }
 
@@ -2062,6 +2079,40 @@ fn assert_edits_survive_expansion(edits: &[(&str, &str)]) -> TestResult {
 /// file that jj materializes for the conflict and snapshotted in turn, as jj
 /// snapshots a working copy.
 fn snapshot_edits(case: &Case, w: &Commit, edits: &[(&str, &str)]) -> TestResult<MergedTreeValue> {
+    let mut edits = edits.iter();
+    snapshot_in_turn(case, w, |working_copy, _| {
+        let (line, replacement) = edits.next()?;
+        Some(if line.is_empty() {
+            format!("{working_copy}{replacement}\n")
+        } else {
+            let (from, to) = (format!("\n{line}\n"), format!("\n{replacement}\n"));
+            working_copy.replacen(&from, &to, 1)
+        })
+    })
+}
+
+/// The value at `f` of `w`, a conflict, once `edit` has rewritten the file
+/// that jj materializes for the conflict, given with its conflict markers'
+/// length, and it is snapshotted, as jj snapshots a working copy.
+fn snapshot_text(
+    case: &Case,
+    w: &Commit,
+    edit: impl FnOnce(&str, usize) -> String,
+) -> TestResult<MergedTreeValue> {
+    let mut edit = Some(edit);
+    snapshot_in_turn(case, w, |working_copy, marker_len| {
+        edit.take().map(|edit| edit(working_copy, marker_len))
+    })
+}
+
+/// The value at `f` of `w`, a conflict, once the file that jj materializes
+/// for the conflict is rewritten by `next`, given the file and its conflict
+/// markers' length, and snapshotted, in turn until `next` gives `None`.
+fn snapshot_in_turn(
+    case: &Case,
+    w: &Commit,
+    mut next: impl FnMut(&str, usize) -> Option<String>,
+) -> TestResult<MergedTreeValue> {
     let store = case.store().clone();
     let mut file_ids = value_at(&w.tree(), "f")?
         .to_file_merge()
@@ -2076,13 +2127,7 @@ fn snapshot_edits(case: &Case, w: &Commit, edits: &[(&str, &str)]) -> TestResult
         materialize_merge_result_to_bytes(&contents, &ConflictLabels::unlabeled(), &options).into(),
     )?;
     let marker_len = choose_materialized_conflict_marker_len(&contents);
-    for (line, replacement) in edits {
-        let edited = if line.is_empty() {
-            format!("{working_copy}{replacement}\n")
-        } else {
-            let (from, to) = (format!("\n{line}\n"), format!("\n{replacement}\n"));
-            working_copy.replacen(&from, &to, 1)
-        };
+    while let Some(edited) = next(&working_copy, marker_len) {
         assert_ne!(edited, working_copy);
         working_copy = edited;
         let content = working_copy.as_bytes();
@@ -2151,14 +2196,7 @@ fn vb5b_an_edit_where_the_merge_bases_merge_survives_expansion() -> TestResult {
 fn vb6_an_edit_where_the_opening_line_resolves_keeps_every_marker_line() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
-    } = two_bases(
-        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
-        Made::AFirst,
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
-    )?;
+    } = vb6_history()?;
     let w = case.commit(&[&p1, &p2], &[])?;
     let new_value = snapshot_edits(&case, &w, &[("5", "FIVE")])?;
     let w_value = new_value.clone();
@@ -2257,14 +2295,7 @@ fn k4_append_goes_into_each_term_of_v() -> TestResult {
 /// holds a marker line.
 #[test]
 fn x1_append_keeps_every_marker_line() -> TestResult {
-    let history = two_bases(
-        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
-        Made::AFirst,
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
-    )?;
+    let history = vb6_history()?;
     let merged = append_then_rebase(
         history,
         lines("x1 x2 2 3 4 5 6 7 8 9 10 END"),
@@ -2282,14 +2313,7 @@ fn x1_append_keeps_every_marker_line() -> TestResult {
 fn x1_restore_into_p1_keeps_d() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
-    } = two_bases(
-        &[("f", lines("1 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("y1 2 3 4 5 6 7 8 9 10"))],
-        Made::AFirst,
-        &[("f", lines("x1 x2 2 3 4 5 6 7 8 9 10"))],
-        &[("f", lines("x1 Q x2 W 2 3 4 5 6 7 8 9 10"))],
-    )?;
+    } = vb6_history()?;
     let d_text = "x1 Q x2 W 2 3 4 FIVE 6 7 8 9 10";
     let d = case.commit(&[&p1, &p2], &[("f", lines(d_text))])?;
     let merged = amend_and_rebase(case, &p1, &[("f", lines(d_text))], &d)?;
@@ -2573,9 +2597,9 @@ fn base_chain_rebase(
 }
 
 /// Two chains of 13 levels at two paths, 8,191 replacements each, under the
-/// bound at one path: one alone is rewritten, but together they pass the
-/// bound of the merge, 10,000 and 100 for each of its 2 paths, so the rebase
-/// fails at the second path, naming that bound.
+/// limit at one path: one alone is rewritten, but together they pass the
+/// limit of the merge, 10,000 and 100 for each of its 2 paths, so the rebase
+/// fails, naming that limit and the path where it stopped.
 #[test]
 fn planted_chains_at_two_paths_are_refused_together() -> TestResult {
     let (_case, alone, _) = base_chain_rebase(&[("f", 13)])?;
@@ -2586,8 +2610,10 @@ fn planted_chains_at_two_paths_are_refused_together() -> TestResult {
     };
     assert_eq!(
         err.to_string(),
-        "The merge at g names more than 10200 virtual bases in all, the bound of a merge that \
-         replaces them at 2 paths"
+        "Refused to merge: across 2 paths the merge would replace more than 10200 virtual merge \
+         bases (the limit is 10000 and 100 for each path where it replaces one); it stopped at g. \
+         Files that pass as virtual merge bases can stand for that many, and so can a history \
+         that is both deep and wide; no change was made"
     );
     Ok(())
 }
@@ -2603,7 +2629,9 @@ fn planted_chain_named_as_bases_is_refused() -> TestResult {
     };
     assert_eq!(
         err.to_string(),
-        "The merge at f names more than 10000 virtual bases at that path, the bound at one path"
+        "Refused to merge: at f the merge would replace more than 10000 virtual merge bases (the \
+         limit at one path). Files that pass as virtual merge bases can stand for that many, and \
+         so can a history that is both deep and wide; no change was made"
     );
     assert!(
         elapsed < Duration::from_secs(5),
@@ -2897,6 +2925,306 @@ fn vb5d_an_edit_reaches_v_where_the_files_end_without_a_newline() -> TestResult 
     });
     assert_same_value(&case, &value, &conflict(&[&x, &o, &y]));
     Ok(())
+}
+
+/// Asserts that each term of `value` holds the line `line`.
+fn assert_every_term_holds(case: &Case, value: &MergedTreeValue, line: &str) {
+    for term in value {
+        let content = case.read(term.as_ref()).unwrap_or_default();
+        assert!(
+            text_lines(&content).contains(&line),
+            "a term without {line:?}: {}",
+            describe(case, value)
+        );
+    }
+}
+
+/// A line the person writes is text, whatever it looks like: K4 with its
+/// conflict at the last line, k, the merge of P1 and P2, left conflicted with
+/// line 2 edited to a line shaped like a separator line of VB, and s and u,
+/// children of k that hold P1's and P2's text with that line. u rebased onto s
+/// is a conflict, and every term holds the line, as jj 0.45.1 gives.
+#[test]
+fn a_marker_shaped_line_in_a_snapshot_reaches_every_term() -> TestResult {
+    const MARKER_SHAPED: &str = "======= 0123456789abcdef0123456789abcdef";
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6"))],
+        &[("f", lines("1 2 3 4 5 x"))],
+        &[("f", lines("1 2 3 4 5 y"))],
+        Made::AFirst,
+        &[("f", lines("1 2 3 4 5 x"))],
+        &[("f", lines("1 2 3 4 5 y"))],
+    )?;
+    let k = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &k, &[("2", MARKER_SHAPED)])?;
+    let k = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let text = |last: &str| Some(format!("1\n{MARKER_SHAPED}\n3\n4\n5\n{last}\n").into_bytes());
+    let s = case.commit(&[&k], &[("f", text("x"))])?;
+    let u = case.commit(&[&k], &[("f", text("y"))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?.simplify();
+    assert_eq!(value.num_sides(), 2, "{}", describe(&case, &value));
+    assert_every_term_holds(&case, &value, MARKER_SHAPED);
+    Ok(())
+}
+
+/// The snapshot splits a conflict into hunks as every merge of contents does,
+/// at the store's hunk level. With `merge.hunk-level=word`: A and B change
+/// line 1 of `o` to `x` and `y`, P1 also changes `a` to `A` in line 3 and P2
+/// `c` to `C`, so that line merges by word in k, the merge of P1 and P2, left
+/// conflicted with line 5 edited to `FIVE`. s and u, children of k, hold P1's
+/// and P2's text with `FIVE`; u rebased onto s is a conflict, and every term
+/// holds `FIVE`, as jj 0.45.1 gives.
+#[test]
+fn a_snapshot_at_word_level_reaches_every_term() -> TestResult {
+    let mut config = testutils::base_user_config();
+    let mut layer = ConfigLayer::empty(ConfigSource::User);
+    layer.set_value("merge.hunk-level", "word")?;
+    config.add_layer(layer);
+    let mut case = Case::with_settings(&testutils::user_settings_from_config(config));
+    let text = |text: &str| Some(text.replace(' ', "\n").replace('_', " ").into_bytes());
+    let root = case.root();
+    let o = case.commit(&[&root], &[("f", text("1 2 a_b_c 4 5 6 "))])?;
+    let a = case.commit(&[&o], &[("f", text("x 2 a_b_c 4 5 6 "))])?;
+    let b = case.commit(&[&o], &[("f", text("y 2 a_b_c 4 5 6 "))])?;
+    let p1 = case.commit(&[&a, &b], &[("f", text("x 2 A_b_c 4 5 6 "))])?;
+    let p2 = case.commit(&[&a, &b], &[("f", text("y 2 a_b_C 4 5 6 "))])?;
+    let k = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &k, &[("5", "FIVE")])?;
+    let k = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&k], &[("f", text("x 2 A_b_c 4 FIVE 6 "))])?;
+    let u = case.commit(&[&k], &[("f", text("y 2 a_b_C 4 FIVE 6 "))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?.simplify();
+    assert!(!value.is_resolved(), "{}", describe(&case, &value));
+    assert_every_term_holds(&case, &value, "FIVE");
+    Ok(())
+}
+
+/// A snapshot of a conflict whose base passes as VB but names another such
+/// file as a side, which no merge writes: the base is not VB, so the snapshot
+/// writes it as the plain text the person left, here with a line appended.
+#[test]
+fn snapshot_of_a_base_naming_a_virtual_base_as_a_side_writes_plain_text() -> TestResult {
+    let mut case = Case::new();
+    let [x, o, y, s1, s2] = ["x", "o", "y", "s1", "s2"].map(|value| case.text(value));
+    let names = |first: &Option<TreeValue>| {
+        format!(
+            "{} {} {}",
+            file_name(first.as_ref()),
+            file_name(o.as_ref()),
+            file_name(y.as_ref())
+        )
+    };
+    let inner = file_value(&case, &crafted_virtual_base(&names(&x), &[b"x\n", b"y\n"]))?;
+    let outer_content = crafted_virtual_base(&names(&inner), &[b"s\n"]);
+    let outer = file_value(&case, &outer_content)?;
+    let root = case.root();
+    let base_value = conflict(&[&s1, &outer, &s2]);
+    let w = case.commit_with_values(&[&root], vec![(repo_path_buf("f"), base_value)])?;
+    let value = snapshot_edits(&case, &w, &[("", "END")])?.simplify();
+    let removes = value.removes().collect_vec();
+    let [base] = removes[..] else {
+        panic!("expected one base, got {}", describe(&case, &value));
+    };
+    let expected = [outer_content, b"END\n".to_vec()].concat();
+    assert_eq!(case.read(base.as_ref()), Some(expected));
+    assert_no_side_marked(&case, &value);
+    Ok(())
+}
+
+/// A snapshot whose hunks do not match the conflict's: VB has two blocks, and
+/// the person resolves the first of the conflict's two conflicts by hand. The
+/// base keeps the old VB, and no side holds a marker line.
+#[test]
+fn snapshot_that_resolves_one_of_two_conflicts_keeps_the_virtual_base() -> TestResult {
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6"))],
+        &[("f", lines("x 2 3 4 5 a"))],
+        &[("f", lines("y 2 3 4 5 b"))],
+        Made::AFirst,
+        &[("f", lines("x 2 3 4 5 a"))],
+        &[("f", lines("y 2 3 4 5 b"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let value = value_at(&w.tree(), "f")?.simplify();
+    let edited = snapshot_text(&case, &w, |working_copy, marker_len| {
+        let start = working_copy.find(&"<".repeat(marker_len)).unwrap();
+        let close = start + working_copy[start..].find(&">".repeat(marker_len)).unwrap();
+        let end = close + working_copy[close..].find('\n').unwrap() + 1;
+        format!("{}x\n{}", &working_copy[..start], &working_copy[end..])
+    })?
+    .simplify();
+    assert_eq!(
+        edited.removes().collect_vec(),
+        value.removes().collect_vec()
+    );
+    assert_no_side_marked(&case, &edited);
+    Ok(())
+}
+
+/// A snapshot of a conflict whose base passes as VB of real terms but is not
+/// their merge (its one block holds one side, `s`): the edit cannot be laid out
+/// over V's terms, so the base keeps it, and no side holds a marker line.
+#[test]
+fn snapshot_of_a_virtual_base_that_is_not_its_terms_merge_keeps_it() -> TestResult {
+    let mut case = Case::new();
+    let [x, o, y, s1, s2] = ["x", "o", "y", "s1", "s2"].map(|value| case.text(value));
+    let names = format!(
+        "{} {} {}",
+        file_name(x.as_ref()),
+        file_name(o.as_ref()),
+        file_name(y.as_ref())
+    );
+    let base = file_value(&case, &crafted_virtual_base(&names, &[b"s\n"]))?;
+    let root = case.root();
+    let base_value = conflict(&[&s1, &base, &s2]);
+    let w = case.commit_with_values(&[&root], vec![(repo_path_buf("f"), base_value)])?;
+    let value = snapshot_edits(&case, &w, &[("", "END")])?.simplify();
+    assert_eq!(value.removes().collect_vec(), [&base]);
+    assert_no_side_marked(&case, &value);
+    Ok(())
+}
+
+/// A snapshot after which V's edited terms resolve to a value that is not a
+/// file: A sets `f` to a symlink and B to an empty file where o has none, so
+/// V is `[symlink, -absent, empty]` and the base of P1's and P2's conflict is
+/// M. A line appended in the working copy goes into the absent term and the
+/// empty file alike, which then cancel, leaving the symlink: the base keeps
+/// M, and no side holds a marker line.
+#[test]
+fn snapshot_after_which_v_resolves_to_a_symlink_keeps_m() -> TestResult {
+    let mut case = Case::new();
+    let root = case.root();
+    let o = case.commit(&[&root], &[("g", line("o"))])?;
+    let symlink_id = case.store().write_symlink(f(), "target").block_on()?;
+    let symlink = Merge::normal(TreeValue::Symlink(symlink_id));
+    let a = case.commit_with_values(&[&o], vec![(repo_path_buf("f"), symlink)])?;
+    let b = case.commit(&[&o], &[("f", Some(vec![]))])?;
+    let p1 = case.commit(&[&a, &b], &[("f", line("p1"))])?;
+    let p2 = case.commit(&[&a, &b], &[("f", line("p2"))])?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let value = value_at(&w.tree(), "f")?.simplify();
+    let removes = value.removes().collect_vec();
+    let [base] = removes[..] else {
+        panic!("expected one base, got {}", describe(&case, &value));
+    };
+    let TreeValue::File { id, .. } = base.as_ref().expect("a file base") else {
+        panic!("expected a file base, got {}", describe(&case, &value));
+    };
+    let m = read_file(case.store(), f(), id);
+    assert!(
+        holds_any_marker(&m),
+        "expected M, got {}",
+        describe(&case, &value)
+    );
+    let edited = snapshot_edits(&case, &w, &[("", "END")])?.simplify();
+    assert_eq!(edited.removes().collect_vec(), [base]);
+    assert_no_side_marked(&case, &edited);
+    Ok(())
+}
+
+/// The three merge bases A, B and C of merge-grid's t3 and t3x histories.
+#[derive(Clone, Copy, Debug)]
+enum ThreeBases {
+    /// A `x`, B `y` and C `w`, children of o.
+    T3,
+    /// A `x` and B `y`, children of o1, and C `x`, a child of o2; o1 and o2
+    /// are children of r.
+    T3x,
+}
+
+/// The value at `f` of d once P1 is squashed into it, as `jj squash --from P1
+/// --into d -u` does, where P1 and P2, merges of the merge bases of `history`,
+/// hold `x` and `y`, and d, their merge, holds `y`. The merge base at `highest`
+/// (0 for A, 1 for B, 2 for C) is made again until its commit id is the
+/// highest of the three, so that P1's parents are merged with the other two
+/// first.
+fn squash_p1_into_d(history: ThreeBases, highest: usize) -> TestResult<(Case, MergedTreeValue)> {
+    let mut case = Case::new();
+    let root = case.root();
+    let mut bases = match history {
+        ThreeBases::T3 => {
+            let o = case.commit(&[&root], &[("f", line("o"))])?;
+            vec![
+                case.commit(&[&o], &[("f", line("x"))])?,
+                case.commit(&[&o], &[("f", line("y"))])?,
+                case.commit(&[&o], &[("f", line("w"))])?,
+            ]
+        }
+        ThreeBases::T3x => {
+            let r = case.commit(&[&root], &[("f", line("r"))])?;
+            let o1 = case.commit(&[&r], &[("f", line("o1"))])?;
+            let o2 = case.commit(&[&r], &[("f", line("o2"))])?;
+            vec![
+                case.commit(&[&o1], &[("f", line("x"))])?,
+                case.commit(&[&o1], &[("f", line("y"))])?,
+                case.commit(&[&o2], &[("f", line("x"))])?,
+            ]
+        }
+    };
+    let mut attempt = 0;
+    while bases.iter().any(|base| base.id() > bases[highest].id()) {
+        attempt += 1;
+        let again = case
+            .tx
+            .repo_mut()
+            .rewrite_commit(&bases[highest])
+            .set_description(format!("made again {attempt}"))
+            .write_unwrap();
+        bases[highest] = again;
+    }
+    let parents = bases.iter().collect_vec();
+    let p1 = case.commit(&parents, &[("f", line("x"))])?;
+    let p2 = case.commit(&parents, &[("f", line("y"))])?;
+    let d = case.commit(&[&p1, &p2], &[("f", line("y"))])?;
+    let source = CommitWithSelection {
+        parent_tree: p1.parent_tree(case.tx.repo()).block_on()?,
+        selected_tree: p1.tree(),
+        commit: p1,
+    };
+    let squashed = squash_commits(case.tx.repo_mut(), &[source], &d, false)
+        .block_on()?
+        .expect("a squash");
+    let d = squashed.commit_builder.write().block_on()?;
+    let value = value_at(&d.tree(), "f")?.simplify();
+    Ok((case, value))
+}
+
+/// Asserts that P1, a merge of the three merge bases of `history`, squashed
+/// into d, its merge with P2, leaves d with `x` or `y`, values that d or its
+/// parents held, or a conflict, whichever merge base has the highest commit
+/// id.
+fn assert_squash_of_p1_into_d_keeps_a_held_value(history: ThreeBases) -> TestResult {
+    for highest in 0..3 {
+        let (case, value) = squash_p1_into_d(history, highest)?;
+        let held = [case.text("x"), case.text("y")];
+        assert!(
+            value.as_resolved().is_none_or(|value| held.contains(value)),
+            "{history:?} with merge base {highest} highest: {}",
+            describe(&case, &value)
+        );
+    }
+    Ok(())
+}
+
+/// t3: P1 squashed into d gives `y` or a conflict, never the merge bases' own
+/// base `o`, which jj 0.45.1 gives.
+#[test]
+fn t3_squash_of_a_merge_of_three_into_its_child_keeps_a_held_value() -> TestResult {
+    assert_squash_of_p1_into_d_keeps_a_held_value(ThreeBases::T3)
+}
+
+/// t3x: P1 squashed into d gives `y` or a conflict, never `o1`, the base of A
+/// and B, which the release from the fork's previous head gave where B has
+/// the highest commit id, so that A and C, both `x`, merge first.
+#[test]
+fn t3x_squash_of_a_merge_of_three_into_its_child_keeps_a_held_value() -> TestResult {
+    assert_squash_of_p1_into_d_keeps_a_held_value(ThreeBases::T3x)
 }
 
 /// An edit of a block's side after which V's terms merge: the base is their

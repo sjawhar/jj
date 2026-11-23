@@ -44,8 +44,6 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::iter;
-use std::iter::Peekable;
 use std::iter::zip;
 use std::mem;
 use std::ops::Range;
@@ -69,9 +67,6 @@ use crate::backend::SymlinkId;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::conflict_labels::ConflictLabels;
-use crate::diff::ContentDiff;
-use crate::diff::DiffHunkKind;
-use crate::diff::DiffHunkRange;
 use crate::files;
 use crate::files::MergeResult;
 use crate::files::is_binary_content;
@@ -81,6 +76,18 @@ use crate::merge::SameChange;
 use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
+use crate::tree_merge::MergeOptions;
+
+mod expand;
+mod snapshot;
+
+pub(crate) use expand::Expansion;
+pub(crate) use expand::NamedTermsCache;
+pub(crate) use expand::Replacements;
+pub(crate) use expand::Substitute;
+pub(crate) use expand::append_pairs;
+pub(crate) use expand::replaces_at;
+pub(crate) use snapshot::rewrite_virtual_base;
 
 /// The tag that the hash of every block starts with.
 const TAG: &str = "jj virtual merge base";
@@ -152,14 +159,27 @@ pub async fn virtual_merge_base(
 /// the writer hashes it, with the salt that the block carries. Text that no
 /// merge wrote is neither VB nor M, nor is VB or M with any byte changed.
 pub fn virtual_base_terms(content: &[u8]) -> Option<MergedTreeValue> {
-    named_terms(content).map(|(terms, _)| terms)
+    parse_named_terms(content).map(|named| named.terms)
+}
+
+/// The terms of V that VB or M names, each with the label of the commit it
+/// comes from.
+#[derive(Clone, Debug)]
+pub(crate) struct NamedTerms {
+    pub(crate) terms: MergedTreeValue,
+    pub(crate) labels: Merge<String>,
 }
 
 /// The terms of V that `content` names, with their labels, if `content` is
 /// VB or M (see [`virtual_base_terms`]).
-fn named_terms(content: &[u8]) -> Option<(MergedTreeValue, Merge<String>)> {
-    let blocks = blocks(content)?;
-    let [first, ..] = &blocks[..] else {
+fn parse_named_terms(content: &[u8]) -> Option<NamedTerms> {
+    verified_named_terms(content, &blocks(content)?)
+}
+
+/// The terms of V that `content`, whose blocks are `blocks`, names, with their
+/// labels, if it is VB or M (see [`virtual_base_terms`]).
+fn verified_named_terms(content: &[u8], blocks: &[Block<'_>]) -> Option<NamedTerms> {
+    let [first, ..] = blocks else {
         return None;
     };
     let names = first.terms;
@@ -191,7 +211,10 @@ fn named_terms(content: &[u8]) -> Option<(MergedTreeValue, Merge<String>)> {
         }
         text_start = block.end;
     }
-    Some((Merge::from_vec(terms), Merge::from_vec(labels)))
+    Some(NamedTerms {
+        terms: Merge::from_vec(terms),
+        labels: Merge::from_vec(labels),
+    })
 }
 
 /// The terms of V that `value` stands for, with their labels, if `value` is
@@ -201,725 +224,15 @@ pub(crate) async fn stored_virtual_base_terms(
     store: &Store,
     path: &RepoPath,
     value: &TreeValue,
-) -> BackendResult<Option<(MergedTreeValue, Merge<String>)>> {
+) -> BackendResult<Option<NamedTerms>> {
     let TreeValue::File { id, .. } = value else {
         return Ok(None);
     };
     let content = read_file(store, path, id).await?;
-    match named_terms(&content) {
-        Some((terms, labels)) if holds_terms(store, path, &terms).await? => {
-            Ok(Some((terms, labels)))
-        }
+    match parse_named_terms(&content) {
+        Some(named) if holds_terms(store, path, &named.terms).await? => Ok(Some(named)),
         _ => Ok(None),
     }
-}
-
-/// The file that takes the place of the base at `index` of `old_contents`,
-/// the contents of the terms of a conflict at `path` whose base `old_id` is
-/// VB or M, once a parse of the conflict's materialized markers (a snapshot of
-/// the working copy, or a merge tool's output) gave the hunks `new_hunks`;
-/// `None` where that base is not VB or M.
-///
-/// The person changed the file that jj materialized, not the terms. A change
-/// to a hunk that resolves and covers whole blocks of VB replaces that hunk's
-/// region of VB with the new text, which then goes into every term of V there,
-/// as jj's snapshot writes a resolved hunk into every term. Each change to
-/// another hunk that resolves, a line diff of the hunk as jj materialized it
-/// against the new hunk, is made to VB at the VB lines that the changed lines
-/// are; VB keeps every other line, its marker lines included. An
-/// insertion next to VB lines that the materialized hunk does not hold goes
-/// outside the block they belong to, and so does a hunk that resolves where
-/// none was. In a hunk that conflicts, a change to VB's lines is taken as it
-/// is where a side of the conflict holds each line it changes; a change to
-/// lines that only VB holds, which jj shows only in the conflict's base, is
-/// not made. The changes are then made to V's terms by region (see
-/// [`edited_terms`]); for M, an insertion before or after its block goes into
-/// each file term, binary ones too, an absent one read as empty, and a term
-/// that is not a file is left as it is (see [`edited_m_terms`]). The file is
-/// the VB or M of the edited terms, or their text where they resolve. Where
-/// the new hunks do not match the old ones, or no change can be made, the base
-/// stays `old_id`: a snapshot never writes a plain file that holds VB's or M's
-/// marker lines.
-pub(crate) async fn rewrite_virtual_base(
-    store: &Store,
-    path: &RepoPath,
-    old_id: &FileId,
-    old_contents: &Merge<BString>,
-    index: usize,
-    new_hunks: &[Merge<BString>],
-    contents: impl IntoIterator<Item = &[u8]>,
-) -> BackendResult<Option<FileId>> {
-    let old = old_contents.as_slice()[index].as_slice();
-    let Some((terms, labels)) = named_terms(old) else {
-        return Ok(None);
-    };
-    if !holds_terms(store, path, &terms).await? {
-        return Ok(None);
-    }
-    let same_change = store.merge_options().same_change;
-    let Some(edits) = output_edits(old_contents, index, new_hunks, same_change) else {
-        return Ok(Some(old_id.clone()));
-    };
-    let new_contents = match text_file_contents(store, path, &terms).await? {
-        Some(term_contents) => edited_terms(old, &term_contents, &edits, same_change)
-            .map(|new_contents| (term_contents, new_contents)),
-        None => {
-            let term_contents = file_term_contents(store, path, &terms).await?;
-            let new_contents = edited_m_terms(old, &terms, &term_contents, &edits);
-            Some((term_contents, new_contents))
-        }
-    };
-    let Some((term_contents, new_contents)) = new_contents else {
-        return Ok(Some(old_id.clone()));
-    };
-    let mut new_terms = vec![];
-    let old_terms = zip(terms.iter(), term_contents.iter());
-    for ((term, content), new_content) in zip(old_terms, new_contents) {
-        if new_content.as_slice() == content.as_slice() {
-            new_terms.push(term.clone());
-            continue;
-        }
-        let id = store.write_file(path, &mut new_content.as_slice()).await?;
-        let (executable, copy_id) = match term {
-            Some(TreeValue::File {
-                executable,
-                copy_id,
-                ..
-            }) => (*executable, copy_id.clone()),
-            _ => (false, CopyId::placeholder()),
-        };
-        new_terms.push(Some(TreeValue::File {
-            id,
-            executable,
-            copy_id,
-        }));
-    }
-    let (base, labels) = simplified_with_labels(
-        &Merge::from_vec(new_terms),
-        &ConflictLabels::from_merge(labels),
-    );
-    if base == terms {
-        return Ok(Some(old_id.clone()));
-    }
-    if let Some(resolved) = base.as_resolved() {
-        return Ok(match resolved {
-            Some(TreeValue::File { id, .. }) => Some(id.clone()),
-            _ => Some(old_id.clone()),
-        });
-    }
-    // The base is the VB of the edited terms where they are a conflict of text
-    // files, M otherwise, whatever the old base was: where an edit makes every
-    // term of M's V text (an absent term written as the person's text), it is
-    // the VB of the edited terms.
-    let base_contents = text_file_contents(store, path, &base).await?;
-    let parent_lines = marker_like_lines(contents);
-    let id = write_virtual_base(store, path, &base, &labels, base_contents, &parent_lines).await?;
-    Ok(Some(id))
-}
-
-/// A change to a text: the range it replaces, and the text that takes its
-/// place.
-#[derive(Clone, Debug)]
-struct Edit {
-    range: Range<usize>,
-    text: Vec<u8>,
-}
-
-/// The changes to the base at `index` of `old_contents`, VB or M, that the
-/// person's changes to the hunks of `old_contents`, as jj materializes them,
-/// stand for, where `new_hunks` are the hunks the person left (see
-/// [`rewrite_virtual_base`]); `None` where the new hunks do not match the old
-/// ones.
-fn output_edits(
-    old_contents: &Merge<BString>,
-    index: usize,
-    new_hunks: &[Merge<BString>],
-    same_change: SameChange,
-) -> Option<Vec<Edit>> {
-    let vb = old_contents.as_slice()[index].as_slice();
-    let blocks = blocks(vb)?;
-    let mut new_hunks = new_hunks.iter().peekable();
-    let mut edits = vec![];
-    // A hunk that resolves where none was is an insertion where the previous
-    // hunk ends.
-    let mut end = 0;
-    for hunk in coalesced(line_hunks(old_contents, same_change)) {
-        let region = hunk.ranges[index].clone();
-        if hunk.kind == HunkKind::Conflict {
-            insert_resolved(&mut new_hunks, region.start, &mut edits);
-            let new_hunk = new_hunks.next()?;
-            if new_hunk.as_slice().len() != old_contents.as_slice().len() {
-                return None;
-            }
-            // A change to lines that only VB holds, its marker lines and lines
-            // of a block's side that no side of the conflict holds, which jj
-            // shows only in the conflict's base, is not made: VB keeps them.
-            let old_text = &vb[region.clone()];
-            let held = held_lines(old_contents, &hunk, index);
-            let changes = line_changes(old_text, &new_hunk.as_slice()[index]);
-            edits.extend(
-                changes
-                    .into_iter()
-                    .filter(|(range, _)| all_held(old_text, &held, range))
-                    .map(|(range, text)| Edit {
-                        range: region.start + range.start..region.start + range.end,
-                        text,
-                    }),
-            );
-        } else {
-            let empty = BString::default();
-            let new_text = match new_hunks.next_if(|hunk| hunk.is_resolved()) {
-                Some(new_hunk) => new_hunk.as_resolved().unwrap_or(&empty),
-                None => &empty,
-            };
-            let mut touched_blocks = blocks
-                .iter()
-                .filter(|block| block.start < region.end && region.start < block.end)
-                .peekable();
-            let covers_whole_blocks = touched_blocks.peek().is_some()
-                && touched_blocks
-                    .all(|block| region.start <= block.start && block.end <= region.end);
-            if covers_whole_blocks {
-                // The person resolved a hunk that covers whole blocks, as jj's
-                // snapshot writes it: its text goes into every term of V there
-                // (see [`edited_terms`]).
-                if new_text.as_slice() != hunk.text.as_slice() {
-                    edits.push(Edit {
-                        range: region.clone(),
-                        text: new_text.as_slice().to_vec(),
-                    });
-                }
-            } else {
-                let anchors = ContentDiff::by_line([hunk.text.as_slice(), &vb[region.clone()]])
-                    .hunk_ranges()
-                    .collect_vec();
-                for (range, text) in line_changes(&hunk.text, new_text) {
-                    let target = if range.is_empty() {
-                        let point =
-                            insertion_point(&anchors, range.start, vb, region.start, &blocks);
-                        Some(point..point)
-                    } else {
-                        matched_range(&anchors, &range, region.start)
-                    };
-                    if let Some(range) = target {
-                        edits.push(Edit { range, text });
-                    }
-                }
-            }
-        }
-        end = region.end;
-    }
-    insert_resolved(&mut new_hunks, end, &mut edits);
-    new_hunks.next().is_none().then_some(edits)
-}
-
-/// Adds to `edits` an insertion at `at` of each of the next hunks of
-/// `new_hunks` that resolve.
-fn insert_resolved<'a>(
-    new_hunks: &mut Peekable<impl Iterator<Item = &'a Merge<BString>>>,
-    at: usize,
-    edits: &mut Vec<Edit>,
-) {
-    while let Some(new_hunk) = new_hunks.next_if(|hunk| hunk.is_resolved()) {
-        let text = new_hunk.as_resolved().map_or(vec![], |text| text.to_vec());
-        edits.push(Edit {
-            range: at..at,
-            text,
-        });
-    }
-}
-
-/// The changes from `old` to `new` by a line diff: each range of `old` that
-/// changed, with the text of `new` that takes its place.
-fn line_changes(old: &[u8], new: &[u8]) -> Vec<(Range<usize>, Vec<u8>)> {
-    ContentDiff::by_line([old, new])
-        .hunk_ranges()
-        .filter(|hunk| matches!(hunk.kind, DiffHunkKind::Different))
-        .map(|hunk| (hunk.ranges[0].clone(), new[hunk.ranges[1].clone()].to_vec()))
-        .collect()
-}
-
-/// The range of the target whose lines are those of `range` of the source,
-/// by `anchors`, a line diff of the source against the target, shifted by
-/// `offset`; `None` where the target holds none of them, or where target
-/// lines that the source does not hold lie between them.
-fn matched_range(
-    anchors: &[DiffHunkRange],
-    range: &Range<usize>,
-    offset: usize,
-) -> Option<Range<usize>> {
-    let mut matched: Option<Range<usize>> = None;
-    for anchor in anchors {
-        if !matches!(anchor.kind, DiffHunkKind::Matching) {
-            continue;
-        }
-        let (source, target) = (&anchor.ranges[0], &anchor.ranges[1]);
-        let (start, end) = (range.start.max(source.start), range.end.min(source.end));
-        if start >= end {
-            continue;
-        }
-        let piece = offset + target.start + start - source.start
-            ..offset + target.start + end - source.start;
-        matched = match matched {
-            None => Some(piece),
-            Some(previous) if previous.end == piece.start => Some(previous.start..piece.end),
-            Some(_) => return None,
-        };
-    }
-    matched
-}
-
-/// Where VB takes an insertion at `position` of a materialized hunk, by
-/// `anchors`, a line diff of the hunk against VB's region at `offset`: next to
-/// the VB lines that are the lines around it, and where VB lines that the hunk
-/// does not hold lie there, at the first point among them that is outside
-/// every block of `blocks`, if any.
-fn insertion_point(
-    anchors: &[DiffHunkRange],
-    position: usize,
-    vb: &[u8],
-    offset: usize,
-    blocks: &[Block<'_>],
-) -> usize {
-    let mut gap = offset..offset;
-    for anchor in anchors {
-        let source = &anchor.ranges[0];
-        let target = offset + anchor.ranges[1].start..offset + anchor.ranges[1].end;
-        if matches!(anchor.kind, DiffHunkKind::Different) {
-            if source.start <= position && position <= source.end {
-                gap = target;
-                break;
-            }
-        } else if source.start < position && position < source.end {
-            return target.start + position - source.start;
-        } else if source.start == position {
-            gap = target.start..target.start;
-            break;
-        } else if source.end == position {
-            gap = target.end..target.end;
-        }
-    }
-    let line_ends = vb[gap.clone()]
-        .lines_with_terminator()
-        .scan(gap.start, |end, line| {
-            *end += line.len();
-            Some(*end)
-        });
-    iter::once(gap.start)
-        .chain(line_ends)
-        .find(|&point| outside_blocks(blocks, point))
-        .unwrap_or(gap.start)
-}
-
-/// Whether `point` is outside every block of `blocks`, or at its edge.
-fn outside_blocks(blocks: &[Block<'_>], point: usize) -> bool {
-    blocks
-        .iter()
-        .all(|block| point <= block.start || block.end <= point)
-}
-
-/// Whether a line of `text` is a marker line of a virtual base.
-fn holds_marker_line(text: &[u8]) -> bool {
-    text.lines_with_terminator().any(|line| {
-        parse_opening_line(line).is_some()
-            || marker_hex(line, SEPARATOR).is_some()
-            || marker_hex(line, CLOSE).is_some()
-    })
-}
-
-/// A line hunk of a merge: how its terms merge, the text they merge to unless
-/// they conflict, and the range that each term takes in it, in the order of
-/// [`Merge::as_slice`].
-struct LineHunk {
-    kind: HunkKind,
-    text: Vec<u8>,
-    ranges: Vec<Range<usize>>,
-}
-
-/// How the terms of a [`LineHunk`] merge.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HunkKind {
-    /// Every term holds the same text.
-    Same,
-    /// The terms differ, and merge trivially.
-    Merged,
-    /// The terms differ, and do not merge.
-    Conflict,
-}
-
-/// The line hunks of the merge of `contents`, as jj's line merge splits it.
-fn line_hunks(contents: &Merge<BString>, same_change: SameChange) -> Vec<LineHunk> {
-    let num_removes = contents.removes().len();
-    let term = |input: usize| {
-        if input < num_removes {
-            2 * input + 1
-        } else {
-            2 * (input - num_removes)
-        }
-    };
-    let diff = ContentDiff::by_line(contents.removes().chain(contents.adds()));
-    diff.hunk_ranges()
-        .map(|hunk| {
-            let mut ranges = vec![Range::default(); contents.as_slice().len()];
-            for (input, range) in hunk.ranges.iter().enumerate() {
-                ranges[term(input)] = range.clone();
-            }
-            let texts = Merge::from_vec(
-                zip(contents.as_slice(), &ranges)
-                    .map(|(content, range)| &content.as_slice()[range.clone()])
-                    .collect_vec(),
-            );
-            let (kind, text) = match (hunk.kind, texts.resolve_trivial(same_change)) {
-                (DiffHunkKind::Matching, _) => (HunkKind::Same, texts.first().to_vec()),
-                (_, Some(text)) => (HunkKind::Merged, text.to_vec()),
-                (_, None) => (HunkKind::Conflict, vec![]),
-            };
-            LineHunk { kind, text, ranges }
-        })
-        .collect()
-}
-
-/// `hunks` with each run of hunks that do not conflict made one, and the runs
-/// that merge to no text left out, as [`files::merge_hunks`] gives them.
-fn coalesced(hunks: Vec<LineHunk>) -> Vec<LineHunk> {
-    let mut result: Vec<LineHunk> = vec![];
-    for hunk in hunks {
-        let resolves = hunk.kind != HunkKind::Conflict;
-        match result.last_mut() {
-            Some(last) if resolves && last.kind == HunkKind::Merged => {
-                last.text.extend(hunk.text);
-                for (range, next) in zip(&mut last.ranges, hunk.ranges) {
-                    range.end = next.end;
-                }
-            }
-            _ if resolves => result.push(LineHunk {
-                kind: HunkKind::Merged,
-                ..hunk
-            }),
-            _ => result.push(hunk),
-        }
-    }
-    result.retain(|hunk| hunk.kind == HunkKind::Conflict || !hunk.text.is_empty());
-    result
-}
-
-/// A line hunk of the merge of V's terms, with the range of VB that it takes,
-/// and its block where it conflicts.
-struct Segment<'a> {
-    range: Range<usize>,
-    hunk: &'a LineHunk,
-    block: Option<&'a Block<'a>>,
-}
-
-/// Changes to VB that rewrite one range of it; where `expand` is set, the
-/// range is the whole of the hunks `segments`, which take the changed text in
-/// each term.
-struct Group<'a> {
-    span: Range<usize>,
-    segments: Range<usize>,
-    expand: bool,
-    edits: Vec<&'a Edit>,
-}
-
-/// The texts of V's terms, `contents`, with `edits`, changes to `vb`, their
-/// VB, made by region. A change to lines where V's terms are the same is made
-/// to each term. A change that touches lines where V's terms differ but merge
-/// writes the changed text of the hunks it touches into each term, in place
-/// of the term's own text there, and so does a change that covers whole
-/// blocks, whose text holds no marker line. Another change inside a side of a
-/// block is made to the term of V whose side it is. A term's text whose last
-/// line has no final newline is a block side all the same, as jj's line split
-/// takes that line as a line, though VB ends the side with a newline. An
-/// insertion at a block's edge is outside the block, and goes into each term.
-/// A change that touches a marker line without covering its block, crosses a
-/// block's edge or two sides, or whose text holds a marker line, is not made.
-/// `None` where `vb` is not the VB of `contents`.
-fn edited_terms(
-    vb: &[u8],
-    contents: &Merge<BString>,
-    edits: &[Edit],
-    same_change: SameChange,
-) -> Option<Vec<Vec<u8>>> {
-    let blocks = blocks(vb)?;
-    let hunks = line_hunks(contents, same_change);
-    let mut segments = vec![];
-    let mut next_blocks = blocks.iter();
-    let mut cursor = 0;
-    for hunk in &hunks {
-        let block = if hunk.kind == HunkKind::Conflict {
-            let block = next_blocks.next()?;
-            let adds = zip(contents.adds(), hunk.ranges.iter().step_by(2));
-            let sides_hold_adds = block.start == cursor
-                && block.sides.len() == contents.adds().len()
-                && zip(&block.sides, adds)
-                    .all(|(side, (add, range))| side_holds(side, &add.as_slice()[range.clone()]));
-            if !sides_hold_adds {
-                return None;
-            }
-            Some(block)
-        } else {
-            if vb.get(cursor..cursor + hunk.text.len())? != hunk.text.as_slice() {
-                return None;
-            }
-            None
-        };
-        let end = block.map_or(cursor + hunk.text.len(), |block| block.end);
-        segments.push(Segment {
-            range: cursor..end,
-            hunk,
-            block,
-        });
-        cursor = end;
-    }
-    if cursor != vb.len() || next_blocks.next().is_some() {
-        return None;
-    }
-
-    let num_terms = contents.as_slice().len();
-    let mut term_edits: Vec<Vec<Edit>> = vec![vec![]; num_terms];
-    let mut groups: Vec<Group<'_>> = vec![];
-    let mut edits = edits.iter().collect_vec();
-    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
-    for edit in edits {
-        if holds_marker_line(&edit.text) {
-            continue;
-        }
-        let (start, end) = (edit.range.start, edit.range.end);
-        let touched = segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| {
-                let range = &segment.range;
-                if start < end {
-                    range.start < end && start < range.end
-                } else if segment.block.is_some() {
-                    range.start < start && start < range.end
-                } else {
-                    range.start <= start && start <= range.end
-                }
-            })
-            .map(|(index, _)| index)
-            .collect_vec();
-        // A change that covers whole blocks, a hunk the person resolved over
-        // them, goes into every term below; any other change that touches a
-        // block goes to the term whose side it is in.
-        let covers = |range: &Range<usize>| start <= range.start && range.end <= end;
-        if let Some(&index) = touched
-            .iter()
-            .find(|&&index| segments[index].block.is_some() && !covers(&segments[index].range))
-        {
-            let segment = &segments[index];
-            let Some(block) = segment.block.filter(|_| touched.len() == 1) else {
-                continue;
-            };
-            let Some(side) = block
-                .side_ranges
-                .iter()
-                .position(|side| side.start <= start && end <= side.end)
-            else {
-                continue;
-            };
-            let term = 2 * side;
-            let term_range = &segment.hunk.ranges[term];
-            let side_range = &block.side_ranges[side];
-            let (from, to) = (start - side_range.start, end - side_range.start);
-            let (range, text) = if to <= term_range.len() {
-                (from..to, edit.text.clone())
-            } else {
-                // The term's last line has no final newline, which VB added:
-                // the changed lines keep that.
-                let mut text = edit.text.clone();
-                if text.last() == Some(&b'\n') {
-                    text.pop();
-                }
-                if from == side_range.len() {
-                    text.insert(0, b'\n');
-                    (term_range.len()..term_range.len(), text)
-                } else {
-                    (from..term_range.len(), text)
-                }
-            };
-            term_edits[term].push(Edit {
-                range: term_range.start + range.start..term_range.start + range.end,
-                text,
-            });
-            continue;
-        }
-        let expand = touched.iter().any(|&index| {
-            let segment = &segments[index];
-            let inside = segment.range.start < start && start < segment.range.end;
-            segment.block.is_some()
-                || (segment.hunk.kind == HunkKind::Merged && (start < end || inside))
-        });
-        let (first, last) = (
-            touched.first().copied().unwrap_or_default(),
-            touched.last().copied().unwrap_or_default(),
-        );
-        let span = if expand {
-            segments[first].range.start..segments[last].range.end
-        } else {
-            edit.range.clone()
-        };
-        match groups.last_mut() {
-            Some(group) if span.start < group.span.end => {
-                group.span = group.span.start.min(span.start)..group.span.end.max(span.end);
-                group.segments = group.segments.start.min(first)..group.segments.end.max(last + 1);
-                group.expand |= expand;
-                group.edits.push(edit);
-            }
-            _ => groups.push(Group {
-                span,
-                segments: first..last + 1,
-                expand,
-                edits: vec![edit],
-            }),
-        }
-    }
-
-    for group in &groups {
-        let (first, last) = (
-            &segments[group.segments.start],
-            &segments[group.segments.end - 1],
-        );
-        let span = if group.expand {
-            first.range.start..last.range.end
-        } else {
-            group.span.clone()
-        };
-        let mut text = vec![];
-        let mut at = span.start;
-        for edit in &group.edits {
-            if edit.range.start < at {
-                return None;
-            }
-            text.extend_from_slice(&vb[at..edit.range.start]);
-            text.extend_from_slice(&edit.text);
-            at = edit.range.end;
-        }
-        text.extend_from_slice(&vb[at..span.end]);
-        for (term, edits) in term_edits.iter_mut().enumerate() {
-            let range = if group.expand {
-                first.hunk.ranges[term].start..last.hunk.ranges[term].end
-            } else {
-                term_offset(&segments, span.start, term)..term_offset(&segments, span.end, term)
-            };
-            edits.push(Edit {
-                range,
-                text: text.clone(),
-            });
-        }
-    }
-
-    let mut new_contents = vec![];
-    for (content, mut edits) in zip(contents.iter(), term_edits) {
-        let content: &[u8] = content;
-        edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
-        let mut text = vec![];
-        let mut at = 0;
-        for edit in edits {
-            if edit.range.start < at {
-                return None;
-            }
-            text.extend_from_slice(&content[at..edit.range.start]);
-            text.extend(edit.text);
-            at = edit.range.end;
-        }
-        text.extend_from_slice(&content[at..]);
-        new_contents.push(text);
-    }
-    Some(new_contents)
-}
-
-/// Whether `side`, a side of a block of VB, holds `text`, a term's text there:
-/// the same text, or, where the text's last line has no final newline, the
-/// text with the newline that VB ends each side with.
-fn side_holds(side: &[u8], text: &[u8]) -> bool {
-    side == text
-        || (!text.is_empty() && !text.ends_with(b"\n") && side.strip_suffix(b"\n") == Some(text))
-}
-
-/// The offset in the term at `term` that `point` of VB stands for, where
-/// `point` is inside a hunk whose terms are the same, or at a hunk's edge.
-fn term_offset(segments: &[Segment<'_>], point: usize, term: usize) -> usize {
-    for segment in segments {
-        let (range, term_range) = (&segment.range, &segment.hunk.ranges[term]);
-        if range.start <= point && point <= range.end {
-            if segment.hunk.kind == HunkKind::Same {
-                return term_range.start + point - range.start;
-            } else if point == range.start {
-                return term_range.start;
-            } else if point == range.end {
-                return term_range.end;
-            }
-        }
-    }
-    segments
-        .last()
-        .map_or(0, |segment| segment.hunk.ranges[term].end)
-}
-
-/// The contents of V's terms, `terms` with the contents `contents`, with
-/// `edits`, changes to M, `m`, made: an insertion before or after M's block
-/// goes into each file term, at its start or its end, as jj's line merge,
-/// which splits any content at newline bytes, makes it into a binary file
-/// too, an absent term read as empty; a term that is not a file (a symlink, a
-/// directory or a submodule) is left as it is, and no other change is made,
-/// as M holds none of V's text.
-fn edited_m_terms(
-    m: &[u8],
-    terms: &MergedTreeValue,
-    contents: &Merge<BString>,
-    edits: &[Edit],
-) -> Vec<Vec<u8>> {
-    let (mut before, mut after) = (vec![], vec![]);
-    for edit in edits {
-        if !edit.range.is_empty() || holds_marker_line(&edit.text) {
-            continue;
-        }
-        if edit.range.start == 0 {
-            before.extend_from_slice(&edit.text);
-        } else if edit.range.start == m.len() {
-            after.extend_from_slice(&edit.text);
-        }
-    }
-    zip(terms.iter(), contents.iter())
-        .map(|(term, content)| {
-            if matches!(term, None | Some(TreeValue::File { .. })) {
-                [before.as_slice(), content.as_slice(), after.as_slice()].concat()
-            } else {
-                content.as_slice().to_vec()
-            }
-        })
-        .collect()
-}
-
-/// The ranges of the text of the term at `index` of `contents`, in `hunk`,
-/// whose lines a side of `contents` holds there too, by a line diff of each.
-fn held_lines(contents: &Merge<BString>, hunk: &LineHunk, index: usize) -> Vec<Range<usize>> {
-    let text = &contents.as_slice()[index].as_slice()[hunk.ranges[index].clone()];
-    zip(contents.as_slice(), &hunk.ranges)
-        .step_by(2)
-        .flat_map(|(content, range)| {
-            ContentDiff::by_line([text, &content.as_slice()[range.clone()]])
-                .hunk_ranges()
-                .filter(|diff_hunk| matches!(diff_hunk.kind, DiffHunkKind::Matching))
-                .map(|diff_hunk| diff_hunk.ranges[0].clone())
-                .collect_vec()
-        })
-        .collect()
-}
-
-/// Whether each line of `range` of `text` is in one of `held`.
-fn all_held(text: &[u8], held: &[Range<usize>], range: &Range<usize>) -> bool {
-    let mut start = range.start;
-    text[range.clone()].lines_with_terminator().all(|line| {
-        let end = start + line.len();
-        let is_held = held
-            .iter()
-            .any(|held| held.start <= start && end <= held.end);
-        start = end;
-        is_held
-    })
 }
 
 /// Writes to the store the VB or M of `base`, V after `simplify()`, each of
@@ -938,7 +251,7 @@ async fn write_virtual_base(
         .map(|(term, label)| term_name(term.as_ref(), label))
         .collect_vec();
     let hunks = match base_contents {
-        Some(base_contents) => text_hunks(&base_contents, store),
+        Some(base_contents) => text_hunks(&base_contents, store.merge_options()),
         None => {
             let sides = names.iter().map(|name| format!("{name}\n").into_bytes());
             vec![VirtualBaseHunk::Block(sides.collect())]
@@ -990,9 +303,9 @@ enum VirtualBaseHunk {
 }
 
 /// The hunks of the VB of `contents`, the terms of a conflict of text files,
-/// merged with the store's merge options.
-fn text_hunks(contents: &Merge<BString>, store: &Store) -> Vec<VirtualBaseHunk> {
-    match files::merge_hunks(contents, store.merge_options()) {
+/// merged with `options`.
+fn text_hunks(contents: &Merge<BString>, options: &MergeOptions) -> Vec<VirtualBaseHunk> {
+    match files::merge_hunks(contents, options) {
         MergeResult::Resolved(content) => vec![VirtualBaseHunk::Resolved(content.into())],
         MergeResult::Conflict(hunks) => hunks
             .into_iter()

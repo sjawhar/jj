@@ -576,29 +576,29 @@ impl<'repo> CommitRewriter<'repo> {
                 try_join!(old_base_fut, new_base_fut)?;
             (
                 old_base_tree.tree_ids() == self.old_commit.tree_ids(),
-                MergedTree::merge_with_unresolved(
-                    Merge::from_vec(vec![
-                        (
-                            new_base_tree,
-                            format!(
-                                "{} (rebase destination)",
-                                conflict_label_for_commits(&new_parents)
-                            ),
+                MergedTree::merge_with_unresolved(Merge::from_vec(vec![
+                    (
+                        new_base_tree,
+                        format!(
+                            "{} (rebase destination)",
+                            conflict_label_for_commits(&new_parents)
                         ),
-                        (
-                            old_base_tree,
-                            format!(
-                                "{} (parents of rebased revision)",
-                                conflict_label_for_commits(&old_parents)
-                            ),
+                        new_unresolved,
+                    ),
+                    (
+                        old_base_tree,
+                        format!(
+                            "{} (parents of rebased revision)",
+                            conflict_label_for_commits(&old_parents)
                         ),
-                        (
-                            old_tree,
-                            format!("{} (rebased revision)", self.old_commit.conflict_label()),
-                        ),
-                    ]),
-                    &[new_unresolved, old_unresolved, None],
-                )
+                        old_unresolved,
+                    ),
+                    (
+                        old_tree,
+                        format!("{} (rebased revision)", self.old_commit.conflict_label()),
+                        None,
+                    ),
+                ]))
                 .await?,
             )
         };
@@ -1609,15 +1609,33 @@ pub async fn squash_commits<'repo>(
     }
 
     let mut rewritten_destination = destination.clone();
-    if fallible_any(sources, async |source| {
+    let into_descendant = fallible_any(sources, async |source| {
         repo.index()
             .is_ancestor(source.commit.id(), destination.id())
             .await
     })
     .await
     // TODO: indexing error shouldn't be a "BackendError"
-    .map_err(|err| BackendError::Other(err.into()))?
-    {
+    .map_err(|err| BackendError::Other(err.into()))?;
+    // A source that is a merge of three or more commits, squashed into a
+    // descendant: its change, against the merge of its parents, can bring back
+    // a merge base's own base that the destination's rebase onto those parents
+    // resolved away. A source that merges two commits keeps jj's result
+    // before this change, which applies the change to the rebased destination.
+    let merge_into_descendant = into_descendant
+        && fallible_any(
+            sources
+                .iter()
+                .filter(|source| source.commit.parent_ids().len() > 2),
+            async |source| {
+                repo.index()
+                    .is_ancestor(source.commit.id(), destination.id())
+                    .await
+            },
+        )
+        .await
+        .map_err(|err| BackendError::Other(err.into()))?;
+    if into_descendant {
         // If we're moving changes to a descendant, first rebase descendants onto the
         // rewritten sources. Otherwise it will likely already have the content
         // changes we're moving, so applying them will have no effect and the
@@ -1641,15 +1659,55 @@ pub async fn squash_commits<'repo>(
             .iter()
             .map(|source| source.commit.commit.id().clone()),
     );
+    let destination_label = format!("{} (squash destination)", destination.conflict_label());
+    let source_diffs = source_commits.into_iter().map(|source| source.diff);
     // Apply the selected changes onto the destination
-    let destination_tree = MergedTree::merge(Merge::from_diffs(
-        (
-            rewritten_destination.tree(),
-            format!("{} (squash destination)", destination.conflict_label()),
-        ),
-        source_commits.into_iter().map(|source| source.diff),
-    ))
-    .await?;
+    let destination_tree = if merge_into_descendant {
+        // The destination's rebase and the selected changes go into one
+        // merge, as the rebase of the destination onto its new parents and
+        // the changes it then takes are one change to its tree: merged apart,
+        // the rebase's result is resolved first, and the changes then bring
+        // back the term it resolved away. Merged as one, the terms of the
+        // source's parent tree cancel those that the rebase brings, and the
+        // destination keeps a value that it or the source held, or a
+        // conflict.
+        let old_parents = destination.parents().await?;
+        let new_parents = rewritten_destination.parents().await?;
+        let ((old_base_tree, old_unresolved), (new_base_tree, new_unresolved)) = try_join!(
+            merge_parents(repo, &old_parents),
+            merge_parents(repo, &new_parents)
+        )?;
+        let mut merge = vec![
+            (
+                new_base_tree,
+                format!(
+                    "{} (rebase destination)",
+                    conflict_label_for_commits(&new_parents)
+                ),
+                new_unresolved,
+            ),
+            (
+                old_base_tree,
+                format!(
+                    "{} (parents of rebased revision)",
+                    conflict_label_for_commits(&old_parents)
+                ),
+                old_unresolved,
+            ),
+            (destination.tree(), destination_label, None),
+        ];
+        for Diff { before, after } in source_diffs {
+            merge.push((before.0, before.1, None));
+            merge.push((after.0, after.1, None));
+        }
+        MergedTree::merge_with_unresolved(Merge::from_vec(merge)).await?
+    } else {
+        MergedTree::merge(Merge::from_diffs(
+            (rewritten_destination.tree(), destination_label),
+            source_diffs,
+        ))
+        .await?
+    };
 
     let commit_builder = repo
         .rewrite_commit(&rewritten_destination)

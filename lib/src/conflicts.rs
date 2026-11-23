@@ -1128,13 +1128,12 @@ pub async fn update_from_content(
     let write_base = async |index: usize, content: &Vec<u8>, file_id: &Option<FileId>| {
         if let Some(old_id) = file_id {
             let contents = contents.iter().map(Vec::as_slice);
-            let old_index = 2 * index + 1;
             if let Some(file_id) = virtual_base::rewrite_virtual_base(
                 store,
                 path,
                 old_id,
                 &old_contents,
-                old_index,
+                index,
                 &hunks,
                 contents,
             )

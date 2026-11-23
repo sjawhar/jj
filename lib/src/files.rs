@@ -18,6 +18,7 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::iter;
 use std::mem;
+use std::ops::Range;
 
 use bstr::BStr;
 use bstr::BString;
@@ -322,15 +323,59 @@ where
     // TODO: Using the first remove as base (first in the inputs) is how it's
     // usually done for 3-way conflicts. Are there better heuristics when there are
     // more than 3 parts?
-    let num_diffs = inputs.removes().len();
-    let diff = ContentDiff::by_line(inputs.removes().chain(inputs.adds()));
-    let hunks = resolve_diff_hunks(&diff, num_diffs, options.same_change);
-    match options.hunk_level {
-        FileMergeHunkLevel::Line => B::from_hunks(hunks.map(MergeHunk::Borrowed)),
-        FileMergeHunkLevel::Word => {
-            B::from_hunks(hunks.map(|h| merge_hunk_by_word(h, options.same_change)))
-        }
+    let diff = line_diff(inputs);
+    let hunks = ranged_merge_hunks(&diff, inputs.removes().len(), options);
+    B::from_hunks(hunks.map(|hunk| hunk.hunk))
+}
+
+/// The line diff of `inputs` that their merge splits into hunks: the removes
+/// first, then the adds (see [`ranged_merge_hunks`]).
+pub(crate) fn line_diff<T: AsRef<[u8]>>(inputs: &Merge<T>) -> ContentDiff<'_> {
+    ContentDiff::by_line(inputs.removes().chain(inputs.adds()))
+}
+
+/// A hunk of a merge of contents, as [`merge_hunks`] splits them before it
+/// joins the hunks that resolve: the range that each input takes in its own
+/// content there, and the hunk, resolved where the inputs merge.
+pub(crate) struct RangedMergeHunk<'input> {
+    /// The range of each input, in the order of the merge's terms.
+    pub(crate) ranges: Merge<Range<usize>>,
+    /// Whether every input holds the same text.
+    pub(crate) matching: bool,
+    hunk: MergeHunk<'input>,
+}
+
+impl RangedMergeHunk<'_> {
+    /// The text that the inputs merge to here, if they merge.
+    pub(crate) fn resolved(&self) -> Option<&BStr> {
+        self.hunk.as_resolved()
     }
+}
+
+/// The hunks of a merge whose `diff` is [`line_diff`] of its inputs, of which
+/// `num_removes` are removes: each hunk of the line diff, resolved where the
+/// inputs merge trivially, and, at word level, a hunk that conflicts by line
+/// resolved where it merges by word. This is how every merge of contents
+/// splits them.
+pub(crate) fn ranged_merge_hunks<'a, 'input>(
+    diff: &'a ContentDiff<'input>,
+    num_removes: usize,
+    options: &'a MergeOptions,
+) -> impl Iterator<Item = RangedMergeHunk<'input>> + 'a {
+    iter::zip(diff.hunks(), diff.hunk_ranges()).map(move |(diff_hunk, diff_ranges)| {
+        let matching = diff_hunk.kind == DiffHunkKind::Matching;
+        let merge = resolve_diff_hunk(diff_hunk, num_removes, options.same_change);
+        let hunk = match options.hunk_level {
+            FileMergeHunkLevel::Line => MergeHunk::Borrowed(merge),
+            FileMergeHunkLevel::Word => merge_hunk_by_word(merge, options.same_change),
+        };
+        let (removes, adds) = diff_ranges.ranges.split_at(num_removes);
+        RangedMergeHunk {
+            ranges: Merge::from_removes_adds(removes.iter().cloned(), adds.iter().cloned()),
+            matching,
+            hunk,
+        }
+    })
 }
 
 fn merge_hunk_by_word(inputs: Merge<&BStr>, same_change: SameChange) -> MergeHunk<'_> {
@@ -477,7 +522,17 @@ fn resolve_diff_hunks<'input>(
     num_diffs: usize,
     same_change: SameChange,
 ) -> impl Iterator<Item = Merge<&'input BStr>> {
-    diff.hunks().map(move |diff_hunk| match diff_hunk.kind {
+    diff.hunks()
+        .map(move |diff_hunk| resolve_diff_hunk(diff_hunk, num_diffs, same_change))
+}
+
+/// Attempts to resolve trivial merge conflict for `diff_hunk`.
+fn resolve_diff_hunk(
+    diff_hunk: DiffHunk<'_>,
+    num_diffs: usize,
+    same_change: SameChange,
+) -> Merge<&BStr> {
+    match diff_hunk.kind {
         DiffHunkKind::Matching => {
             debug_assert!(diff_hunk.contents.iter().all_equal());
             Merge::resolved(diff_hunk.contents[0])
@@ -492,7 +547,7 @@ fn resolve_diff_hunks<'input>(
                 None => merge,
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]

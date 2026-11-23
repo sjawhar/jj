@@ -60,7 +60,8 @@ pub(crate) async fn merge_parent_trees(
 ) -> BackendResult<MergedTree> {
     let overrides = rule_overrides(store, &side1.0, &base.0, &side2.0).await?;
     let merge = Merge::from_vec(vec![side1, base, side2]);
-    MergedTree::merge_with_overrides(merge, &overrides, &[], resolve).await
+    let merge = merge.into_map(|(tree, label)| (tree, label, None));
+    MergedTree::merge_with_overrides(merge, &overrides, resolve).await
 }
 
 /// The values that [`merge_parent_trees`] writes over the merge of `side1`
