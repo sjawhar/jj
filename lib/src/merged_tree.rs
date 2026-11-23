@@ -361,15 +361,6 @@ impl MergedTree {
         Self::merge_with_overrides(merge, &[], true).await
     }
 
-    /// Merges as [`Self::merge_with_unresolved`] does, and returns with the
-    /// merge the paths where it replaced a virtual merge base with the terms
-    /// of the conflict that it stands for.
-    pub(crate) async fn merge_with_unresolved_and_replaced(
-        merge: Merge<(Self, String, Option<Self>)>,
-    ) -> BackendResult<(Self, Vec<RepoPathBuf>)> {
-        Self::merge_replacing(merge, &[], true).await
-    }
-
     /// Merges the provided trees into a single `MergedTree`, without attempting
     /// to resolve file conflicts.
     ///
@@ -443,7 +434,7 @@ impl MergedTree {
 
     /// Merges as [`Self::merge_with_overrides`] does, and returns with the
     /// merge the paths where it replaced VB or M.
-    async fn merge_replacing(
+    pub(crate) async fn merge_replacing(
         merge: Merge<(Self, String, Option<Self>)>,
         overrides: &[(RepoPathBuf, MergedTreeValue)],
         resolve: bool,

@@ -96,24 +96,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the conflicts that every virtual merge base there stands for in their
   place, and a rebase takes the merges of the old and the new parents there as
   their terms, not as the text they resolve to. A snapshot of such a conflict
-  writes the lines the person changed into those terms, laid out at the hunk
-  level that the virtual merge base records, and lines up the file the person
-  left with the conflict by a line diff, so that a conflict the person
-  resolved or deleted goes into every term; a line that looks like a marker
-  line is the person's text. Where a term of the conflict is not a file (a
-  symlink, a submodule or a directory), a snapshot leaves it as it is, so a
-  later merge keeps the person's change only in the terms that are files. A
-  squash of a merge of three or more commits into a descendant, through
-  commits with one parent each, merges the descendant's rebase and the
-  squashed changes as one merge at each path where it replaces a virtual
-  merge base, so the changes there no longer bring back a merge base's own
-  base that the rebase resolved away; every other path is squashed as
-  before. A merge is refused, and writes nothing, where it would replace more
-  than 10,000 virtual merge bases at one path, or more than 10,000 in all and
-  100 for each path where it replaces one: files that pass as virtual merge
-  bases can stand for that many, and so can a history that is both deep and
-  wide (a braid of 202 criss-cross levels over 100 files needs about 201 at
-  each path, more than 20,000 in all, where jj 0.45.1 completes).
+  makes the person's changes of the base to those terms: a change to text that
+  every term holds goes into every term, a change inside one side of the
+  conflict of the merge bases into that side's term, and any other change
+  (a conflict resolved, deleted or cut into) puts the text the person left
+  into every term in place of the lines it touches; a conflict that the
+  person moved or copied takes the terms' own lines with it. A line that looks
+  like a marker line is the person's text. A change of the lines that show
+  the virtual merge base inside a conflict that the person kept is not made:
+  those lines are derived from the merge bases. Where a merge base's own
+  merge bases disagreed, so that a term is itself a virtual merge base, the
+  change is made to the terms which that one stands for, never to its text.
+  Where the conflict of the merge bases is between files that are not all
+  text, a snapshot keeps the changes that every side of the conflict has
+  alike; where a term is absent or is not a file, it keeps only text put
+  before or after the whole conflict, and leaves a term that is not a file
+  (a symlink, a submodule or a directory) as it is. A file whose final
+  newline the person or a merge tool removed after a conflict's end marker
+  removes it from those terms too. Where an edit would make a term of the
+  merge bases' conflict a file that is itself a virtual merge base (one
+  pasted into a deleted side), the snapshot keeps the old one as the base:
+  none can stand for such terms. A squash of a merge of
+  three or more commits into a descendant, or into a new commit that
+  `--insert-after` or `--insert-before` places among its descendants, merges
+  the descendant's rebase and the squashed changes as one merge, whatever
+  commits lie between, at each path where the merge's parents conflict or
+  where it replaces a virtual merge base, so the changes there no longer
+  bring back a merge base's own base that the rebase resolved away; every
+  other path is squashed as before. A merge is refused, and writes nothing,
+  where it would replace more than 10,000 virtual merge bases at one path, or
+  more than 10,000 in all and 100 for each path where it replaces one: files
+  that pass as virtual merge bases can stand for that many, and so can a
+  history that is both deep and wide (a braid of 202 criss-cross levels over
+  100 files needs about 201 at each path, more than 20,000 in all, where jj
+  0.45.1 completes). Where a later rebase, abandon or duplicate rewrites the
+  parents of an edited merge, jj's rebase can put back among the sides a
+  parent that deletes the file, a parent whose change conflicts with the
+  merge's own (a final newline removed where the parent changed the last
+  line), or an edit-free side that the rewritten merge bases bring, as jj
+  0.45.1's rebase does; such a side does not hold the edit.
   Merge bases, and the parents of a merge of three or more commits, are
   merged in the order of their commit ids. This affects criss-cross histories,
   and merges whose base is itself conflicted.

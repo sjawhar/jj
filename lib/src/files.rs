@@ -384,45 +384,6 @@ pub(crate) fn split_ranged_hunks<T: AsRef<[u8]>>(
         .collect()
 }
 
-/// The hunks of the merge of `inputs` as [`merge_hunks`] gives them, each with
-/// the range that each input takes in its own content there.
-pub(crate) fn ranged_merge_hunks<T: AsRef<[u8]>>(
-    inputs: &Merge<T>,
-    options: &MergeOptions,
-) -> Vec<RangedMergeHunk> {
-    join_hunks(split_ranged_hunks(inputs, options))
-}
-
-/// What [`merge_hunks`] gives for `inputs`, whose hunks [`ranged_merge_hunks`]
-/// gives as `hunks`.
-pub(crate) fn ranged_merge_result<T: AsRef<[u8]>>(
-    inputs: &Merge<T>,
-    hunks: &[RangedMergeHunk],
-) -> MergeResult {
-    match hunks {
-        [] => MergeResult::Resolved(BString::default()),
-        [
-            RangedMergeHunk {
-                resolved: Some(text),
-                ..
-            },
-        ] => MergeResult::Resolved(text.clone()),
-        _ => MergeResult::Conflict(
-            hunks
-                .iter()
-                .map(|hunk| match &hunk.resolved {
-                    Some(text) => Merge::resolved(text.clone()),
-                    None => Merge::from_vec(
-                        iter::zip(inputs.iter(), hunk.ranges.iter())
-                            .map(|(input, range)| BString::from(&input.as_ref()[range.clone()]))
-                            .collect_vec(),
-                    ),
-                })
-                .collect(),
-        ),
-    }
-}
-
 fn merge_hunk_by_word(inputs: Merge<&BStr>, same_change: SameChange) -> MergeHunk<'_> {
     if inputs.is_resolved() {
         return MergeHunk::Borrowed(inputs);
@@ -502,79 +463,31 @@ impl<'input> FromMergeHunks<'input> for Option<BString> {
     }
 }
 
-/// A hunk of a merge of contents that [`join_hunks`] joins.
-trait JoinHunk: Sized {
-    /// The text that the hunk resolves to, unless it conflicts.
-    fn resolved_text(&self) -> Option<&[u8]>;
-
-    /// Appends `next`, a hunk that resolves, to this hunk, which resolves.
-    fn append(&mut self, next: Self);
-}
-
-impl JoinHunk for MergeHunk<'_> {
-    fn resolved_text(&self) -> Option<&[u8]> {
-        self.as_resolved().map(|text| text.as_ref())
-    }
-
-    fn append(&mut self, next: Self) {
-        let resolved = Merge::resolved(BString::default());
-        let mut text = match mem::replace(self, MergeHunk::Owned(resolved)) {
-            MergeHunk::Borrowed(merge) => merge.into_resolved().ok().map(BStr::to_owned),
-            MergeHunk::Owned(merge) => merge.into_resolved().ok(),
-        }
-        .expect("a hunk that resolves");
-        text.extend_from_slice(next.as_resolved().expect("a hunk that resolves"));
-        *self = MergeHunk::Owned(Merge::resolved(text));
-    }
-}
-
-impl JoinHunk for RangedMergeHunk {
-    fn resolved_text(&self) -> Option<&[u8]> {
-        self.resolved.as_ref().map(|text| text.as_slice())
-    }
-
-    fn append(&mut self, next: Self) {
-        let text = self.resolved.as_mut().expect("a hunk that resolves");
-        text.extend_from_slice(&next.resolved.expect("a hunk that resolves"));
-        for (range, next) in iter::zip(self.ranges.iter_mut(), next.ranges.iter()) {
-            range.end = next.end;
-        }
-        self.matching &= next.matching;
-    }
-}
-
-/// `hunks` with each run of hunks that resolve joined into one, and each run
-/// that resolves to no text left out: how a merge of contents joins its hunks
-/// (see [`collect_hunks`]).
-fn join_hunks<H: JoinHunk>(hunks: impl IntoIterator<Item = H>) -> Vec<H> {
-    let mut joined: Vec<H> = vec![];
-    for hunk in hunks {
-        match joined.last_mut() {
-            Some(last) if last.resolved_text().is_some() && hunk.resolved_text().is_some() => {
-                last.append(hunk);
-            }
-            _ => joined.push(hunk),
-        }
-    }
-    joined.retain(|hunk| hunk.resolved_text().is_none_or(|text| !text.is_empty()));
-    joined
-}
-
 /// Collects merged hunks into either fully-resolved content or list of
 /// partially-resolved hunks.
 fn collect_hunks<'input>(hunks: impl IntoIterator<Item = MergeHunk<'input>>) -> MergeResult {
-    let mut merge_hunks = join_hunks(hunks);
-    if merge_hunks.iter().all(|hunk| hunk.as_resolved().is_some()) {
-        // The hunks resolve, so they are joined into one, or none if they
-        // resolve to no text.
-        let content = merge_hunks.pop().map_or_else(BString::default, |hunk| {
-            hunk.into_owned()
-                .into_resolved()
-                .expect("a hunk that resolves")
-        });
-        return MergeResult::Resolved(content);
+    let mut resolved_hunk = BString::new(vec![]);
+    let mut merge_hunks: Vec<Merge<BString>> = vec![];
+    for hunk in hunks {
+        if let Some(content) = hunk.as_resolved() {
+            resolved_hunk.extend_from_slice(content);
+        } else {
+            if !resolved_hunk.is_empty() {
+                merge_hunks.push(Merge::resolved(resolved_hunk));
+                resolved_hunk = BString::new(vec![]);
+            }
+            merge_hunks.push(hunk.into_owned());
+        }
     }
-    MergeResult::Conflict(merge_hunks.into_iter().map(MergeHunk::into_owned).collect())
+
+    if merge_hunks.is_empty() {
+        MergeResult::Resolved(resolved_hunk)
+    } else {
+        if !resolved_hunk.is_empty() {
+            merge_hunks.push(Merge::resolved(resolved_hunk));
+        }
+        MergeResult::Conflict(merge_hunks)
+    }
 }
 
 /// Collects merged hunks back to single `Merge` object, duplicating resolved

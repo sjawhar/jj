@@ -34,6 +34,8 @@ use tracing::instrument;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
+use crate::backend::MergedTreeValue;
+use crate::backend::MergedTreeValueExt as _;
 use crate::commit::Commit;
 use crate::commit::CommitIteratorExt as _;
 use crate::commit::conflict_label_for_commits;
@@ -58,6 +60,7 @@ use crate::repo_path::RepoPathBuf;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetStreamExt as _;
 use crate::store::Store;
+use crate::virtual_base;
 
 /// Merges `commits` and tries to resolve any conflicts recursively.
 #[instrument(skip(repo))]
@@ -148,39 +151,221 @@ async fn rebase_parent_terms(
     ))
 }
 
-/// The first commit of the chain through which `destination` descends from a
-/// source of a squash, each commit of it with one parent, from `destination`
-/// up: the commit whose parents hold one of `merge_sources`; `None` where the
-/// chain reaches first a commit with another number of parents, or one of
-/// `sources`.
-async fn squash_chain_top(
-    store: &Arc<Store>,
+/// A source of a squash into a commit that descends from it.
+struct SquashedAncestor<'a> {
+    commit: &'a Commit,
+    /// The selected changes: the merge of the commit's parents and the
+    /// selected tree, each with its label.
+    diff: Diff<(MergedTree, String)>,
+    /// Whether the squash abandons the commit; otherwise it rewrites the
+    /// commit without the selected changes.
+    abandon: bool,
+}
+
+/// The tree of `destination` once `sources` are squashed into it, where it
+/// descends from at least one of them that merges three or more commits
+/// (`merge_sources`). `rewrites` holds each commit that the squash rewrote
+/// before this, with the commit that it became: the sources that it did not
+/// abandon, and their descendants, `destination` among them, which became
+/// `rewritten_destination`.
+///
+/// jj squashes into a descendant in two merges: the rebase of each
+/// descendant takes the selected changes out of it, and the selected changes
+/// are then made to the rebased destination. Each merge resolves what it can
+/// before the next starts, and a source that merges three or more commits
+/// makes its changes against the merge of its parents, which can be a
+/// conflict: resolved apart, the two merges can leave a value that no commit
+/// held, such as a merge base's own base.
+///
+/// So the tree is also built in one merge. Its terms are `destination`'s own
+/// tree, the change that the squash's rebase made to it, and the selected
+/// changes. The change of the rebase is found from `destination` up, through
+/// whatever commits the squash rebased: a commit whose parents the squash
+/// abandoned got those commits' own parents in their place, so the merge of
+/// its parents changed from the old ones' to those; and a commit of which
+/// one parent was rebased, or rewritten, changed as that parent did, which
+/// is followed in turn. (Where two or more parents were rebased, the merges
+/// of the parents before and after are the terms, the rebased parents as
+/// they are.) The merge of the parents of a source that merges three or more
+/// commits is one term wherever it comes up, with a virtual merge base at
+/// each path where it is a conflict of files (see [`with_virtual_bases`]):
+/// the selected changes are made against it, as the merge of two commits
+/// whose merge bases disagree is made against theirs, and the terms that
+/// take the changes out and put them back cancel.
+///
+/// The one merge decides the paths where it has a virtual merge base to work
+/// with: where the parents of such a source conflict, and where it replaced
+/// a virtual merge base with the terms that it stands for. Every other path
+/// keeps the value that jj's two merges give.
+async fn squash_into_descendant(
+    repo: &dyn Repo,
     destination: &Commit,
+    rewritten_destination: &Commit,
+    destination_label: String,
+    sources: Vec<SquashedAncestor<'_>>,
     merge_sources: &HashSet<CommitId>,
-    sources: &HashSet<&CommitId>,
-) -> BackendResult<Option<Commit>> {
+    rewrites: &[(Commit, Commit)],
+) -> BackendResult<MergedTree> {
+    let two_merges = MergedTree::merge(Merge::from_diffs(
+        (rewritten_destination.tree(), destination_label.clone()),
+        sources.iter().map(|source| source.diff.clone()),
+    ))
+    .await?;
+    let destination_tree = destination.tree();
+    // The selected changes of each source as terms, and, for each source that
+    // merges three or more commits, the ids of its parents with the term
+    // that their merge is.
+    let mut changes: Vec<Diff<MergeInput>> = vec![];
+    let mut merged_parents: Vec<(&[CommitId], MergeInput)> = vec![];
+    let mut paths = vec![];
+    for source in &sources {
+        let (parent_tree, parent_label) = source.diff.before.clone();
+        let (selected_tree, selected_label) = source.diff.after.clone();
+        let parent_term = if merge_sources.contains(source.commit.id()) {
+            let (parent_tree, based) =
+                with_virtual_bases(parent_tree, &selected_tree, &destination_tree).await?;
+            paths.extend(based);
+            let parent_term = (parent_tree, parent_label, None);
+            merged_parents.push((source.commit.parent_ids(), parent_term.clone()));
+            parent_term
+        } else {
+            (parent_tree, parent_label, None)
+        };
+        changes.push(Diff::new(
+            parent_term,
+            (selected_tree, selected_label, None),
+        ));
+    }
+    // The merge of `commits` as a term: `term`, or the term of a source's
+    // parents if they are `commits`.
+    let parents_term = |commits: &[Commit], term: MergeInput| {
+        let merged = merged_parents
+            .iter()
+            .find(|(ids, _)| commits.iter().map(|commit| commit.id()).eq(*ids));
+        merged.map_or(term, |(_, term)| term.clone())
+    };
+    // The commit that each rewritten commit was at first, and the one that
+    // each commit became at last.
+    let was: HashMap<&CommitId, &Commit> =
+        rewrites.iter().map(|(old, new)| (new.id(), old)).collect();
+    let became: HashMap<&CommitId, &Commit> =
+        rewrites.iter().map(|(old, new)| (old.id(), new)).collect();
+    // The changes that the squash's rebase made to the destination's tree,
+    // from the destination up.
+    let mut rebase_changes: Vec<Diff<MergeInput>> = vec![];
     let mut commit = destination.clone();
     loop {
-        if commit
-            .parent_ids()
+        let kept_source = sources
             .iter()
-            .any(|id| merge_sources.contains(id))
-        {
-            return Ok(Some(commit));
+            .position(|source| !source.abandon && source.commit.id() == commit.id());
+        if let Some(source) = kept_source {
+            // The squash took the selected changes out of the source.
+            rebase_changes.push(changes[source].clone().invert());
         }
-        let [parent_id] = commit.parent_ids() else {
-            return Ok(None);
-        };
-        if sources.contains(parent_id) {
-            return Ok(None);
+        let rebased = followed(&commit, &became).clone();
+        if rebased.id() == commit.id() {
+            break;
         }
-        commit = store.get_commit_async(parent_id).await?;
+        let (old_parents, new_parents) = try_join!(commit.parents(), rebased.parents())?;
+        let were = new_parents
+            .iter()
+            .map(|parent| followed(parent, &was).clone())
+            .collect_vec();
+        if !were.iter().ids().eq(old_parents.iter().ids()) {
+            // Parents that the squash abandoned gave way to their own.
+            let (after, before) = rebase_parent_terms(repo, &old_parents, &were).await?;
+            rebase_changes.push(Diff::new(before, parents_term(&were, after)));
+        }
+        let mut changed = iter::zip(&were, &new_parents).filter(|(was, now)| was.id() != now.id());
+        match (changed.next(), changed.next()) {
+            (None, _) => break,
+            (Some((was, _)), None) => commit = was.clone(),
+            (Some(_), Some(_)) => {
+                let (after, before) = rebase_parent_terms(repo, &were, &new_parents).await?;
+                rebase_changes.push(Diff::new(parents_term(&were, before), after));
+                break;
+            }
+        }
     }
+    // The destination's rebased tree as terms, the outermost change of the
+    // rebase first, as a rebase puts its new parents first: each change's
+    // new side, then its old side, then the next change, and the
+    // destination's own tree last.
+    let mut terms = vec![(destination_tree, destination_label, None)];
+    for change in rebase_changes {
+        terms.extend([change.before, change.after]);
+    }
+    let mut terms = terms.into_iter().rev();
+    let first = terms.next().expect("the destination's tree");
+    let rebase = terms
+        .tuples()
+        .map(|(before, after)| Diff::new(before, after));
+    let merge = Merge::from_diffs(first, rebase.chain(changes));
+    let (one_merge, replaced) = MergedTree::merge_replacing(merge, &[], true).await?;
+    paths.extend(replaced);
+    with_values_at(two_merges, &one_merge, &paths).await
+}
+
+/// The commit that `commit` leads to through `links`, which give, by a
+/// commit's id, the commit that it was, or the one that it became.
+fn followed<'a>(mut commit: &'a Commit, links: &HashMap<&CommitId, &'a Commit>) -> &'a Commit {
+    while let Some(&next) = links.get(commit.id()) {
+        commit = next;
+    }
+    commit
+}
+
+/// `tree`, the merge of the parents of a commit that merges three or more
+/// commits, with a virtual merge base in place of each conflict of files
+/// (see [`virtual_base::virtual_merge_base`]), and the paths of those: the
+/// tree against which the commit's changes are merged into `side2` where
+/// `side1` is the commit's selected tree, as the merge of two commits is
+/// made against the merge of their merge bases. Its marker lines are no line
+/// of a side of `side1` or of `side2` there; a base of theirs can be the
+/// same virtual merge base.
+async fn with_virtual_bases(
+    tree: MergedTree,
+    side1: &MergedTree,
+    side2: &MergedTree,
+) -> BackendResult<(MergedTree, Vec<RepoPathBuf>)> {
+    let sides = |value: MergedTreeValue| {
+        let absent = iter::repeat_n(None, value.removes().len());
+        Merge::from_removes_adds(absent, value.adds().cloned())
+    };
+    let mut bases = vec![];
+    for (path, value) in tree.conflicts() {
+        let value = value?;
+        if value.to_file_merge().is_none() {
+            continue;
+        }
+        let (value1, value2) = try_join!(side1.path_value(&path), side2.path_value(&path))?;
+        let base = virtual_base::virtual_merge_base(
+            tree.store(),
+            &path,
+            &value,
+            tree.labels(),
+            &sides(value1),
+            &sides(value2),
+        )
+        .await?;
+        bases.push((path, base));
+    }
+    if bases.is_empty() {
+        return Ok((tree, vec![]));
+    }
+    let paths = bases.iter().map(|(path, _)| path.clone()).collect();
+    let mut builder = MergedTreeBuilder::new(tree);
+    for (path, base) in bases {
+        builder.set_or_remove(path, Merge::normal(base));
+    }
+    Ok((builder.write_tree().await?, paths))
 }
 
 /// `tree` with the values that `merged` holds at `paths` written over its own,
-/// resolved where they resolve; with no conflict labels where one of those
-/// values is a conflict, whose terms are `merged`'s.
+/// resolved where they resolve. Where one of those values is a conflict, its
+/// first term takes the place of `tree`'s first, and its other terms go
+/// after `tree`'s own, each with `merged`'s label for it, so that `tree`'s
+/// conflicts at other paths keep their labels.
 async fn with_values_at(
     tree: MergedTree,
     merged: &MergedTree,
@@ -193,14 +378,39 @@ async fn with_values_at(
     for path in paths {
         values.push((path.clone(), merged.path_value(path).await?));
     }
-    let tree = if values.iter().all(|(_, value)| value.is_resolved()) {
-        tree
-    } else {
-        let store = tree.store().clone();
-        MergedTree::new(store, tree.into_tree_ids(), ConflictLabels::unlabeled())
-    };
-    let mut builder = MergedTreeBuilder::new(tree);
+    if values.iter().all(|(_, value)| value.is_resolved()) {
+        let mut builder = MergedTreeBuilder::new(tree);
+        for (path, value) in values {
+            builder.set_or_remove(path, value);
+        }
+        return builder.write_tree().await;
+    }
+    let store = tree.store().clone();
+    let own_sides = tree.tree_ids().num_sides();
+    let num_sides = own_sides + merged.tree_ids().num_sides() - 1;
+    let mut tree_ids = tree.tree_ids().clone();
+    tree_ids.pad_to(num_sides, store.empty_tree_id());
+    let own_labels = tree.labels_by_term("");
+    let merged_labels = merged.labels_by_term("");
+    let labels = own_labels
+        .iter()
+        .chain(&merged_labels.as_slice()[1..])
+        .map(|&label| label.to_owned())
+        .collect_vec();
+    let labels = ConflictLabels::from_merge(Merge::from_vec(labels));
+    let mut builder = MergedTreeBuilder::new(MergedTree::new(store, tree_ids, labels));
     for (path, value) in values {
+        let value = match value.into_resolved() {
+            Ok(resolved) => Merge::resolved(resolved),
+            Err(conflict) => {
+                let (first, others) = conflict.as_slice().split_first().expect("a term");
+                let absent = iter::repeat_n(None, 2 * (own_sides - 1));
+                let terms = iter::once(first.clone())
+                    .chain(absent)
+                    .chain(others.iter().cloned());
+                Merge::from_vec(terms.collect_vec())
+            }
+        };
         builder.set_or_remove(path, value);
     }
     builder.write_tree().await
@@ -1657,6 +1867,8 @@ pub async fn squash_commits<'repo>(
     }
 
     let mut abandoned_commits = vec![];
+    // Each commit that the squash rewrites, with the commit that it becomes.
+    let mut rewrites = vec![];
     for source in &source_commits {
         if source.abandon {
             repo.record_abandoned_commit(&source.commit.commit);
@@ -1669,10 +1881,12 @@ pub async fn squash_commits<'repo>(
                 [source.diff.clone().invert()],
             ))
             .await?;
-            repo.rewrite_commit(&source.commit.commit)
+            let new_source = repo
+                .rewrite_commit(&source.commit.commit)
                 .set_tree(new_source_tree)
                 .write()
                 .await?;
+            rewrites.push((source.commit.commit.clone(), new_source));
         }
     }
 
@@ -1694,13 +1908,6 @@ pub async fn squash_commits<'repo>(
             merge_sources.insert(source.commit.id().clone());
         }
     }
-    let chain_top = if merge_sources.is_empty() {
-        None
-    } else {
-        let source_ids = sources.iter().map(|source| source.commit.id()).collect();
-        squash_chain_top(repo.store(), destination, &merge_sources, &source_ids).await?
-    };
-    let mut rewritten_chain_top = None;
     if into_descendant {
         // If we're moving changes to a descendant, first rebase descendants onto the
         // rewritten sources. Otherwise it will likely already have the content
@@ -1709,12 +1916,10 @@ pub async fn squash_commits<'repo>(
         let immutable = RevsetExpression::none();
         let options = RebaseOptions::default();
         repo.rebase_descendants_with_options(&immutable, &options, |old_commit, rebased_commit| {
-            if let RebasedCommit::Rewritten(commit) = &rebased_commit
-                && chain_top
-                    .as_ref()
-                    .is_some_and(|top| top.id() == old_commit.id())
+            if !merge_sources.is_empty()
+                && let RebasedCommit::Rewritten(commit) = &rebased_commit
             {
-                rewritten_chain_top = Some(commit.clone());
+                rewrites.push((old_commit.clone(), commit.clone()));
             }
             if old_commit.id() != destination.id() {
                 return;
@@ -1733,41 +1938,35 @@ pub async fn squash_commits<'repo>(
             .map(|source| source.commit.commit.id().clone()),
     );
     let destination_label = format!("{} (squash destination)", destination.conflict_label());
-    let source_diffs = source_commits
-        .into_iter()
-        .map(|source| source.diff)
-        .collect_vec();
-    // Apply the selected changes onto the destination
-    let mut destination_tree = MergedTree::merge(Merge::from_diffs(
-        (rewritten_destination.tree(), destination_label.clone()),
-        source_diffs.clone(),
-    ))
-    .await?;
-    // Where a source that merges three or more commits is squashed into a
-    // descendant through a chain of commits with one parent each, the
-    // destination's tree is, at each path where it replaces a virtual merge
-    // base, one merge of the destination's rebase (the new parents' merge of
-    // the chain's first commit, minus its old parents' merge, plus the
-    // destination's tree) and the selected changes, the parents' merges
-    // entering as their terms. Merged apart, as at every other path, the
-    // rebase is resolved first, and there the changes, made against the
-    // source's parents' merge, which resolves each step of the merge of its
-    // parents, can bring back a term that the rebase resolved away, such as a
-    // merge base's own base.
-    if let (Some(top), Some(rewritten_top)) = (chain_top, rewritten_chain_top) {
-        let old_parents = top.parents().await?;
-        let new_parents = rewritten_top.parents().await?;
-        let (new_base, old_base) = rebase_parent_terms(repo, &old_parents, &new_parents).await?;
-        let destination_term = (destination.tree(), destination_label, None);
-        let changes = source_diffs
+    let destination_tree = if merge_sources.is_empty() {
+        // Apply the selected changes onto the destination
+        MergedTree::merge(Merge::from_diffs(
+            (rewritten_destination.tree(), destination_label),
+            source_commits.into_iter().map(|source| source.diff),
+        ))
+        .await?
+    } else {
+        // The destination descends from a source that merges three or more
+        // commits: the rebase and the selected changes are also one merge.
+        let sources = source_commits
             .into_iter()
-            .map(|diff| diff.map(|(tree, label)| (tree, label, None)));
-        let diffs = iter::once(Diff::new(old_base, destination_term)).chain(changes);
-        let (merged, replaced) =
-            MergedTree::merge_with_unresolved_and_replaced(Merge::from_diffs(new_base, diffs))
-                .await?;
-        destination_tree = with_values_at(destination_tree, &merged, &replaced).await?;
-    }
+            .map(|source| SquashedAncestor {
+                commit: &source.commit.commit,
+                diff: source.diff,
+                abandon: source.abandon,
+            })
+            .collect();
+        squash_into_descendant(
+            repo,
+            destination,
+            &rewritten_destination,
+            destination_label,
+            sources,
+            &merge_sources,
+            &rewrites,
+        )
+        .await?
+    };
 
     let commit_builder = repo
         .rewrite_commit(&rewritten_destination)

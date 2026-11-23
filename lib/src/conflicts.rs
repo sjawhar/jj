@@ -1057,10 +1057,9 @@ fn parse_git_style_conflict_hunk(input: &[u8], expected_marker_len: usize) -> Me
 /// single resolves `FileId` will be returned.
 ///
 /// A base that is a virtual merge base stands for the terms of the conflict it
-/// names: the changes the new contents make to the materialized file are made
-/// to those terms by region, and the base becomes their virtual merge base,
-/// never a plain file that holds its marker lines (see
-/// [`virtual_base`]).
+/// names: the changes that the new contents make to it are made to those
+/// terms, and the base becomes their virtual merge base, never a plain file
+/// that holds its marker lines (see [`virtual_base`]).
 pub async fn update_from_content(
     file_ids: &Merge<Option<FileId>>,
     store: &Store,
@@ -1071,10 +1070,7 @@ pub async fn update_from_content(
     let simplified_file_ids = file_ids.simplify();
 
     let old_contents = extract_as_single_hunk(&simplified_file_ids, store, path).await?;
-    // The old hunks, each with the range of each term, which a base that is a
-    // virtual merge base reads to map the changes onto the terms it names.
-    let old_ranged_hunks = files::ranged_merge_hunks(&old_contents, store.merge_options());
-    let old_hunks = files::ranged_merge_result(&old_contents, &old_ranged_hunks);
+    let old_hunks = files::merge_hunks(&old_contents, store.merge_options());
 
     // Parse conflicts from the new content using the arity of the simplified
     // conflicts.
@@ -1135,7 +1131,6 @@ pub async fn update_from_content(
                 path,
                 old_id,
                 &old_contents,
-                &old_ranged_hunks,
                 index,
                 &hunks,
             )
