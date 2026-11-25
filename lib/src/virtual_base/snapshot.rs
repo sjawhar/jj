@@ -27,12 +27,19 @@
 //! the file showed, which jj's snapshot writes into every term, a plain base
 //! among them; it goes into V's terms too, so that a later rewrite that puts
 //! V's terms in VB's place keeps it (a change that a parent made there).
-//! Where such a hunk cuts a block, the merge made something of the block,
-//! which is no change of the person's, and VB keeps its own text there
-//! (merge-cases' VB6). The rest is the person's changes to the base: a
-//! conflict that they resolved, deleted, moved or copied, and a line that
-//! they changed. The snapshot makes each one, and each hunk that the merge
-//! resolved outside every block, to V's terms, by where it falls in VB:
+//! Where such hunks cut a block, VB keeps its marker lines and the side of
+//! the block that the merge did not take (merge-cases' VB6), which no side
+//! of the conflict changes; but jj's snapshot writes each such hunk's text
+//! into every side, so each side changes its own text there to that text,
+//! and where the hunk lies inside one side of the block, that change goes
+//! into V's terms as well (see [`edits::ShownBase`]), so that a rewrite that
+//! takes the snapshot's sides away gives back what the parents' merge held
+//! there (a parent's own line in a block that the merge cuts). The rest is
+//! the person's changes to the base: a conflict that they resolved,
+//! deleted, moved or copied, and a line that they changed. The snapshot
+//! makes each one, each hunk that the merge resolved outside every block,
+//! and each side's change inside a block, to V's terms, by where it falls
+//! in VB:
 //!
 //! 1. in text that every term of V holds, or at the edge of a hunk of V's
 //!    terms' merge, outside every block: the change is made to every term, at
@@ -112,6 +119,7 @@ use futures::future::BoxFuture;
 use itertools::Itertools as _;
 
 use self::edits::Edit;
+use self::edits::ShownBase;
 use self::edits::Text;
 use self::edits::base_edits;
 use self::edits::edge_insertions;
@@ -136,9 +144,7 @@ use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
 use crate::backend::TreeValue;
 use crate::conflict_labels::ConflictLabels;
-use crate::files;
 use crate::files::FileMergeHunkLevel;
-use crate::files::MergeResult;
 use crate::merge::Merge;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
@@ -207,22 +213,11 @@ pub(crate) async fn rewrite_virtual_base(
                 new_base: &new_base,
             };
             if is_text {
-                return edited_text_terms(&base, &term_contents, &snapshot, options)
-                    .map_or(Edited::Kept, Edited::Terms);
+                edited_text_terms(&base, &term_contents, &snapshot, options)
+                    .map_or(Edited::Kept, Edited::Terms)
+            } else {
+                Edited::Terms(edited_file_terms(&base, &term_contents, &snapshot, options))
             }
-            // Files that are not all text merge by line as text does, so the VB
-            // that such a merge would give them tells where the changes that
-            // every side of the conflict has fall in them.
-            let all_files = terms
-                .iter()
-                .all(|term| matches!(term, Some(TreeValue::File { .. })));
-            let by_reference = all_files
-                .then(|| edited_by_reference(&base, &term_contents, &snapshot, options))
-                .flatten();
-            Edited::Terms(by_reference.unwrap_or_else(|| {
-                let edits = edge_insertions(old_contents, new_hunks, old.len());
-                edited_m_terms(old, &terms, &term_contents, &edits)
-            }))
         },
     );
     let new_contents = match edited {
@@ -533,13 +528,39 @@ fn edited_text_terms(
     let Some((layout, options)) = laid_out(base.finder, term_contents, options) else {
         return edited_by_reference(base, term_contents, snapshot, options);
     };
-    let seen_hunks = match files::merge_hunks(snapshot.old_contents, &options) {
-        MergeResult::Resolved(text) => vec![Merge::resolved(text)],
-        MergeResult::Conflict(hunks) => hunks,
-    };
-    let seen = Text::of_base(&seen_hunks, snapshot.index)?;
+    let seen = ShownBase::new(base.finder, snapshot.old_contents, snapshot.index, &options);
     let edits = base_edits(base.finder, &seen, snapshot.new_base);
     Some(layout.edited(&edits))
+}
+
+/// The contents of V's terms, `term_contents`, files that are not all text,
+/// with the changes of `snapshot` to `base`, which names them, made. The
+/// store's merge options are `options`.
+///
+/// Files that are not all text merge by line as text does, so where every
+/// term is a file, the VB that such a merge would give them tells where the
+/// changes that every side of the conflict has fall in them (see
+/// [`edited_by_reference`]). Otherwise, or where that VB is not laid out
+/// over them, only the text that every side gained at its very start or at
+/// its very end goes into them (see [`edited_m_terms`]).
+fn edited_file_terms(
+    base: &VirtualBase<'_>,
+    term_contents: &Merge<BString>,
+    snapshot: &Snapshot<'_>,
+    options: &MergeOptions,
+) -> Merge<Vec<u8>> {
+    let all_files = base
+        .terms
+        .iter()
+        .all(|term| matches!(term, Some(TreeValue::File { .. })));
+    let by_reference = all_files
+        .then(|| edited_by_reference(base, term_contents, snapshot, options))
+        .flatten();
+    by_reference.unwrap_or_else(|| {
+        let old = base.finder.vb;
+        let edits = edge_insertions(snapshot.old_contents, snapshot.new_hunks, old.len());
+        edited_m_terms(old, base.terms, term_contents, &edits)
+    })
 }
 
 /// The contents of V's terms, `term_contents`, with the changes of
@@ -665,15 +686,20 @@ mod tests {
         let finder = BlockFinder::new(&vb, &blocks);
         let layout = Layout::new(&finder, terms, &options()).unwrap();
         // The base as the file that jj materialized showed it: VB, each of
-        // its blocks in the base of a conflict.
-        let mut seen = Text::default();
+        // its blocks in the base of a conflict, so no hunk that the
+        // conflict's merge resolved cuts one.
+        let mut text = Text::default();
         let mut at = 0;
         for block in &blocks {
-            seen.push(&vb[at..block.start], false);
-            seen.push(&vb[block.start..block.end], true);
+            text.push(&vb[at..block.start], false);
+            text.push(&vb[block.start..block.end], true);
             at = block.end;
         }
-        seen.push(&vb[at..], false);
+        text.push(&vb[at..], false);
+        let seen = ShownBase {
+            text,
+            side_edits: vec![],
+        };
         let edited = layout.edited(&base_edits(&finder, &seen, new));
         edited
             .iter()
@@ -898,23 +924,32 @@ mod tests {
         // V conflicts at N hunks, each between the sides `x` and `y`, so VB
         // has N blocks with the same sides, and the file that jj
         // materialized shows each in the base of a conflict that the person
-        // kept; they change one line between two of them. The finder of the
-        // blocks that the bases hold reads each block's sides once to be
-        // built, and one block's for each block that it finds, in each of the
-        // three passes over the bases: 4N in all. Looking a block up among
-        // all of VB's reads N for each, N² in all.
+        // kept. The person changes one line between two of them, and `y` to
+        // `Y` in each base, so that no block has the sides that a base
+        // holds. The count is of the blocks whose sides the finders read:
+        // each block's once to build the finder, and, for each base that a
+        // pass over the bases looks up, each block whose sides it compares
+        // with the base's (see `BlockFinder::holds`). The finder compares the
+        // block of the base's opening line and finds no other by those sides,
+        // in three passes, so it reads 4N in all. Comparing a base's sides
+        // with those of each block of VB in turn reads N for each base that
+        // no block holds, N² in all.
         const N: usize = 64;
         let text = |side: &str| BString::from((0..N).map(|i| format!("{side}\ns{i}\n")).join(""));
         let terms = Merge::from_vec(vec![text("x"), text("o"), text("y")]);
         let vb = String::from_utf8(vb_of(&terms)).unwrap();
-        let new = vb.replacen("\ns0\n", "\nS0\n", 1);
+        let new = vb.replacen("\ns0\n", "\nS0\n", 1).replace("\ny\n", "\nY\n");
         let before = blocks_read();
-        let edited = edited(&terms, &new_text(&new, in_a_block));
+        let in_a_base = |line: &str| line == "Y\n" || in_a_block(line);
+        let edited = edited(&terms, &new_text(&new, in_a_base));
         let read = blocks_read() - before;
         for (old, new) in zip(terms.iter(), edited) {
             assert_eq!(new, old.to_string().replacen("\ns0\n", "\nS0\n", 1));
         }
-        assert!(read <= 8 * N, "{read} blocks read for {N} blocks");
+        assert!(
+            (N..=8 * N).contains(&read),
+            "{read} blocks read for {N} blocks"
+        );
     }
 
     #[test]

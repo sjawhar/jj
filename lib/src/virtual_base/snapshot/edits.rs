@@ -16,6 +16,7 @@
 //! left in place of each range of it that they changed (see the
 //! documentation of [`super`]).
 
+use std::iter;
 use std::iter::zip;
 use std::ops::Range;
 
@@ -215,18 +216,98 @@ impl Marker {
     }
 }
 
+/// The base of a conflict, VB, as the file that jj materialized for the
+/// conflict showed it, with the changes that the conflict's sides make to VB
+/// where the conflict's own merge resolved a hunk inside one of its blocks.
+pub(super) struct ShownBase {
+    /// VB but for the hunks that the conflict's own merge resolved to its
+    /// sides' text, which show that text.
+    pub(super) text: Text,
+    /// At each hunk that the merge resolved inside a side of a block of VB,
+    /// the sides' changes there made to VB's text, in order (see
+    /// [`Self::new`]).
+    pub(super) side_edits: Vec<Edit>,
+}
+
+impl ShownBase {
+    /// VB, whose blocks `finder` finds, the base at `index` among the
+    /// removes of `contents`, the contents of a conflict's terms, as their
+    /// merge with `options` shows it.
+    ///
+    /// At a hunk that the merge resolves to `S`, jj's snapshot writes `S`
+    /// into every side of the conflict, so each side's change there is its
+    /// own text `P_i` to `S`. Where the hunk lies inside one side of a block
+    /// of VB, holding none of its marker lines, those changes are made to
+    /// VB's text `B` there: the text that takes its place is `B` plus, for
+    /// each side, `S` less `P_i`, where those merge. That is `S` where a
+    /// side holds `B` and the other `S`, and `B` where every side holds
+    /// `S`, which made no change there. VB's marker lines, and the lines of
+    /// a side of a block that the merge did not take, are in no such hunk.
+    pub(super) fn new(
+        finder: &BlockFinder<'_>,
+        contents: &Merge<BString>,
+        index: usize,
+        options: &MergeOptions,
+    ) -> Self {
+        let vb = finder.vb;
+        let mut text = Text::default();
+        let mut side_edits = vec![];
+        for hunk in files::split_ranged_hunks(contents, options) {
+            let Some(range) = hunk.ranges.get_remove(index).cloned() else {
+                continue;
+            };
+            let Some(merged) = &hunk.resolved else {
+                text.push(&vb[range], true);
+                continue;
+            };
+            text.push(merged, false);
+            if hunk.matching || !is_inside_a_side(finder.blocks, &range) {
+                continue;
+            }
+            let own = &vb[range.clone()];
+            let sides = zip(contents.adds(), hunk.ranges.adds())
+                .map(|(content, range)| &content.as_slice()[range.clone()]);
+            let merged = merged.as_slice();
+            let changes = iter::once(own).chain(iter::repeat_n(merged, contents.num_sides()));
+            let changed = files::try_merge(&Merge::from_removes_adds(sides, changes), options);
+            if let Some(changed) = changed
+                && changed.as_slice() != own
+            {
+                side_edits.push(Edit {
+                    range,
+                    text: Text::literal(&changed),
+                });
+            }
+        }
+        Self { text, side_edits }
+    }
+}
+
+/// Whether `range` of VB, whose blocks are `blocks`, lies inside one side of
+/// a block, holding none of the block's marker lines.
+fn is_inside_a_side(blocks: &[Block<'_>], range: &Range<usize>) -> bool {
+    let next = blocks.partition_point(|block| block.end <= range.start);
+    blocks.get(next).is_some_and(|block| {
+        block
+            .side_ranges
+            .iter()
+            .any(|side| side.start <= range.start && range.end <= side.end)
+    })
+}
+
 /// The changes from VB, VB or M whose blocks `finder` finds, to `new`, the
 /// text that a snapshot gives it, in order, none overlapping another, where
-/// `seen` is the text that a snapshot of the file that jj materialized would
-/// give it.
+/// `seen` is the base that the file that jj materialized showed.
 ///
-/// `seen` is VB but for the hunks that the conflict's own merge resolved to
-/// its sides' text, which the file holds in place of VB's. Outside every
-/// block of VB, that text is what the file showed for the base, and it goes
-/// into V's terms as the person left it, as jj's snapshot writes the text of
-/// a hunk that resolves into every term, a plain base among them. Where such
-/// a hunk cuts a block, VB keeps its own text unless the person changed what
-/// the merge made of the block (see [`onto_virtual_base`]).
+/// The text of `seen` is VB but for the hunks that the conflict's own merge
+/// resolved to its sides' text, which the file holds in place of VB's.
+/// Outside every block of VB, that text is what the file showed for the
+/// base, and it goes into V's terms as the person left it, as jj's snapshot
+/// writes the text of a hunk that resolves into every term, a plain base
+/// among them. Where such hunks cut a block, VB keeps its marker lines and
+/// the side that the merge did not take, and takes each side's change
+/// inside a side of the block (see [`ShownBase::new`]), unless the person
+/// changed what the merge made of the block (see [`onto_virtual_base`]).
 ///
 /// The working copy can hold the marker lines of an earlier VB of the same
 /// conflict, which an earlier snapshot replaced, so a block is told by its
@@ -239,7 +320,7 @@ impl Marker {
 /// deleted in one place and put, whole, in another; and each other line of a
 /// base in the form of a marker line is equal to VB's marker line of that
 /// kind, so a change inside a block's side is a change of those lines alone.
-pub(super) fn base_edits(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> Vec<Edit> {
+pub(super) fn base_edits(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text) -> Vec<Edit> {
     let vb = finder.vb;
     let new = &onto_virtual_base(finder, seen, new);
     let held = new
@@ -273,15 +354,21 @@ pub(super) fn base_edits(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> V
 /// blocks `finder` finds, where `seen` is that base as the file that jj
 /// materialized showed it.
 ///
-/// A line diff of `seen` against `new` gives the person's changes, and one
-/// of `seen` against VB the hunks that the conflict's own merge resolved to
-/// its sides' text. The result is `seen` with the person's changes. A hunk
-/// that the merge resolved outside every block of VB keeps the text that the
-/// file showed, or the person's, so it goes into V's terms. A hunk that cuts
-/// a block takes VB's own lines back, unless a change of the person's touches
-/// the lines that the file showed for the block: the hunks that are parts of
-/// one block are one in this (see [`resolved_hunks`] and [`untouched`]).
-fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> Text {
+/// A line diff of the text that the file showed against `new` gives the
+/// person's changes, and one of it against VB the hunks that the conflict's
+/// own merge resolved to its sides' text. The result is the text that the
+/// file showed with the person's changes. A hunk that the merge resolved
+/// outside every block of VB keeps the text that the file showed, or the
+/// person's, so it goes into V's terms. Where such hunks cut a block, the
+/// lines that the file showed for the block give way to VB's own lines of
+/// it, with the sides' changes inside its sides (see [`ShownBase::new`]),
+/// unless a change of the person's touches the lines that the file showed
+/// for the block (see [`resolved_hunks`] and [`untouched`]).
+fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text) -> Text {
+    let ShownBase {
+        text: seen,
+        side_edits,
+    } = seen;
     let vb = finder.vb;
     let seen_lines = seen.lines(finder);
     // VB's own lines, with each marker line of its blocks as the line that
@@ -314,7 +401,14 @@ fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &Text, new: &Text) -> Text 
         .collect_vec();
     let own_changes = line_changes(&seen_lines.bytes, &own_lines.bytes);
     let resolved = resolved_hunks(finder, &own_lines, &own_changes);
-    let kept = untouched(finder.blocks, &own_lines, &own_changes, &changes, resolved);
+    let kept = untouched(
+        finder,
+        &own_lines,
+        &own_changes,
+        &changes,
+        resolved,
+        side_edits,
+    );
     // Each range of the lines of `seen` to replace, with the text that takes
     // its place.
     let mut replacements = changes;
@@ -360,58 +454,98 @@ fn resolved_hunks(
         let Some(block) = block else {
             continue;
         };
-        let mut own = Text::default();
-        let mut at = start;
-        for line in vb[start..end].lines_with_terminator() {
-            own.push(line, finder.marker_at(at).is_some());
-            at += line.len();
-        }
         match resolved.last_mut() {
             Some(last) if last.block == block => {
                 last.span.end = range.end;
-                last.parts.push((range, own));
+                last.own.end = own_range.end;
             }
             _ => resolved.push(Resolved {
                 block,
-                span: range.clone(),
-                parts: vec![(range, own)],
+                span: range,
+                own: own_range,
             }),
         }
     }
     resolved
 }
 
-/// The parts of `resolved`, hunks that the conflict's own merge resolved in
-/// blocks of VB, `blocks`, for which VB keeps its own lines: those of each
-/// block where none of `changes`, the person's changes of the lines of the
-/// base that the file showed, touches the lines that the file showed for the
-/// block. A change that takes some of those lines, or puts text among them,
-/// changes what the merge made of the block, and all of its hunks stay as
-/// the person left them. `own_changes` are the changes from the lines that
-/// the file showed to VB's own lines, `own_lines`.
+/// What takes the place of the lines that the file showed for each block of
+/// `resolved`, blocks of VB, whose blocks `finder` finds, that hunks that the
+/// conflict's own merge resolved cut, where none of `changes`, the person's
+/// changes of the lines of the base that the file showed, touches those
+/// lines: VB's own lines of the block and of the hunks, with each of
+/// `side_edits`, the sides' changes to VB, that falls inside them. A change
+/// that takes some of those lines, or puts text among them, changes what the
+/// merge made of the block, and they stay as the person left them.
+/// `own_changes` are the changes from the lines that the file showed to VB's
+/// own lines, `own_lines`.
 fn untouched(
-    blocks: &[Block<'_>],
+    finder: &BlockFinder<'_>,
     own_lines: &Lines,
     own_changes: &[(Range<usize>, Range<usize>)],
     changes: &[(Range<usize>, Text)],
     resolved: Vec<Resolved>,
+    side_edits: &[Edit],
 ) -> Vec<(Range<usize>, Text)> {
+    let vb = finder.vb;
     let mut kept = vec![];
-    for Resolved { block, span, parts } in resolved {
-        let block = &blocks[block];
-        let start = offset_among(own_lines, block.start);
-        let end = offset_among(own_lines, block.end);
-        let start = span.start.min(lined_up(own_changes, start, false));
-        let end = span.end.max(lined_up(own_changes, end, true));
+    // The end of VB's own lines of the block before, which a hunk that cuts
+    // it can reach past.
+    let mut done = 0;
+    for Resolved { block, span, own } in resolved {
+        let block = &finder.blocks[block];
+        // The block's own lines, and the lines that the file showed for them,
+        // without a change that is next to the block but outside it.
+        let block_start = offset_among(own_lines, block.start).max(done);
+        let block_end = offset_among(own_lines, block.end);
+        let (own_start, start) = if own.start <= block_start {
+            (own.start, span.start)
+        } else {
+            (block_start, lined_up(own_changes, block_start, true))
+        };
+        let (own_end, end) = if block_end <= own.end {
+            (own.end, span.end)
+        } else {
+            (block_end, lined_up(own_changes, block_end, false))
+        };
+        done = own_end;
         let first = changes.partition_point(|(change, _)| change.end <= start);
         let touched = changes[first..]
             .first()
             .is_some_and(|(change, _)| change.start < end);
         if !touched {
-            kept.extend(parts);
+            let range =
+                own_lines.original(own_start, vb.len())..own_lines.original(own_end, vb.len());
+            kept.push((start..end, with_side_edits(finder, range, side_edits)));
         }
     }
     kept
+}
+
+/// `range` of VB, whose blocks `finder` finds, with each of `side_edits`,
+/// changes to VB in order, that falls inside it made: the marker lines of
+/// VB's blocks as text that came from a base, the rest as text.
+fn with_side_edits(finder: &BlockFinder<'_>, range: Range<usize>, side_edits: &[Edit]) -> Text {
+    let push_own = |text: &mut Text, range: Range<usize>| {
+        let mut at = range.start;
+        for line in finder.vb[range].lines_with_terminator() {
+            text.push(line, finder.marker_at(at).is_some());
+            at += line.len();
+        }
+    };
+    let mut text = Text::default();
+    let mut at = range.start;
+    let first = side_edits.partition_point(|edit| edit.range.start < range.start);
+    for edit in side_edits[first..]
+        .iter()
+        .take_while(|edit| edit.range.end <= range.end)
+    {
+        push_own(&mut text, at..edit.range.start);
+        text.append(&edit.text);
+        at = edit.range.end;
+    }
+    push_own(&mut text, at..range.end);
+    text
 }
 
 /// The offset among `lines` of `original`, the start of a line of the text
@@ -459,15 +593,15 @@ fn lined_up(changes: &[(Range<usize>, Range<usize>)], offset: usize, end: bool) 
 }
 
 /// Hunks that a conflict's own merge resolved to its sides' text in one block
-/// of VB, as changes of the lines of the base that the file showed back to
-/// VB's own lines.
+/// of VB, as changes of the lines of the base that the file showed to VB's
+/// own lines.
 struct Resolved {
     /// The index of the block.
     block: usize,
-    /// The lines that the hunks span.
+    /// The lines of the base that the file showed that the hunks span.
     span: Range<usize>,
-    /// Each range of lines to replace, with VB's own lines for it.
-    parts: Vec<(Range<usize>, Text)>,
+    /// VB's own lines that they span.
+    own: Range<usize>,
 }
 
 /// The lines of `range` of VB, whose blocks `finder` finds, where each marker

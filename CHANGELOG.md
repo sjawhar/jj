@@ -104,41 +104,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   person moved or copied takes the terms' own lines with it. Text that the
   merge itself resolved outside the conflict of the merge bases, such as a
   parent's own change, goes into those terms too, as jj's snapshot writes it
-  into a plain base. A line that looks like a marker line is the person's
-  text. A change of the lines that show the virtual merge base inside a
-  conflict that the person kept is not made: those lines are derived from
-  the merge bases. Where a merge base's own
-  merge bases disagreed, so that a term is itself a virtual merge base, the
-  change is made to the terms which that one stands for, never to its text.
-  Where the conflict of the merge bases is between files that are not all
-  text, a snapshot keeps the changes that every side of the conflict has
-  alike; where a term is absent or is not a file, it keeps only text put
-  before or after the whole conflict, and leaves a term that is not a file
-  (a symlink, a submodule or a directory) as it is. A file whose final
-  newline the person or a merge tool removed after a conflict's end marker
-  removes it from those terms too. Where an edit would make a term of the
-  merge bases' conflict a file that is itself a virtual merge base (one
-  pasted into a deleted side), the snapshot keeps the old one as the base:
-  none can stand for such terms. A squash of a merge of
-  three or more commits into a descendant, or into a new commit that
-  `--insert-after` or `--insert-before` places among its descendants, merges
-  the descendant's rebase and the squashed changes as one merge, whatever
-  commits lie between, at each path where the merge's parents hold a
-  conflict between files or where it replaces a virtual merge base, so the
-  changes there no longer bring back a merge base's own base that the rebase
-  resolved away; every
-  other path is squashed as before. A virtual merge base's marker lines
-  carry a salt at which no line of either side of the merge equals one of
-  them; where the text of the merge bases' conflict holds lines of that
-  shape at the highest salts, and a side holds a marker line there too, the
-  merge writes the placeholder, which holds none of that text, instead of a
-  virtual merge base. A merge is refused, and writes nothing,
-  where it would replace more than 10,000 virtual merge bases at one path, or
-  more than 10,000 in all and 100 for each path where it replaces one: files
-  that pass as virtual merge bases can stand for that many, and so can a
-  history that is both deep and wide (a braid of 202 criss-cross levels over
-  100 files needs about 201 at each path, more than 20,000 in all, where jj
-  0.45.1 completes). Where a later rebase, abandon or duplicate rewrites the
+  into a plain base. Where the merge resolved a hunk inside one side of that
+  conflict, such as a parent's own line there, jj's snapshot changes each
+  side of the file's conflict there from its own text to the merge's, and
+  that change goes into the term of the merge bases' conflict whose side
+  holds it, so a later abandon of the merge or a rebase of its children
+  keeps what the parents' merge held there. A line that looks like a marker
+  line is the person's text. A change of the lines that show the virtual
+  merge base inside a conflict that the person kept is not made: those lines
+  are derived from the merge bases. Where a merge base's own merge bases
+  disagreed, so that a term is itself a virtual merge base, the change is
+  made to the terms which that one stands for, never to its text. Where the
+  conflict of the merge bases is between files that are not all text, a
+  snapshot keeps the changes that every side of the conflict has alike;
+  where a term is absent or is not a file, it keeps only text put before or
+  after the whole conflict, and leaves a term that is not a file (a symlink,
+  a submodule or a directory) as it is. A file whose final newline the
+  person or a merge tool removed after a conflict's end marker removes it
+  from those terms too. Where an edit would make a term of the merge bases'
+  conflict a file that is itself a virtual merge base (one pasted into a
+  deleted side), the snapshot keeps the old one as the base: none can stand
+  for such terms. A squash of a merge of three or more commits into a
+  descendant, or into a new commit that `--insert-after` or `--insert-before`
+  places among its descendants, merges the descendant's rebase and the
+  squashed changes as one merge, whatever commits lie between, at each path
+  where the merge's parents hold a conflict between files or where it
+  replaces a virtual merge base, so the changes there no longer bring back a
+  merge base's own base that the rebase resolved away; every other path is
+  squashed as before. A virtual merge base's marker lines carry a salt at
+  which no line of either side of the merge equals one of them; where the
+  text of the merge bases' conflict holds lines of that shape at the highest
+  salts, and a side holds a marker line there too, the merge writes the
+  placeholder, which holds none of that text, instead of a virtual merge
+  base. A merge is refused, and writes nothing, where it would replace more
+  than 10,000 virtual merge bases at one path, or more than 10,000 in all
+  and 100 for each path where it replaces one: files that pass as virtual
+  merge bases can stand for that many, and so can a history that is both
+  deep and wide (a braid of 202 criss-cross levels over 100 files needs
+  about 201 at each path, more than 20,000 in all, where jj 0.45.1
+  completes). Where a later rebase, abandon or duplicate rewrites the
   parents of an edited merge, jj's rebase can put back among the sides a
   parent that deletes the file, a parent whose change conflicts with the
   merge's own (a final newline removed where the parent changed the last

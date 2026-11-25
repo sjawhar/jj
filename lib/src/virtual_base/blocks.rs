@@ -386,8 +386,9 @@ impl<'a> BlockFinder<'a> {
     /// of VB with their marker lines, or where they would take the bytes read
     /// as sides for `range` past [`MAX_COMPARED`] times its length. So the
     /// bytes read and looked up as sides are bounded by a multiple of the
-    /// length of `range`, and each lookup reads the sides of at most one
-    /// block, whatever the number of VB's blocks.
+    /// length of `range`, and each lookup looks the sides up once in the map
+    /// of sides and compares them with those of at most two blocks (see
+    /// [`Self::block_holding`]), whatever the number of VB's blocks.
     pub(super) fn held(&self, bytes: &[u8], range: Range<usize>) -> Vec<(Range<usize>, usize)> {
         let lines = lines_at(&bytes[range.clone()], range.start);
         let mut budget = range.len().saturating_mul(MAX_COMPARED);
@@ -431,17 +432,31 @@ impl<'a> BlockFinder<'a> {
     /// The block of VB that holds `sides`, the sides that a text holds after
     /// `line`, a line in the form of an opening marker line: the block whose
     /// opening line `line` is, if it holds them, else the first block from
-    /// `next_block` on that holds them, else the first one that does.
+    /// `next_block` on that holds them, else the first one that does. Each
+    /// block whose sides a lookup compares with `sides`, the block of `line`
+    /// and the one that the map of sides gives, is compared by
+    /// [`Self::holds`], so a lookup compares the sides of at most two.
     fn block_holding(&self, line: &[u8], sides: &[&[u8]], next_block: usize) -> Option<usize> {
-        count_read(1);
         let own = self
             .block_of(line)
-            .filter(|&block| self.blocks[block].sides == sides);
+            .filter(|&block| self.holds(block, sides));
         own.or_else(|| {
             let holding = self.blocks_with(sides);
             let next = holding.partition_point(|&block| block < next_block);
-            holding.get(next).or(holding.first()).copied()
+            holding
+                .get(next)
+                .or(holding.first())
+                .copied()
+                .filter(|&block| self.holds(block, sides))
         })
+    }
+
+    /// Whether the block at `block` of VB has the sides `sides`: the one
+    /// comparison of a block's sides with a text's that a lookup makes,
+    /// which the tests that bound a finder's reads count.
+    fn holds(&self, block: usize, sides: &[&[u8]]) -> bool {
+        count_read(1);
+        self.blocks[block].sides == sides
     }
 
     /// The blocks of VB whose sides are `sides`, in order.

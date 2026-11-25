@@ -37,6 +37,7 @@
 //! a user would make the commits, so that the index lists the merge bases in
 //! that order.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::process::Command;
 use std::sync::Arc;
@@ -71,6 +72,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::CommitWithSelection;
 use jj_lib::rewrite::RebaseOptions;
+use jj_lib::rewrite::duplicate_commits;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::rewrite::merge_commit_trees_no_resolve;
 use jj_lib::rewrite::rebase_commit;
@@ -2276,11 +2278,14 @@ fn vb6_an_edit_where_the_opening_line_resolves_keeps_every_marker_line() -> Test
 /// VB6: the merge of P1 and P2 resolves two hunks of VB's block to its
 /// sides' text (both drop the opening line, and P2 puts `Q` inside the first
 /// side), so the file that jj materializes for w shows the base without the
-/// one and with the other. Neither is a change of the person's: a snapshot
-/// with line 5 changed to `FIVE` makes that change alone to V's terms, and s,
-/// which resolves `f` to P2's text, rebased onto P1, is a conflict.
+/// one and with the other. Neither is a change of the person's, but jj's
+/// snapshot writes `Q` into side 1, P1's text, which lacked it: a snapshot
+/// with line 5 changed to `FIVE` makes that change to V's terms, and makes
+/// side 1's change, `Q` between `x1` and `x2`, inside A's side of the block,
+/// to A's term. The opening line and B's side stay. s, which resolves `f` to
+/// P2's text, rebased onto P1, is a conflict.
 #[test]
-fn vb6_a_snapshot_changes_only_what_the_person_changed() -> TestResult {
+fn vb6_a_snapshot_changes_what_the_person_and_the_cut_block_changed() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
     } = vb6_history()?;
@@ -2293,7 +2298,7 @@ fn vb6_a_snapshot_changes_only_what_the_person_changed() -> TestResult {
             .collect_vec(),
         [
             "1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n",
-            "x1\nx2\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n",
+            "x1\nQ\nx2\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n",
             "y1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n",
         ]
     );
@@ -2306,9 +2311,10 @@ fn vb6_a_snapshot_changes_only_what_the_person_changed() -> TestResult {
 }
 
 /// VB6 with a line appended in the working copy: the line goes into every
-/// term of V, and V's terms hold no other change.
+/// term of V, and V's terms hold no other change but side 1's `Q` in A's
+/// term.
 #[test]
-fn vb6_a_line_appended_goes_into_every_term_alone() -> TestResult {
+fn vb6_a_line_appended_goes_into_every_term() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
     } = vb6_history()?;
@@ -2321,7 +2327,7 @@ fn vb6_a_line_appended_goes_into_every_term_alone() -> TestResult {
             .collect_vec(),
         [
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\nEND\n",
-            "x1\nx2\n2\n3\n4\n5\n6\n7\n8\n9\n10\nEND\n",
+            "x1\nQ\nx2\n2\n3\n4\n5\n6\n7\n8\n9\n10\nEND\n",
             "y1\n2\n3\n4\n5\n6\n7\n8\n9\n10\nEND\n",
         ]
     );
@@ -2436,6 +2442,458 @@ fn a_third_parents_own_change_survives_a_sibling_rebase_after_a_snapshot() -> Te
         assert_every_term_holds(&case, &value, line);
     }
     Ok(())
+}
+
+/// K4s: P1 and P2, merges of A and B, which set line 1 of `o 2 3 4 5 6 7 8`
+/// to `x` and `y`, both set line 6 to `SAME`, so w's own merge resolves line
+/// 6, outside VB's block, to `SAME`, where no side changes. jj's snapshot
+/// writes the text of a hunk that resolves into every term of a conflict, a
+/// plain base among them, and the snapshot of an edit of line 3 writes
+/// `SAME` into V's terms too: u rebased onto s, children of w that hold its
+/// file with `x` and with `y`, holds `SAME` in every term, and s rebased onto
+/// P1 is P1's text, clean.
+#[test]
+fn k4s_a_line_that_both_parents_add_survives_rewrites_after_a_snapshot() -> TestResult {
+    let text =
+        |first: &str, three: &str, six: &str| lines(&format!("{first} 2 {three} 4 5 {six} 7 8"));
+    let TwoBases {
+        mut case, p1, p2, ..
+    } = two_bases(
+        &[("f", text("o", "3", "6"))],
+        &[("f", text("x", "3", "6"))],
+        &[("f", text("y", "3", "6"))],
+        Made::AFirst,
+        &[("f", text("x", "3", "SAME"))],
+        &[("f", text("y", "3", "SAME"))],
+    )?;
+    let w = case.commit(&[&p1, &p2], &[])?;
+    let new_value = snapshot_edits(&case, &w, &[("3", "EDIT")])?;
+    let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    let s = case.commit(&[&w], &[("f", text("x", "EDIT", "SAME"))])?;
+    let u = case.commit(&[&w], &[("f", text("y", "EDIT", "SAME"))])?;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?.simplify();
+    assert!(!value.is_resolved(), "{}", describe(&case, &value));
+    assert_every_term_holds(&case, &value, "SAME");
+    let rebased = rebase_commit(case.tx.repo_mut(), s.clone(), vec![p1.id().clone()]).block_on()?;
+    let merged = Merged {
+        case,
+        parents: vec![p1, s],
+        tree: rebased.tree(),
+    };
+    assert_resolved_text(&merged, "x\n2\n3\n4\n5\nSAME\n7\n8\n")
+}
+
+/// A history whose merge cuts a block of VB: o holds `1 2 3 4 5 6 7 8`; A
+/// and B, its children, and P1 and P2, merges of A and B, hold the texts of
+/// a [`CutTexts`], where a parent's own line sits inside one side of VB's
+/// block at line 1. w, the merge of P1 and P2, is left conflicted: its own
+/// merge resolves that line's hunk, which cuts the block, and conflicts at
+/// the last line. With `edit`, a line of `f` and its replacement, that line
+/// is changed in w's working copy and snapshotted. s and u, children of w,
+/// hold the file that jj materializes for w with side 1 and with side 2 of
+/// its conflict.
+struct CutHistory {
+    case: Case,
+    a: Commit,
+    p1: Commit,
+    p2: Commit,
+    w: Commit,
+    s: Commit,
+    u: Commit,
+}
+
+/// The texts of a [`CutHistory`], each word a line.
+struct CutTexts {
+    a: &'static str,
+    b: &'static str,
+    p1: &'static str,
+    p2: &'static str,
+    /// What the file that jj materializes for w shows before its conflict
+    /// at the last line, between A's `xA` and B's `yB`.
+    shown: &'static str,
+}
+
+/// cutq: A sets line 1 to `x1 x2` and line 8 to `xA`, and B to `y1` and
+/// `yB`; P1 holds A's text, and P2 holds A's lines with its own line `Q`
+/// between `x1` and `x2`, inside A's side of the block, and B's `yB`.
+const CUTQ: CutTexts = CutTexts {
+    a: "x1 x2 2 3 4 5 6 7 xA",
+    b: "y1 2 3 4 5 6 7 yB",
+    p1: "x1 x2 2 3 4 5 6 7 xA",
+    p2: "x1 Q x2 2 3 4 5 6 7 yB",
+    shown: "x1 Q x2 2 3 4 5 6 7",
+};
+
+/// cutqz: cutq where P1 holds its own `Z` at line 6 too, outside every block.
+const CUTQZ: CutTexts = CutTexts {
+    p1: "x1 x2 2 3 4 Z 6 7 xA",
+    shown: "x1 Q x2 2 3 4 Z 6 7",
+    ..CUTQ
+};
+
+/// cqp, cutq's mirror: A sets line 1 to `x1` and line 8 to `xA`, and B to
+/// `y1 y2` and `yB`; P1 holds B's lines with its own line `Q` between `y1`
+/// and `y2`, inside B's side of the block, and A's `xA`, and P2 holds B's
+/// text.
+const CQP: CutTexts = CutTexts {
+    a: "x1 2 3 4 5 6 7 xA",
+    b: "y1 y2 2 3 4 5 6 7 yB",
+    p1: "y1 Q y2 2 3 4 5 6 7 xA",
+    p2: "y1 y2 2 3 4 5 6 7 yB",
+    shown: "y1 Q y2 2 3 4 5 6 7",
+};
+
+fn cut_history(texts: &CutTexts, edit: Option<(&str, &str)>) -> TestResult<CutHistory> {
+    let TwoBases {
+        mut case,
+        a,
+        p1,
+        p2,
+        ..
+    } = two_bases(
+        &[("f", lines("1 2 3 4 5 6 7 8"))],
+        &[("f", lines(texts.a))],
+        &[("f", lines(texts.b))],
+        Made::AFirst,
+        &[("f", lines(texts.p1))],
+        &[("f", lines(texts.p2))],
+    )?;
+    let mut w = case.commit(&[&p1, &p2], &[])?;
+    if let Some(edit) = edit {
+        let new_value = snapshot_edits(&case, &w, &[edit])?;
+        w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    }
+    let side = |last: &str| {
+        let words = format!("{} {last}", texts.shown);
+        lines(&match edit {
+            Some((line, replacement)) => words
+                .split(' ')
+                .map(|word| if word == line { replacement } else { word })
+                .join(" "),
+            None => words,
+        })
+    };
+    let s = case.commit(&[&w], &[("f", side("xA"))])?;
+    let u = case.commit(&[&w], &[("f", side("yB"))])?;
+    Ok(CutHistory {
+        case,
+        a,
+        p1,
+        p2,
+        w,
+        s,
+        u,
+    })
+}
+
+/// The values at `f` that a rewrite reads, each with the commit's name.
+type Reads = Vec<(&'static str, MergedTreeValue)>;
+
+/// A value at `f` hunk by hunk: for each hunk, its adds and its removes,
+/// each sorted; a hunk that resolves is its text alone.
+type Hunks = Vec<(Vec<String>, Vec<String>)>;
+
+/// `value` hunk by hunk, as jj shows it: the hunks of the merge of the
+/// contents of its terms after `simplify()`, each simplified.
+fn hunks(case: &Case, value: &MergedTreeValue) -> Hunks {
+    let contents = value
+        .simplify()
+        .map(|term| case.read(term.as_ref()).unwrap_or_default());
+    let hunks = match files::merge_hunks(&contents, case.store().merge_options()) {
+        files::MergeResult::Resolved(content) => vec![Merge::resolved(content)],
+        files::MergeResult::Conflict(hunks) => hunks,
+    };
+    let texts = |terms: Vec<String>| terms.into_iter().sorted().collect_vec();
+    hunks
+        .iter()
+        .map(|hunk| {
+            let hunk = hunk
+                .simplify()
+                .map(|text| String::from_utf8_lossy(text).into_owned());
+            let (removes, adds) = hunk.into_removes_adds();
+            (texts(adds.collect()), texts(removes.collect()))
+        })
+        .collect()
+}
+
+/// A hunk of [`Hunks`] that resolves to `words`, one a line.
+fn resolved_hunk(words: &str) -> (Vec<String>, Vec<String>) {
+    conflict_hunk(&[words], &[])
+}
+
+/// A hunk of [`Hunks`] with the sides `adds` and the bases `removes`, each
+/// words, one a line.
+fn conflict_hunk(adds: &[&str], removes: &[&str]) -> (Vec<String>, Vec<String>) {
+    let texts = |terms: &[&str]| {
+        terms
+            .iter()
+            .map(|words| format!("{}\n", words.replace(' ', "\n")))
+            .sorted()
+            .collect_vec()
+    };
+    (texts(adds), texts(removes))
+}
+
+/// Asserts that `rewrite`, run on the [`CutHistory`] of `texts`, gives, at
+/// each commit that it reads, the hunks that `expected` gives for the text
+/// of the line that `edit` changes, a line of `f` and its replacement: the
+/// line with no edit, and its replacement after the edit of w's working copy.
+/// Where the rewrite takes w's own change away, both are the same.
+fn assert_cut_rewrite(
+    texts: &CutTexts,
+    edit: (&str, &str),
+    rewrite: impl Fn(CutHistory) -> TestResult<(Case, Reads)>,
+    expected: impl Fn(&str) -> Vec<(&'static str, Hunks)>,
+) -> TestResult {
+    let (line, replacement) = edit;
+    let (mut actual, mut wanted) = (vec![], vec![]);
+    for (half, edit, text) in [("no edit", None, line), ("edit", Some(edit), replacement)] {
+        let (case, reads) = rewrite(cut_history(texts, edit)?)?;
+        let reads = reads
+            .iter()
+            .map(|(name, value)| (*name, hunks(&case, value)))
+            .collect_vec();
+        actual.push((half, reads));
+        wanted.push((half, expected(text)));
+    }
+    assert_eq!(actual, wanted);
+    Ok(())
+}
+
+/// The value at `f` of each of `commits`, with its name, once the
+/// descendants of the rewritten commits are rebased.
+fn rebased_values(case: &mut Case, commits: &[(&'static str, &Commit)]) -> TestResult<Reads> {
+    let rebased =
+        rebase_descendants_with_options_return_map(case.tx.repo_mut(), &RebaseOptions::default());
+    commits
+        .iter()
+        .map(|&(name, commit)| {
+            let commit = case.store().get_commit(&rebased[commit.id()])?;
+            Ok((name, value_at(&commit.tree(), "f")?))
+        })
+        .collect()
+}
+
+/// u rebased onto s, as `jj rebase -r u -o s` does.
+fn sibling_rebase(history: CutHistory) -> TestResult<(Case, Reads)> {
+    let CutHistory { mut case, s, u, .. } = history;
+    let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+    let value = value_at(&rebased.tree(), "f")?;
+    Ok((case, vec![("u", value)]))
+}
+
+/// u once w is abandoned, as `jj abandon w` rebases it onto P1 and P2.
+fn abandon_w(history: CutHistory) -> TestResult<(Case, Reads)> {
+    let CutHistory { mut case, w, u, .. } = history;
+    case.tx.repo_mut().record_abandoned_commit(&w);
+    let reads = rebased_values(&mut case, &[("u", &u)])?;
+    Ok((case, reads))
+}
+
+/// w once P2 is abandoned, as `jj abandon P2` rebases it onto P1 and P2's
+/// parents.
+fn abandon_p2_under_w(history: CutHistory) -> TestResult<(Case, Reads)> {
+    let CutHistory {
+        mut case, p2, w, ..
+    } = history;
+    case.tx.repo_mut().record_abandoned_commit(&p2);
+    let reads = rebased_values(&mut case, &[("w", &w)])?;
+    Ok((case, reads))
+}
+
+/// The duplicate of w onto P1, as `jj duplicate -r w -o P1` makes it.
+fn duplicate_w_onto_p1(history: CutHistory) -> TestResult<(Case, Reads)> {
+    let CutHistory {
+        mut case, p1, w, ..
+    } = history;
+    let stats = duplicate_commits(
+        case.tx.repo_mut(),
+        &[w.id().clone()],
+        &HashMap::new(),
+        &[p1.id().clone()],
+        &[],
+    )
+    .block_on()?;
+    let duplicate = &stats.duplicated_commits[w.id()];
+    Ok((case, vec![("dup", value_at(&duplicate.tree(), "f")?)]))
+}
+
+/// cutq through `jj abandon w`: u holds P2's `Q` and B's `yB`, clean, with no
+/// edit and after line 4 of w's working copy is changed to `EDIT` alike, as
+/// jj 0.45.1 gives. jj's snapshot writes w's merge of Q's hunk, which cuts
+/// VB's block, into each side, so side 1, P1's text, gains `Q` between `x1`
+/// and `x2`, inside A's side of the block; the snapshot makes that change to
+/// A's term of V too, so the abandon, which takes w's sides and V's terms
+/// away and puts P1 and P2 back, gives back what their merge held there.
+#[test]
+fn abandon_after_a_snapshot_keeps_a_parents_line_in_a_block_the_merge_cuts() -> TestResult {
+    assert_cut_rewrite(&CUTQ, ("4", "EDIT"), abandon_w, |_| {
+        vec![("u", vec![resolved_hunk("x1 Q x2 2 3 4 5 6 7 yB")])]
+    })
+}
+
+/// cutq: u rebased onto s is the conflict of V's terms, `x1 Q x2` and `y1`
+/// against `1` at line 1 and `xA` and `yB` against `8` at the last line, with
+/// no edit and after the edit alike, as jj 0.45.1 gives.
+#[test]
+fn sibling_rebase_after_a_snapshot_keeps_a_parents_line_in_a_block_the_merge_cuts() -> TestResult {
+    assert_cut_rewrite(&CUTQ, ("4", "EDIT"), sibling_rebase, |four| {
+        vec![(
+            "u",
+            vec![
+                conflict_hunk(&["x1 Q x2", "y1"], &["1"]),
+                resolved_hunk(&format!("2 3 {four} 5 6 7")),
+                conflict_hunk(&["xA", "yB"], &["8"]),
+            ],
+        )]
+    })
+}
+
+/// cutq: s rebased onto P1, as `jj rebase -r s -o P1` does, which takes w's
+/// change away, is `x1 x2` and `y1` against `1` at line 1, with no edit and
+/// after the edit alike, as jj 0.45.1 gives: the `Q` that s holds from w's
+/// merge cancels against P2's.
+#[test]
+fn rebase_onto_p1_after_a_snapshot_keeps_a_parents_line_in_a_block_the_merge_cuts() -> TestResult {
+    let rebase_s_onto_p1 = |history: CutHistory| -> TestResult<(Case, Reads)> {
+        let CutHistory {
+            mut case, p1, s, ..
+        } = history;
+        let rebased = rebase_commit(case.tx.repo_mut(), s, vec![p1.id().clone()]).block_on()?;
+        let value = value_at(&rebased.tree(), "f")?;
+        Ok((case, vec![("s", value)]))
+    };
+    assert_cut_rewrite(&CUTQ, ("4", "EDIT"), rebase_s_onto_p1, |_| {
+        vec![(
+            "s",
+            vec![
+                conflict_hunk(&["x1 x2", "y1"], &["1"]),
+                resolved_hunk("2 3 4 5 6 7 xA"),
+            ],
+        )]
+    })
+}
+
+/// cutq: P2 rebased onto A, as `jj rebase -s P2 -o A` does, with w and u
+/// rebased: w is P2's `x1 Q x2` and o's `1` against B's `y1` at line 1, and u
+/// holds its own text, clean, with no edit and after the edit alike, as jj
+/// 0.45.1 gives.
+#[test]
+fn rebase_of_p2_after_a_snapshot_keeps_a_parents_line_in_a_block_the_merge_cuts() -> TestResult {
+    let rebase_p2_onto_a = |history: CutHistory| -> TestResult<(Case, Reads)> {
+        let CutHistory {
+            mut case,
+            a,
+            p2,
+            w,
+            u,
+            ..
+        } = history;
+        rebase_commit(case.tx.repo_mut(), p2, vec![a.id().clone()]).block_on()?;
+        let reads = rebased_values(&mut case, &[("w", &w), ("u", &u)])?;
+        Ok((case, reads))
+    };
+    assert_cut_rewrite(&CUTQ, ("4", "EDIT"), rebase_p2_onto_a, |four| {
+        vec![
+            (
+                "w",
+                vec![
+                    conflict_hunk(&["x1 Q x2", "1"], &["y1"]),
+                    resolved_hunk(&format!("2 3 {four} 5 6 7 8")),
+                ],
+            ),
+            (
+                "u",
+                vec![resolved_hunk(&format!("x1 Q x2 2 3 {four} 5 6 7 yB"))],
+            ),
+        ]
+    })
+}
+
+/// cutq: s squashed into P1, as `jj squash --from s --into P1` does, with w
+/// and u rebased: P1 is `x1 x2` and `y1` against `1` at line 1, and u is the
+/// conflict that u rebased onto s is, with no edit and after the edit alike,
+/// as jj 0.45.1 gives.
+#[test]
+fn squash_into_p1_after_a_snapshot_keeps_a_parents_line_in_a_block_the_merge_cuts() -> TestResult {
+    let squash_s_into_p1 = |history: CutHistory| -> TestResult<(Case, Reads)> {
+        let CutHistory {
+            mut case, p1, s, u, ..
+        } = history;
+        let p1 = squash_all_of(&mut case, s, &p1)?;
+        let mut reads = vec![("P1", value_at(&p1.tree(), "f")?)];
+        reads.extend(rebased_values(&mut case, &[("u", &u)])?);
+        Ok((case, reads))
+    };
+    assert_cut_rewrite(&CUTQ, ("4", "EDIT"), squash_s_into_p1, |four| {
+        vec![
+            (
+                "P1",
+                vec![
+                    conflict_hunk(&["x1 x2", "y1"], &["1"]),
+                    resolved_hunk("2 3 4 5 6 7 xA"),
+                ],
+            ),
+            (
+                "u",
+                vec![
+                    conflict_hunk(&["x1 Q x2", "y1"], &["1"]),
+                    resolved_hunk(&format!("2 3 {four} 5 6 7")),
+                    conflict_hunk(&["xA", "yB"], &["8"]),
+                ],
+            ),
+        ]
+    })
+}
+
+/// cutqz: cutq where P1 holds its own `Z` at line 6 too, outside every block,
+/// and line 3 is edited: u rebased onto s is V's conflict with `Z` in every
+/// term, and u once w is abandoned holds `Q` and `Z`, clean, with no edit and
+/// after the edit alike, as jj 0.45.1 gives.
+#[test]
+fn rewrites_after_a_snapshot_keep_a_parents_lines_in_and_outside_a_cut_block() -> TestResult {
+    assert_cut_rewrite(&CUTQZ, ("3", "EDIT"), sibling_rebase, |three| {
+        vec![(
+            "u",
+            vec![
+                conflict_hunk(&["x1 Q x2", "y1"], &["1"]),
+                resolved_hunk(&format!("2 {three} 4 Z 6 7")),
+                conflict_hunk(&["xA", "yB"], &["8"]),
+            ],
+        )]
+    })?;
+    assert_cut_rewrite(&CUTQZ, ("3", "EDIT"), abandon_w, |_| {
+        vec![("u", vec![resolved_hunk("x1 Q x2 2 3 4 Z 6 7 yB")])]
+    })
+}
+
+/// cqp, cutq's mirror, through `jj abandon P2`: w, rebased onto P1 and P2's
+/// parents, is P1's text, `Q` with it, clean, with no edit and after line 4
+/// of w's working copy is changed to `EDIT` alike, as jj 0.45.1 gives. jj's
+/// snapshot writes `Q` into side 2, P2's text, which lacked it, inside B's
+/// side of the block that w's merge cuts, and the snapshot makes that change
+/// to B's term of V.
+#[test]
+fn abandon_of_p2_after_a_snapshot_keeps_p1s_line_in_a_block_the_merge_cuts() -> TestResult {
+    assert_cut_rewrite(&CQP, ("4", "EDIT"), abandon_p2_under_w, |four| {
+        vec![(
+            "w",
+            vec![resolved_hunk(&format!("y1 Q y2 2 3 {four} 5 6 7 xA"))],
+        )]
+    })
+}
+
+/// cqp through `jj duplicate -r w -o P1`: the duplicate is P1's text, `Q`
+/// with it, clean, with no edit and after the edit alike, as jj 0.45.1 gives.
+#[test]
+fn duplicate_after_a_snapshot_keeps_p1s_line_in_a_block_the_merge_cuts() -> TestResult {
+    assert_cut_rewrite(&CQP, ("4", "EDIT"), duplicate_w_onto_p1, |four| {
+        vec![(
+            "dup",
+            vec![resolved_hunk(&format!("y1 Q y2 2 3 {four} 5 6 7 xA"))],
+        )]
+    })
 }
 
 /// Appends `END` to the working copy of k, the merge of `history`'s P1 and P2,
