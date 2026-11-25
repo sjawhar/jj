@@ -2896,6 +2896,201 @@ fn duplicate_after_a_snapshot_keeps_p1s_line_in_a_block_the_merge_cuts() -> Test
     })
 }
 
+/// An edit of the file that jj materializes for w in VB6's history (x1), next
+/// to the conflict at the tail of the block that w's merge cuts: w's file
+/// shows `x1 Q x2`, then that conflict (P1's nothing against P2's `W`), then
+/// `2 3 .. 10`.
+#[derive(Clone, Copy, Debug)]
+enum BesideCut {
+    /// `EDIT-1` put right before the conflict (the grid's insb).
+    Insert,
+    /// `x2`, the line right before the conflict, changed to `EDIT-1` (shb).
+    Change,
+    /// `2`, the line right after the conflict, moved right before it (move2).
+    Move,
+}
+
+impl BesideCut {
+    /// The line that the edit puts.
+    fn line(self) -> &'static str {
+        match self {
+            Self::Insert | Self::Change => "EDIT-1",
+            Self::Move => "2",
+        }
+    }
+
+    /// `text`, the file that jj materializes for w with conflict markers of
+    /// `marker_len`, with the edit made.
+    fn edit(self, text: &str, marker_len: usize) -> String {
+        let mut lines = text.split_inclusive('\n').collect_vec();
+        let open = "<".repeat(marker_len);
+        let close = ">".repeat(marker_len);
+        let start = lines.iter().position(|line| line.starts_with(&open));
+        let start = start.expect("a conflict in w's file");
+        match self {
+            Self::Insert => lines.insert(start, "EDIT-1\n"),
+            Self::Change => {
+                assert_eq!(lines[start - 1], "x2\n");
+                lines[start - 1] = "EDIT-1\n";
+            }
+            Self::Move => {
+                let end = lines.iter().position(|line| line.starts_with(&close));
+                let end = end.expect("the conflict's end in w's file");
+                assert_eq!(lines[end + 1], "2\n");
+                lines.remove(end + 1);
+                lines.insert(start, "2\n");
+            }
+        }
+        lines.concat()
+    }
+
+    /// The words of w's side 1 and side 2 once the edit is made, one a line.
+    fn sides(edit: Option<Self>) -> (&'static str, &'static str) {
+        match edit {
+            None => ("x1 Q x2 2 3 4 5 6 7 8 9 10", "x1 Q x2 W 2 3 4 5 6 7 8 9 10"),
+            Some(Self::Insert) => (
+                "x1 Q x2 EDIT-1 2 3 4 5 6 7 8 9 10",
+                "x1 Q x2 EDIT-1 W 2 3 4 5 6 7 8 9 10",
+            ),
+            Some(Self::Change) => (
+                "x1 Q EDIT-1 2 3 4 5 6 7 8 9 10",
+                "x1 Q EDIT-1 W 2 3 4 5 6 7 8 9 10",
+            ),
+            Some(Self::Move) => ("x1 Q x2 2 3 4 5 6 7 8 9 10", "x1 Q x2 2 W 3 4 5 6 7 8 9 10"),
+        }
+    }
+}
+
+/// VB6's history, with `edit` made to w's working copy and snapshotted; s and
+/// u, children of w, hold w's file with side 1 and with side 2 of its
+/// conflict.
+fn beside_cut_history(edit: Option<BesideCut>) -> TestResult<CutHistory> {
+    let TwoBases {
+        mut case,
+        a,
+        p1,
+        p2,
+        ..
+    } = vb6_history()?;
+    let mut w = case.commit(&[&p1, &p2], &[])?;
+    if let Some(edit) = edit {
+        let new_value = snapshot_text(&case, &w, |text, marker_len| edit.edit(text, marker_len))?;
+        w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
+    }
+    let (s_text, u_text) = BesideCut::sides(edit);
+    let s = case.commit(&[&w], &[("f", lines(s_text))])?;
+    let u = case.commit(&[&w], &[("f", lines(u_text))])?;
+    Ok(CutHistory {
+        case,
+        a,
+        p1,
+        p2,
+        w,
+        s,
+        u,
+    })
+}
+
+/// The most sides of one hunk of `hunks` that hold `line`, as k of n, where
+/// a hunk that resolves is one side; 0 of 1 where no hunk holds it.
+fn share_holding(hunks: &Hunks, line: &str) -> (usize, usize) {
+    let holds = |text: &String| text.lines().any(|text_line| text_line == line);
+    hunks
+        .iter()
+        .map(|(adds, _)| (adds.iter().filter(|add| holds(add)).count(), adds.len()))
+        .filter(|(holding, _)| *holding > 0)
+        .max_by(|(k1, n1), (k2, n2)| (k1 * n2).cmp(&(k2 * n1)))
+        .unwrap_or((0, 1))
+}
+
+/// Asserts that `read`, a rewrite of the history of [`beside_cut_history`]
+/// that reads one value at `f`, keeps `Q`, P2's own line inside A's side of
+/// the block that w's merge cuts, on no smaller share of sides after each
+/// edit than with no edit, and, if `edit_on_every_side` is set, the line that
+/// each edit puts on every side. The message names every edit that fails.
+fn assert_beside_cut(
+    read: impl Fn(CutHistory) -> TestResult<(Case, MergedTreeValue)>,
+    edit_on_every_side: bool,
+) -> TestResult {
+    let (case, value) = read(beside_cut_history(None)?)?;
+    let no_edit = share_holding(&hunks(&case, &value), "Q");
+    assert!(no_edit.0 > 0, "no edit: {}", describe(&case, &value));
+    let mut failures = vec![];
+    for edit in [BesideCut::Insert, BesideCut::Change, BesideCut::Move] {
+        let (case, value) = read(beside_cut_history(Some(edit))?)?;
+        let hunks = hunks(&case, &value);
+        let edited = share_holding(&hunks, "Q");
+        if edited.0 * no_edit.1 < no_edit.0 * edited.1 {
+            failures.push(format!(
+                "{edit:?}: Q on {edited:?} sides, with no edit on {no_edit:?}: {}",
+                describe(&case, &value)
+            ));
+        }
+        let (holding, sides) = share_holding(&hunks, edit.line());
+        if edit_on_every_side && holding < sides {
+            failures.push(format!(
+                "{edit:?}: {} on {holding} of {sides} sides: {}",
+                edit.line(),
+                describe(&case, &value)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+/// x1 with an edit beside the block that w's merge cuts (insb, shb, move2):
+/// s rebased onto P1, as `jj rebase -r s -o P1` does, keeps P2's `Q` on a
+/// side as with no edit. The snapshot keeps VB's block in V's terms: `Q`
+/// goes into A's term, and the person's edit into every term.
+#[test]
+fn rebase_onto_p1_after_an_edit_beside_a_cut_block_keeps_a_parents_line() -> TestResult {
+    assert_beside_cut(
+        |history| {
+            let CutHistory {
+                mut case, p1, s, ..
+            } = history;
+            let rebased = rebase_commit(case.tx.repo_mut(), s, vec![p1.id().clone()]).block_on()?;
+            let value = value_at(&rebased.tree(), "f")?;
+            Ok((case, value))
+        },
+        false,
+    )
+}
+
+/// x1 with an edit beside the cut block: s squashed into P1, as `jj squash
+/// --from s --into P1` does, leaves P1 with P2's `Q` on a side as with no
+/// edit.
+#[test]
+fn squash_into_p1_after_an_edit_beside_a_cut_block_keeps_a_parents_line() -> TestResult {
+    assert_beside_cut(
+        |history| {
+            let CutHistory {
+                mut case, p1, s, ..
+            } = history;
+            let p1 = squash_all_of(&mut case, s, &p1)?;
+            let value = value_at(&p1.tree(), "f")?;
+            Ok((case, value))
+        },
+        false,
+    )
+}
+
+/// x1 with an edit beside the cut block: u rebased onto s holds the edit on
+/// every side, and `Q` on a side as with no edit.
+#[test]
+fn sibling_rebase_after_an_edit_beside_a_cut_block_keeps_the_edit_on_every_side() -> TestResult {
+    assert_beside_cut(
+        |history| {
+            let CutHistory { mut case, s, u, .. } = history;
+            let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
+            let value = value_at(&rebased.tree(), "f")?;
+            Ok((case, value))
+        },
+        true,
+    )
+}
+
 /// Appends `END` to the working copy of k, the merge of `history`'s P1 and P2,
 /// left conflicted, and snapshots it; s and u, children of k, hold `s_text`
 /// and `u_text`. Returns u rebased onto s.
@@ -4745,23 +4940,43 @@ fn snapshot_of_a_base_edit_after_which_v_would_cancel_keeps_the_value() -> TestR
 }
 
 /// VB6 with `x2` changed in the working copy. The merge of P1 and P2 made
-/// `x1 Q x2` of the first side of VB's block, so the change is to what that
-/// merge made of the block: the lines that the person left for the block go
-/// into every term of V, and u, rebased onto s, holds the change in every
-/// term.
+/// `x1 Q x2` of the first side of VB's block, and left a conflict at the
+/// block's tail, so the change is next to that conflict: its text goes into
+/// the term of each side of the block, A's and B's, and V keeps the block.
+/// u, rebased onto s, holds the change on every side, and no side holds a
+/// marker line. V's base term, o's, does not hold it, as w's virtual base
+/// after the snapshot shows: text put into every term at that place would
+/// make the writer put it outside the block, and w's own conflict at the
+/// block's tail would resolve.
 #[test]
-fn vb6_an_edit_of_what_the_merge_made_of_a_block_reaches_every_term() -> TestResult {
+fn vb6_an_edit_of_what_the_merge_made_of_a_block_reaches_every_side() -> TestResult {
     let TwoBases {
         mut case, p1, p2, ..
     } = vb6_history()?;
     let w = case.commit(&[&p1, &p2], &[])?;
     let new_value = snapshot_edits(&case, &w, &[("x2", "EDIT")])?;
+    let terms = named_term_texts(&case, &new_value.simplify());
+    let [_, o, _] = &terms[..] else {
+        panic!("expected V's three terms, got {terms:?}");
+    };
+    assert!(o.starts_with("1\n"), "not o's term: {terms:?}");
+    assert!(
+        !o.lines().any(|line| line == "EDIT"),
+        "o's term holds \"EDIT\": {terms:?}"
+    );
     let w = case.commit_with_values(&[&p1, &p2], vec![(repo_path_buf("f"), new_value)])?;
     let s = case.commit(&[&w], &[("f", lines("x1 Q EDIT 2 3 4 5 6 7 8 9 10"))])?;
     let u = case.commit(&[&w], &[("f", lines("x1 Q EDIT W 2 3 4 5 6 7 8 9 10"))])?;
     let rebased = rebase_commit(case.tx.repo_mut(), u, vec![s.id().clone()]).block_on()?;
     let value = value_at(&rebased.tree(), "f")?.simplify();
-    assert_every_term_holds(&case, &value, "EDIT");
+    for side in value.adds() {
+        let content = case.read(side.as_ref()).unwrap_or_default();
+        assert!(
+            text_lines(&content).contains(&"EDIT"),
+            "a side without \"EDIT\": {}",
+            describe(&case, &value)
+        );
+    }
     assert_no_side_marked(&case, &value);
     Ok(())
 }

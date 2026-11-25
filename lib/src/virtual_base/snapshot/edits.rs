@@ -304,10 +304,11 @@ fn is_inside_a_side(blocks: &[Block<'_>], range: &Range<usize>) -> bool {
 /// Outside every block of VB, that text is what the file showed for the
 /// base, and it goes into V's terms as the person left it, as jj's snapshot
 /// writes the text of a hunk that resolves into every term, a plain base
-/// among them. Where such hunks cut a block, VB keeps its marker lines and
-/// the side that the merge did not take, and takes each side's change
-/// inside a side of the block (see [`ShownBase::new`]), unless the person
-/// changed what the merge made of the block (see [`onto_virtual_base`]).
+/// among them. Where such hunks cut a block, VB keeps the block: its marker
+/// lines and the side that the merge did not take stay, it takes each
+/// side's change inside a side of the block (see [`ShownBase::new`]), and a
+/// person's edit inside its sides goes into the terms of the block's sides,
+/// not into V's base term (see [`onto_virtual_base`]).
 ///
 /// The working copy can hold the marker lines of an earlier VB of the same
 /// conflict, which an earlier snapshot replaced, so a block is told by its
@@ -362,8 +363,8 @@ pub(super) fn base_edits(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text)
 /// person's, so it goes into V's terms. Where such hunks cut a block, the
 /// lines that the file showed for the block give way to VB's own lines of
 /// it, with the sides' changes inside its sides (see [`ShownBase::new`]),
-/// unless a change of the person's touches the lines that the file showed
-/// for the block (see [`resolved_hunks`] and [`untouched`]).
+/// and with the person's changes of those lines made among them where they
+/// can be (see [`resolved_hunks`], [`untouched`] and [`lifted`]).
 fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text) -> Text {
     let ShownBase {
         text: seen,
@@ -401,8 +402,9 @@ fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text) -> 
         .collect_vec();
     let own_changes = line_changes(&seen_lines.bytes, &own_lines.bytes);
     let resolved = resolved_hunks(finder, &own_lines, &own_changes);
-    let kept = untouched(
+    let (kept, lifted) = untouched(
         finder,
+        &seen_lines,
         &own_lines,
         &own_changes,
         &changes,
@@ -411,7 +413,10 @@ fn onto_virtual_base(finder: &BlockFinder<'_>, seen: &ShownBase, new: &Text) -> 
     );
     // Each range of the lines of `seen` to replace, with the text that takes
     // its place.
-    let mut replacements = changes;
+    let mut replacements = zip(changes, lifted)
+        .filter(|(_, lifted)| !lifted)
+        .map(|(change, _)| change)
+        .collect_vec();
     replacements.extend(kept);
     replacements.sort_by_key(|(range, _)| (range.start, range.end));
     let mut text = Text::default();
@@ -471,24 +476,36 @@ fn resolved_hunks(
 
 /// What takes the place of the lines that the file showed for each block of
 /// `resolved`, blocks of VB, whose blocks `finder` finds, that hunks that the
-/// conflict's own merge resolved cut, where none of `changes`, the person's
-/// changes of the lines of the base that the file showed, touches those
-/// lines: VB's own lines of the block and of the hunks, with each of
-/// `side_edits`, the sides' changes to VB, that falls inside them. A change
-/// that takes some of those lines, or puts text among them, changes what the
-/// merge made of the block, and they stay as the person left them.
-/// `own_changes` are the changes from the lines that the file showed to VB's
-/// own lines, `own_lines`.
+/// conflict's own merge resolved cut, and, for each of `changes`, the
+/// person's changes of the lines of the base that the file showed,
+/// `seen_lines`, whether it is made there.
+///
+/// VB keeps each such block: its own lines of the block and of the hunks
+/// take the place of the lines that the file showed, with each of
+/// `side_edits`, the sides' changes to VB, that falls inside them. Where the
+/// file showed some of the block's marker lines in a conflict's base, each
+/// change of the person's to those lines is made among them (see
+/// [`lifted`]). So an edit at the end or the start of a side, as one next to
+/// the conflict at the block's tail is, goes into the terms of the block's
+/// sides, A's and B's, and one between two lines of a side into that side's
+/// term; none goes into V's base term, o's, and the block stays whole. Where
+/// the merge resolved the whole block, or a change takes a marker line or
+/// text of a base (a resolution of the conflict at the block's tail), the
+/// lines stay as the person left them, and the change goes into every term
+/// (case 3 of [`super`]). `own_changes` are the changes from the lines that
+/// the file showed to VB's own lines, `own_lines`.
 fn untouched(
     finder: &BlockFinder<'_>,
+    seen_lines: &Lines,
     own_lines: &Lines,
     own_changes: &[(Range<usize>, Range<usize>)],
     changes: &[(Range<usize>, Text)],
     resolved: Vec<Resolved>,
     side_edits: &[Edit],
-) -> Vec<(Range<usize>, Text)> {
+) -> (Vec<(Range<usize>, Text)>, Vec<bool>) {
     let vb = finder.vb;
     let mut kept = vec![];
+    let mut made = vec![false; changes.len()];
     // The end of VB's own lines of the block before, which a hunk that cuts
     // it can reach past.
     let mut done = 0;
@@ -509,43 +526,268 @@ fn untouched(
             (block_end, lined_up(own_changes, block_end, false))
         };
         done = own_end;
+        let range = own_lines.original(own_start, vb.len())..own_lines.original(own_end, vb.len());
+        let own = with_side_edits(finder, range, side_edits);
         let first = changes.partition_point(|(change, _)| change.end <= start);
-        let touched = changes[first..]
-            .first()
-            .is_some_and(|(change, _)| change.start < end);
-        if !touched {
-            let range =
-                own_lines.original(own_start, vb.len())..own_lines.original(own_end, vb.len());
-            kept.push((start..end, with_side_edits(finder, range, side_edits)));
+        let touching = changes[first..]
+            .iter()
+            .take_while(|(change, _)| change.start < end)
+            .count();
+        let touching = first..first + touching;
+        if touching.is_empty() {
+            let mut text = Text::default();
+            for line in &own {
+                text.append(&line.text);
+            }
+            kept.push((start..end, text));
+            continue;
+        }
+        let inside = changes[touching.clone()]
+            .iter()
+            .map(|(change, text)| {
+                (start <= change.start && change.end <= end)
+                    .then(|| (change.start - start..change.end - start, text))
+            })
+            .collect::<Option<Vec<_>>>();
+        let shown = &seen_lines.bytes[start..end];
+        if let Some(text) = inside.and_then(|inside| lifted(block, &own, shown, &inside)) {
+            kept.push((start..end, text));
+            made[touching].fill(true);
         }
     }
-    kept
+    (kept, made)
 }
 
-/// `range` of VB, whose blocks `finder` finds, with each of `side_edits`,
-/// changes to VB in order, that falls inside it made: the marker lines of
-/// VB's blocks as text that came from a base, the rest as text.
-fn with_side_edits(finder: &BlockFinder<'_>, range: Range<usize>, side_edits: &[Edit]) -> Text {
-    let push_own = |text: &mut Text, range: Range<usize>| {
+/// A line of VB, or of a side's change to VB at a hunk that the conflict's
+/// own merge resolved inside a block: the line that a line diff reads in its
+/// place, its text, where a marker line of VB's blocks came from a base, and
+/// the offset in VB of such a marker line.
+struct OwnLine {
+    token: Vec<u8>,
+    text: Text,
+    marker_at: Option<usize>,
+}
+
+/// The lines of `range` of VB, whose blocks `finder` finds, with each of
+/// `side_edits`, changes to VB in order, that falls inside it made.
+fn with_side_edits(
+    finder: &BlockFinder<'_>,
+    range: Range<usize>,
+    side_edits: &[Edit],
+) -> Vec<OwnLine> {
+    let push_own = |lines: &mut Vec<OwnLine>, range: Range<usize>| {
         let mut at = range.start;
         for line in finder.vb[range].lines_with_terminator() {
-            text.push(line, finder.marker_at(at).is_some());
+            let marker = finder.marker_at(at);
+            let token = marker.map_or(line.to_vec(), |marker| {
+                marker.token_of(finder.block_of(line))
+            });
+            let mut text = Text::default();
+            text.push(line, marker.is_some());
+            lines.push(OwnLine {
+                token,
+                text,
+                marker_at: marker.map(|_| at),
+            });
             at += line.len();
         }
     };
-    let mut text = Text::default();
+    let mut lines = vec![];
     let mut at = range.start;
     let first = side_edits.partition_point(|edit| edit.range.start < range.start);
     for edit in side_edits[first..]
         .iter()
         .take_while(|edit| edit.range.end <= range.end)
     {
-        push_own(&mut text, at..edit.range.start);
-        text.append(&edit.text);
+        push_own(&mut lines, at..edit.range.start);
+        for line in edit.text.bytes.lines_with_terminator() {
+            lines.push(OwnLine {
+                token: line.to_vec(),
+                text: Text::literal(line),
+                marker_at: None,
+            });
+        }
         at = edit.range.end;
     }
-    push_own(&mut text, at..range.end);
-    text
+    push_own(&mut lines, at..range.end);
+    lines
+}
+
+/// Where a change of the person's goes among VB's own lines of a block.
+enum Lift {
+    /// In place of the lines that it replaces.
+    InPlace,
+    /// At the start of every side of the block, where it starts at the start
+    /// of a side.
+    Before,
+    /// At the end of every side of the block, where it ends at the end of a
+    /// side.
+    After,
+}
+
+/// `own`, VB's own lines of `block` and around it with the sides' changes to
+/// VB (see [`with_side_edits`]), with `changes` made among them, where the
+/// file that jj materialized showed `shown` for them, and the person made
+/// `changes`, each a range of `shown` and the text that takes its place.
+///
+/// A line diff of `shown` against `own` lines them up: the lines that the
+/// conflict's own merge left out of the block, such as its marker lines and
+/// a side that it did not take, are `own`'s alone. Each change that takes
+/// only lines that both hold, and puts only the person's text, is made where
+/// it falls among `own`. Inside a side of the block it is made there, so it
+/// goes into that side's term of V. A change that ends at the end of a side,
+/// as an edit next to a conflict at the block's tail does, or starts at its
+/// start, takes that side's lines that it replaces there, and its text goes
+/// at the end, or the start, of every side of the block: into the term of
+/// each side, just where the person put it in the side that the file showed.
+/// The block's marker lines stay where they are, so the conflict's own merge
+/// of the block, a conflict at its tail among it, stays as it was; V's base
+/// term keeps its own text there. This is only where the file showed some of
+/// the block's marker lines in the base of a conflict, which the merge left
+/// there: where it resolved the whole block, the person's text for it goes
+/// into every term as they left it (merge-cases' VB5d). `None` there, and
+/// where a change is not of that kind.
+fn lifted(
+    block: &Block<'_>,
+    own: &[OwnLine],
+    shown: &[u8],
+    changes: &[(Range<usize>, &Text)],
+) -> Option<Text> {
+    let tokens = own
+        .iter()
+        .map(|line| line.token.as_slice())
+        .collect_vec()
+        .concat();
+    let mut starts = Vec::with_capacity(own.len());
+    let mut at = 0;
+    for line in own {
+        starts.push(at);
+        at += line.token.len();
+    }
+    // The block's marker lines among `own`: its opening line first, its
+    // closing line last.
+    let markers = own
+        .iter()
+        .positions(|line| {
+            line.marker_at
+                .is_some_and(|at| block.markers.iter().any(|(range, _)| range.start == at))
+        })
+        .collect_vec();
+    let (&open, &close) = (markers.first()?, markers.last()?);
+    let shows_a_marker = shown
+        .lines_with_terminator()
+        .any(|line| markers.iter().any(|&marker| own[marker].token == line));
+    if !shows_a_marker {
+        return None;
+    }
+    let restored = line_changes(shown, &tokens);
+    // The offset among `tokens` that `offset` among `shown` lines up with:
+    // lines of `own`'s alone there that open the block come before it, any
+    // other such lines after it.
+    let line_up = |offset: usize| -> Option<usize> {
+        let mut last = (0, 0);
+        for (shown_range, own_range) in &restored {
+            if shown_range.end < offset || (shown_range.end == offset && !shown_range.is_empty()) {
+                last = (shown_range.end, own_range.end);
+                continue;
+            }
+            if shown_range.start < offset {
+                return None;
+            }
+            if shown_range.is_empty() && shown_range.start == offset {
+                let opens = tokens[own_range.clone()].starts_with(&own[open].token);
+                return Some(if opens {
+                    own_range.end
+                } else {
+                    own_range.start
+                });
+            }
+            break;
+        }
+        Some(last.1 + (offset - last.0))
+    };
+    let line_at = |offset: usize| match starts.binary_search(&offset) {
+        Ok(index) => Some(index),
+        Err(index) => (index == own.len() && offset == tokens.len()).then_some(index),
+    };
+    let (mut before, mut after, mut cuts) = (vec![], vec![], vec![]);
+    for (range, text) in changes {
+        let crosses = restored.iter().any(|(shown_range, _)| {
+            if shown_range.is_empty() {
+                range.start < shown_range.start && shown_range.start < range.end
+            } else {
+                shown_range.start < range.end && range.start < shown_range.end
+            }
+        });
+        if crosses || !text.of_base.is_empty() {
+            return None;
+        }
+        let start = line_at(line_up(range.start)?)?;
+        let end = if range.is_empty() {
+            start
+        } else {
+            line_at(line_up(range.end)?)?
+        };
+        let lines = own.get(start..end)?;
+        if lines.iter().any(|line| line.marker_at.is_some()) {
+            return None;
+        }
+        let inside = open < start && end <= close;
+        let place = if inside && own[end].marker_at.is_some() {
+            Lift::After
+        } else if inside && own[start - 1].marker_at.is_some() {
+            Lift::Before
+        } else {
+            Lift::InPlace
+        };
+        match place {
+            Lift::InPlace => cuts.push((start..end, Some(*text))),
+            Lift::Before => {
+                before.push(*text);
+                cuts.push((start..end, None));
+            }
+            Lift::After => {
+                after.push(*text);
+                cuts.push((start..end, None));
+            }
+        }
+    }
+    let mut result = Text::default();
+    let mut cuts = cuts.into_iter().peekable();
+    let mut index = 0;
+    loop {
+        let mut skip_to = None;
+        while let Some((range, text)) = cuts.next_if(|(range, _)| range.start == index) {
+            if let Some(text) = text {
+                result.append(text);
+            }
+            if !range.is_empty() {
+                skip_to = Some(range.end);
+                break;
+            }
+        }
+        if let Some(end) = skip_to {
+            index = end;
+            continue;
+        }
+        let Some(line) = own.get(index) else {
+            break;
+        };
+        let is_marker = markers.binary_search(&index).is_ok();
+        if is_marker && index != open {
+            for text in &after {
+                result.append(text);
+            }
+        }
+        result.append(&line.text);
+        if is_marker && index != close {
+            for text in &before {
+                result.append(text);
+            }
+        }
+        index += 1;
+    }
+    Some(result)
 }
 
 /// The offset among `lines` of `original`, the start of a line of the text

@@ -34,12 +34,21 @@
 //! and where the hunk lies inside one side of the block, that change goes
 //! into V's terms as well (see [`edits::ShownBase`]), so that a rewrite that
 //! takes the snapshot's sides away gives back what the parents' merge held
-//! there (a parent's own line in a block that the merge cuts). The rest is
-//! the person's changes to the base: a conflict that they resolved,
+//! there (a parent's own line in a block that the merge cuts). A change of
+//! the person's to the lines that the file showed for such a block is made
+//! among VB's own lines of it, so that V keeps the block: where it ends at
+//! the end of a side of the block, or starts at its start, as an edit next
+//! to the conflict at the block's tail does, its text goes at the end, or
+//! the start, of every side of the block, into each side's term of V, and
+//! the lines that it replaces go from the side that holds them. V's base
+//! term keeps its own text there, so the conflict's own merge of the block,
+//! the conflict at its tail with it, stays as it was. Elsewhere the change
+//! is made inside the side (see `onto_virtual_base` in [`edits`]). The rest
+//! is the person's changes to the base: a conflict that they resolved,
 //! deleted, moved or copied, and a line that they changed. The snapshot
 //! makes each one, each hunk that the merge resolved outside every block,
-//! and each side's change inside a block, to V's terms, by where it falls
-//! in VB:
+//! and each side's change inside a block, to V's terms, by where it falls in
+//! VB:
 //!
 //! 1. in text that every term of V holds, or at the edge of a hunk of V's
 //!    terms' merge, outside every block: the change is made to every term, at
