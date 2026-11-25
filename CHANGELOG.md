@@ -82,6 +82,110 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their deletion: jj marks their Git index entries skip-worktree when it resets
   the index and when `jj sparse` changes the patterns.
 
+* Merging no longer silently drops content that both sides of the merge
+  contain, nor a change that one side made where the merge bases disagree.
+  Where the merge of the merge bases cannot resolve a path, the merge keeps
+  that conflict: a side that left it as it is counts as unchanged, and two
+  sides that both changed it are merged against a virtual merge base built as
+  Git builds one where that conflict is between text files, or give a conflict
+  where it is not (for example, with a deletion or a binary file among its
+  sides). A virtual merge base names the conflict of the merge bases that it
+  stands for, each term with the commit it comes from, and is only ever the
+  base of a conflict: where a later merge, such as a rebase, an abandon or a
+  squash, would make one a side of a file's conflict, the merge uses the terms
+  of the conflicts that every virtual merge base there stands for in their
+  place, and a rebase takes the merges of the old and the new parents there as
+  their terms, not as the text they resolve to. A snapshot of such a conflict
+  makes the person's changes of the base to those terms: a change to text that
+  every term holds goes into every term, a change inside one side of the
+  conflict of the merge bases into that side's term, and any other change
+  (a conflict resolved, deleted or cut into) puts the text the person left
+  into every term in place of the lines it touches; a conflict that the
+  person moved or copied takes the terms' own lines with it. Text that the
+  merge itself resolved outside the conflict of the merge bases, such as a
+  parent's own change, goes into those terms too, as jj's snapshot writes it
+  into a plain base. Where the merge resolved a hunk inside one side of that
+  conflict, such as a parent's own line there, jj's snapshot changes each
+  side of the file's conflict there from its own text to the merge's, and
+  that change goes into the term of the merge bases' conflict whose side
+  holds it, so that after an edit away from that conflict a later abandon
+  of the merge or a rebase of its children keeps what the parents' merge
+  held there; after an edit at its edge, `jj abandon` of the merge gives a
+  conflict that holds the parent's line. Where the file still shows some of
+  the marker lines of that conflict, as the base of a conflict that the merge
+  left at its edge does, a line that the person adds or changes at the start
+  or the end of a side goes to the start or the end of every side, into each
+  side's term and not into the base's term, and that conflict stays whole in
+  the virtual merge base, so the merge's own conflict stays a conflict. The
+  conflict stays whole only where no change of the person's touches it, or
+  where the file still shows a marker line of the conflict and each change
+  lies inside it; anywhere else the change goes into every term, as above.
+  This is a limit: where the conflict's own merge resolved a whole block of
+  the virtual merge base, with a parent's own line inside the side that it
+  took and no marker line of that block in the file, and the person changes
+  a line inside that block, the snapshot writes the block's new text into
+  every term of the merge bases' conflict, in place of the other side's and
+  the base's text there. Take o `1 2 3 4 5 6 7 8`, A `x1 x2 2 3 4 5 6 7 xA`
+  and B `y1 2 3 4 5 6 7 yB`, P1 and P2, two merges of A and B, with A's
+  text and with `x1 Q x2 2 3 4 5 6 7 yB`, a merge w of P1 and P2, two
+  children s and u of w that hold its file with `xA` and with `yB` at the
+  last line, and `x1` changed to `X1` in w. A conflict's sides are counted
+  here after each side that equals a base cancels with it. A rebase of u
+  onto s holds `X1 Q x2` at line 1 as resolved text, where jj 0.45.1 gives
+  a 2-sided conflict whose `y1` side holds neither `X1` nor `Q`.
+  `jj abandon w` gives u a 2-sided conflict at line 1 with `Q` on 1 of 2
+  sides, where jj 0.45.1 and this release without the edit give a clean
+  `x1 Q x2 2 3 4 5 6 7 yB`.
+  `jj rebase -s P2 -o A` gives w a clean `X1 Q x2 2 3 4 5 6 7 8`, which
+  holds the edit and `Q` and drops the merge bases' older text, where
+  jj 0.45.1 and this release without the edit give a 2-sided conflict at
+  line 1. `jj rebase -r s -o P1` gives s a clean `x1 x2 2 3 4 5 6 7 xA`,
+  where jj 0.45.1 and this release without the edit give a 2-sided conflict
+  of `x1 x2` and `y1` over `1`, which holds neither `X1` nor `Q`, since
+  that rebase leaves the merge that carried them. A line that looks like
+  a marker line is the person's text. A change of the lines that show
+  the virtual merge base inside a conflict that the person kept is not made:
+  those lines are derived from the merge bases. Where a merge base's own
+  merge bases disagreed, so that a term is itself a virtual merge base, the
+  change is made to the terms which that one stands for, never to its text.
+  Where the conflict of the merge bases is between files that are not all
+  text, a snapshot keeps the changes that every side of the conflict has
+  alike; where a term is absent or is not a file, it keeps only text put
+  before or after the whole conflict, and leaves a term that is not a file
+  (a symlink, a submodule or a directory) as it is. A file whose final
+  newline the person or a merge tool removed after a conflict's end marker
+  removes it from those terms too. Where an edit would make a term of the
+  merge bases' conflict a file that is itself a virtual merge base (one
+  pasted into a deleted side), the snapshot keeps the old one as the base:
+  none can stand for such terms. A squash of a merge of three or more
+  commits into a descendant, or into a new commit that `--insert-after` or
+  `--insert-before` places among its descendants, merges the descendant's
+  rebase and the squashed changes as one merge, whatever commits lie between,
+  at each path where the merge's parents hold a conflict between files or
+  where it replaces a virtual merge base, so the changes there no longer
+  bring back a merge base's own base that the rebase resolved away; every
+  other path is squashed as before. A virtual merge base's marker lines
+  carry a salt at which no line of either side of the merge equals one of
+  them; where the text of the merge bases' conflict holds lines of that
+  shape at the highest salts, and a side holds a marker line there too, the
+  merge writes the placeholder, which holds none of that text, instead of a
+  virtual merge base. A merge is refused, and writes nothing, where it would
+  replace more than 10,000 virtual merge bases at one path, or more than
+  10,000 in all and 100 for each path where it replaces one: files that pass
+  as virtual merge bases can stand for that many, and so can a history that
+  is both deep and wide (a braid of 202 criss-cross levels over 100 files
+  needs about 201 at each path, more than 20,000 in all, where jj 0.45.1
+  completes). Where a later rebase, abandon or duplicate rewrites the
+  parents of an edited merge, jj's rebase can put back among the sides a
+  parent that deletes the file, a parent whose change conflicts with the
+  merge's own (a final newline removed where the parent changed the last
+  line), or an edit-free side that the rewritten merge bases bring, as jj
+  0.45.1's rebase does; such a side does not hold the edit.
+  Merge bases, and the parents of a merge of three or more commits, are
+  merged in the order of their commit ids. This affects criss-cross histories,
+  and merges whose base is itself conflicted.
+  [#6369](https://github.com/jj-vcs/jj/issues/6369)
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights

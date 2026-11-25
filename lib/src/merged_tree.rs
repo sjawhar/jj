@@ -15,6 +15,7 @@
 //! A lazily merged view of a set of trees.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::iter;
 use std::pin::Pin;
@@ -52,6 +53,7 @@ use crate::matchers::Matcher;
 use crate::merge::Diff;
 use crate::merge::Merge;
 use crate::merge::MergeBuilder;
+use crate::merged_tree_builder::MergedTreeBuilder;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
@@ -60,6 +62,7 @@ use crate::tree::ToTreeMergeExt as _;
 use crate::tree::Tree;
 use crate::tree::TreeMergeExt as _;
 use crate::tree_merge::merge_trees;
+use crate::virtual_base;
 
 /// Presents a view of a merged set of trees at the root directory, as well as
 /// conflict labels.
@@ -336,13 +339,44 @@ impl MergedTree {
     /// conflict arises. However, if one of the input trees is already
     /// conflicted, the corresponding label will be ignored, and its existing
     /// labels will be used instead.
+    ///
+    /// A virtual merge base ([`crate::virtual_base`]) is only ever a base of a
+    /// conflict: where the merge leaves one as a side of a path, the merge
+    /// replaces every one at that path, sides and bases alike, with the terms
+    /// of the conflict that it stands for.
     pub async fn merge(merge: Merge<(Self, String)>) -> BackendResult<Self> {
-        Self::merge_no_resolve(merge).resolve().await
+        let merge = merge.into_map(|(tree, label)| (tree, label, None));
+        Self::merge_with_overrides(merge, &[], true).await
+    }
+
+    /// Merges the provided trees as [`Self::merge`] does, where each tree
+    /// comes with its label and may come with the merge that it is the
+    /// resolution of, such as the merge of a commit's parents: at a path where
+    /// the merge replaces a virtual merge base, each such tree enters as the
+    /// terms of its unresolved merge there (each parent and the virtual merge
+    /// base of their merge bases), not as the value they resolve to.
+    pub(crate) async fn merge_with_unresolved(
+        merge: Merge<(Self, String, Option<Self>)>,
+    ) -> BackendResult<Self> {
+        Self::merge_with_overrides(merge, &[], true).await
     }
 
     /// Merges the provided trees into a single `MergedTree`, without attempting
     /// to resolve file conflicts.
+    ///
+    /// Unlike [`Self::merge`], this keeps a virtual merge base that the merge
+    /// leaves as a side, so `merge_no_resolve(..).resolve()` can differ from
+    /// `merge(..)` where an input tree at a base of the merge holds a conflict
+    /// whose base is a virtual merge base.
     pub fn merge_no_resolve(merge: Merge<(Self, String)>) -> Self {
+        Self::merge_unsimplified(merge).simplified()
+    }
+
+    /// The merge of the provided trees with each term of each tree kept, as
+    /// [`Self::merge_no_resolve`] builds it before it simplifies the terms:
+    /// the terms of the first tree, then those of the second, inverted, and so
+    /// on, each with its label.
+    fn merge_unsimplified(merge: Merge<(Self, String)>) -> Self {
         debug_assert!(
             merge
                 .iter()
@@ -359,10 +393,200 @@ impl MergedTree {
         let flattened_tree_ids: Merge<TreeId> = merge
             .into_map(|(tree, _label)| tree.into_tree_ids())
             .flatten();
-
-        let (labels, tree_ids) = flattened_labels.simplify_with(&flattened_tree_ids);
-        Self::new(store, tree_ids, labels)
+        Self::new(store, flattened_tree_ids, flattened_labels)
     }
+
+    /// This merge with its terms simplified, with their labels.
+    fn simplified(self) -> Self {
+        let (labels, tree_ids) = self.labels.simplify_with(&self.tree_ids);
+        Self::new(self.store, tree_ids, labels)
+    }
+
+    /// Merges the trees of `merge`, with `overrides` written over their terms,
+    /// and resolves the result if `resolve` is set. Each override has one term
+    /// for each term of the trees, in the order [`Self::merge_unsimplified`]
+    /// gives. Each tree of `merge` comes with its label and the unresolved
+    /// merge that it is the resolution of, if any.
+    ///
+    /// A virtual merge base, VB or M ([`crate::virtual_base`]), is only ever a
+    /// base of a conflict, but a tree at a base of `merge` brings the bases of
+    /// its conflicts into the merge as sides. At each path outside `overrides`
+    /// where such a tree has a conflict, and where, once the merge's terms are
+    /// simplified, such a base is a side and is VB or M, each tree that comes
+    /// with its unresolved merge enters as the terms of that merge at the path,
+    /// and every VB and M term at that path, sides and bases alike, is
+    /// replaced with the terms of V that it names, inverted where it is a
+    /// base, and so on for the VB and M among those, until none is left. The
+    /// terms then merge as the terms of the merge bases' own conflicts would,
+    /// whatever the order of `merge`. A path where VB or M is only a base is
+    /// merged as it is. The decision reads the merge's terms and the files that
+    /// may be VB or M, never merged text. Each term that replaces a VB or M
+    /// takes the label that it names for that term, the label of the commit it
+    /// comes from.
+    pub(crate) async fn merge_with_overrides(
+        merge: Merge<(Self, String, Option<Self>)>,
+        overrides: &[(RepoPathBuf, MergedTreeValue)],
+        resolve: bool,
+    ) -> BackendResult<Self> {
+        let (tree, _) = Self::merge_replacing(merge, overrides, resolve).await?;
+        Ok(tree)
+    }
+
+    /// Merges as [`Self::merge_with_overrides`] does, and returns with the
+    /// merge the paths where it replaced VB or M.
+    pub(crate) async fn merge_replacing(
+        merge: Merge<(Self, String, Option<Self>)>,
+        overrides: &[(RepoPathBuf, MergedTreeValue)],
+        resolve: bool,
+    ) -> BackendResult<(Self, Vec<RepoPathBuf>)> {
+        // Each tree that comes with its unresolved merge: the range of its
+        // terms among the merge's terms, the tree, that merge and its label.
+        let mut substituted = vec![];
+        let mut start = 0;
+        for (tree, label, unresolved) in &merge {
+            let end = start + tree.tree_ids().as_slice().len();
+            if let Some(unresolved) = unresolved {
+                substituted.push((start..end, tree.clone(), unresolved.clone(), label.clone()));
+            }
+            start = end;
+        }
+        let merge = merge.into_map(|(tree, label, _)| (tree, label));
+        let inverted_bases = inverted_bases(&merge, overrides)?;
+        let tree = Self::merge_unsimplified(merge);
+        let store = tree.store();
+        let mut replaced = vec![];
+        for (path, candidates) in inverted_bases {
+            let terms = tree.term_values(&path).await?;
+            let mut named = virtual_base::NamedTermsCache::new();
+            if virtual_base::replaces_at(store, &path, &terms, &candidates, &mut named).await? {
+                replaced.push((path, terms, named));
+            }
+        }
+        let mut replacements = virtual_base::Replacements::new(replaced.len());
+        let mut expansions = vec![];
+        for (path, terms, named) in replaced {
+            let mut substitutes = vec![];
+            for (slots, tree, unresolved, label) in &substituted {
+                let labels = unresolved.labels_by_term(label);
+                substitutes.push(virtual_base::Substitute {
+                    slots: slots.clone(),
+                    own_terms: tree.term_values(&path).await?,
+                    unresolved: virtual_base::NamedTerms {
+                        terms: unresolved.term_values(&path).await?,
+                        labels: labels.map(|label| (*label).to_owned()),
+                    },
+                });
+            }
+            let expansion = virtual_base::Expansion::new(
+                store,
+                &path,
+                terms,
+                substitutes,
+                named,
+                &mut replacements,
+            )
+            .await?;
+            expansions.push((path, expansion));
+        }
+        let replaced_paths = expansions.iter().map(|(path, _)| path.clone()).collect();
+        let tree = if overrides.is_empty() && expansions.is_empty() {
+            tree.simplified()
+        } else {
+            write_expanded(tree, overrides, expansions).await?
+        };
+        let tree = if resolve { tree.resolve().await? } else { tree };
+        Ok((tree, replaced_paths))
+    }
+
+    /// The value that each term of this merge holds at `path`, one for each
+    /// term, none of them merged with the others.
+    pub(crate) async fn term_values(&self, path: &RepoPath) -> BackendResult<MergedTreeValue> {
+        let trees = self.trees().await?;
+        trees.try_map_async(|tree| tree.path_value(path)).await
+    }
+}
+
+/// The files that the trees at the bases of `merge` hold as bases of their
+/// conflicts, by path, outside the paths of `overrides`: in the merge, each is
+/// a side.
+fn inverted_bases(
+    merge: &Merge<(MergedTree, String)>,
+    overrides: &[(RepoPathBuf, MergedTreeValue)],
+) -> BackendResult<BTreeMap<RepoPathBuf, HashSet<TreeValue>>> {
+    let override_paths: HashSet<&RepoPath> =
+        overrides.iter().map(|(path, _)| path.as_ref()).collect();
+    let mut bases: BTreeMap<RepoPathBuf, HashSet<TreeValue>> = BTreeMap::new();
+    for (tree, _) in merge.removes().filter(|(tree, _)| tree.has_conflict()) {
+        for (path, value) in tree.conflicts() {
+            let value = value?;
+            if path
+                .ancestors()
+                .any(|ancestor| override_paths.contains(ancestor))
+            {
+                continue;
+            }
+            let files = value
+                .removes()
+                .flatten()
+                .filter(|term| matches!(term, TreeValue::File { .. }));
+            bases.entry(path).or_default().extend(files.cloned());
+        }
+    }
+    bases.retain(|_, files| !files.is_empty());
+    Ok(bases)
+}
+
+/// `tree`, an unsimplified merge, with `overrides` and `expansions` written
+/// over its terms, and simplified once, with its labels. The terms that
+/// replace VB and M go after the merge's own terms, as many pairs for each of
+/// the merge's terms that they came from as at the path where it brings the
+/// most. Each such term takes the label that the first path to put a term
+/// there gives it, or the label of the merge's term it came from.
+async fn write_expanded(
+    tree: MergedTree,
+    overrides: &[(RepoPathBuf, MergedTreeValue)],
+    expansions: Vec<(RepoPathBuf, virtual_base::Expansion)>,
+) -> BackendResult<MergedTree> {
+    let pair_labels =
+        virtual_base::Expansion::pair_labels(expansions.iter().map(|(_, expansion)| expansion));
+    let num_pairs: BTreeMap<usize, usize> = pair_labels
+        .iter()
+        .map(|(&origin, labels)| (origin, labels.len()))
+        .collect();
+    let MergedTree {
+        store,
+        tree_ids,
+        labels,
+    } = tree;
+    let own_labels = if labels.has_labels() {
+        labels.into_merge()
+    } else {
+        Merge::repeated(String::new(), tree_ids.num_sides())
+    };
+    let empty_tree_id = store.empty_tree_id().clone();
+    let tree_ids = virtual_base::append_pairs(tree_ids, &num_pairs, |_, n| {
+        vec![(empty_tree_id.clone(), empty_tree_id.clone()); n]
+    });
+    let labels = virtual_base::append_pairs(own_labels.clone(), &num_pairs, |origin, n| {
+        let origin_label = own_labels.as_slice()[origin].clone();
+        let label = |label: Option<&String>| label.cloned().unwrap_or_else(|| origin_label.clone());
+        pair_labels[&origin][..n]
+            .iter()
+            .map(|labels| (label(labels.remove.as_ref()), label(labels.add.as_ref())))
+            .collect()
+    });
+    let mut builder = MergedTreeBuilder::new(MergedTree::new(
+        store,
+        tree_ids,
+        ConflictLabels::from_merge(labels),
+    ));
+    for (path, value) in overrides {
+        builder.set_or_remove(path.clone(), value.clone());
+    }
+    for (path, expansion) in expansions {
+        builder.set_or_remove(path, expansion.into_merge(&num_pairs));
+    }
+    builder.write_tree_no_resolve().await
 }
 
 /// A single entry in a tree diff.

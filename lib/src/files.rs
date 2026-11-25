@@ -18,6 +18,7 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::iter;
 use std::mem;
+use std::ops::Range;
 
 use bstr::BStr;
 use bstr::BString;
@@ -306,6 +307,14 @@ pub fn try_merge<T: AsRef<[u8]>>(inputs: &Merge<T>, options: &MergeOptions) -> O
     merge_inner(inputs, options)
 }
 
+/// Whether `contents` is likely binary: whether its first 8,000 bytes hold a
+/// NUL byte. This is the same heuristic used by git as of writing:
+/// <https://github.com/git/git/blob/eea0e59ffbed6e33d171ace5be13cde9faa41639/xdiff-interface.c#L192-L198>
+pub(crate) fn is_binary_content(contents: &[u8]) -> bool {
+    const PEEK_SIZE: usize = 8000;
+    contents[..PEEK_SIZE.min(contents.len())].contains(&b'\0')
+}
+
 fn merge_inner<'input, T, B>(inputs: &'input Merge<T>, options: &MergeOptions) -> B
 where
     T: AsRef<[u8]>,
@@ -316,13 +325,63 @@ where
     // more than 3 parts?
     let num_diffs = inputs.removes().len();
     let diff = ContentDiff::by_line(inputs.removes().chain(inputs.adds()));
-    let hunks = resolve_diff_hunks(&diff, num_diffs, options.same_change);
+    B::from_hunks(
+        diff.hunks()
+            .map(|diff_hunk| merge_hunk(diff_hunk, num_diffs, options)),
+    )
+}
+
+/// The hunk that a merge of contents makes of `diff_hunk`, a hunk of the line
+/// diff of the merge's removes and then its adds, of which `num_diffs` are
+/// removes: resolved where the contents merge trivially, and, at word level,
+/// where a hunk that conflicts by line merges by word.
+fn merge_hunk<'input>(
+    diff_hunk: DiffHunk<'input>,
+    num_diffs: usize,
+    options: &MergeOptions,
+) -> MergeHunk<'input> {
+    let merge = resolve_diff_hunk(diff_hunk, num_diffs, options.same_change);
     match options.hunk_level {
-        FileMergeHunkLevel::Line => B::from_hunks(hunks.map(MergeHunk::Borrowed)),
-        FileMergeHunkLevel::Word => {
-            B::from_hunks(hunks.map(|h| merge_hunk_by_word(h, options.same_change)))
-        }
+        FileMergeHunkLevel::Line => MergeHunk::Borrowed(merge),
+        FileMergeHunkLevel::Word => merge_hunk_by_word(merge, options.same_change),
     }
+}
+
+/// A hunk of a merge of contents with the range that each input takes in its
+/// own content there.
+#[derive(Clone, Debug)]
+pub(crate) struct RangedMergeHunk {
+    /// The range of each input, in the order of the merge's terms.
+    pub(crate) ranges: Merge<Range<usize>>,
+    /// Whether every input holds the same text.
+    pub(crate) matching: bool,
+    /// The text that the inputs merge to, unless they conflict. Where they
+    /// conflict, each input's text is its range of its content.
+    pub(crate) resolved: Option<BString>,
+}
+
+/// The hunks of the merge of `inputs`, one for each hunk of their line diff,
+/// as every merge of contents splits them, before it joins the hunks that
+/// resolve: each made as [`merge_hunk`] makes it, at the hunk level of
+/// `options`.
+pub(crate) fn split_ranged_hunks<T: AsRef<[u8]>>(
+    inputs: &Merge<T>,
+    options: &MergeOptions,
+) -> Vec<RangedMergeHunk> {
+    let num_diffs = inputs.removes().len();
+    let diff = ContentDiff::by_line(inputs.removes().chain(inputs.adds()));
+    iter::zip(diff.hunks(), diff.hunk_ranges())
+        .map(|(diff_hunk, diff_ranges)| {
+            let matching = diff_hunk.kind == DiffHunkKind::Matching;
+            let hunk = merge_hunk(diff_hunk, num_diffs, options);
+            let (removes, adds) = diff_ranges.ranges.split_at(num_diffs);
+            RangedMergeHunk {
+                ranges: Merge::from_removes_adds(removes.iter().cloned(), adds.iter().cloned()),
+                matching,
+                resolved: hunk.as_resolved().map(BStr::to_owned),
+            }
+        })
+        .collect()
 }
 
 fn merge_hunk_by_word(inputs: Merge<&BStr>, same_change: SameChange) -> MergeHunk<'_> {
@@ -469,7 +528,17 @@ fn resolve_diff_hunks<'input>(
     num_diffs: usize,
     same_change: SameChange,
 ) -> impl Iterator<Item = Merge<&'input BStr>> {
-    diff.hunks().map(move |diff_hunk| match diff_hunk.kind {
+    diff.hunks()
+        .map(move |diff_hunk| resolve_diff_hunk(diff_hunk, num_diffs, same_change))
+}
+
+/// Attempts to resolve trivial merge conflict for `diff_hunk`.
+fn resolve_diff_hunk(
+    diff_hunk: DiffHunk<'_>,
+    num_diffs: usize,
+    same_change: SameChange,
+) -> Merge<&BStr> {
+    match diff_hunk.kind {
         DiffHunkKind::Matching => {
             debug_assert!(diff_hunk.contents.iter().all_equal());
             Merge::resolved(diff_hunk.contents[0])
@@ -484,7 +553,7 @@ fn resolve_diff_hunks<'input>(
                 None => merge,
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use indexmap::IndexSet;
 use indoc::indoc;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::FileId;
+use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::fix::FileFixer;
 use jj_lib::fix::FileToFix;
@@ -789,7 +790,28 @@ fn test_fix_complex_merge_with_base_map() -> TestResult {
 
     let mut file_fixer = TestFileFixer::new();
     file_fixer.add_replacement(path, Some(b"base A"), b"unformatted C", b"Formatted C");
-    file_fixer.add_replacement(path, Some(b"base A"), b"unformatted E", b"Formatted E");
+    // E's base is the merge of A, B and D, which jj merges in the order of their
+    // commit ids. The fixer gets the first side of that merge's conflict as the
+    // base content, which is A's or D's content, depending on that order.
+    let base_commits_e: Vec<Commit> = [&commit_a, &commit_b, &commit_d]
+        .into_iter()
+        .map(|id| repo.store().get_commit(id))
+        .collect::<Result<_, _>>()?;
+    let base_value_e = merge_commit_trees(tx.repo(), &base_commits_e)
+        .block_on()?
+        .path_value(path)
+        .block_on()?;
+    let Some(TreeValue::File { id, .. }) = base_value_e.first() else {
+        panic!("expected a file as the first side of E's base, got {base_value_e:?}");
+    };
+    let base_content_e = read_file(repo.store(), path, id);
+    assert!(base_content_e == b"base A" || base_content_e == b"base D");
+    file_fixer.add_replacement(
+        path,
+        Some(base_content_e.as_slice()),
+        b"unformatted E",
+        b"Formatted E",
+    );
 
     let include_unchanged_files = false;
     let summary = fix_files(

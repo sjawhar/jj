@@ -13,13 +13,11 @@
 // limitations under the License.
 
 use jj_lib::backend::TreeValue;
-use jj_lib::config::ConfigLayer;
-use jj_lib::config::ConfigSource;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
 use jj_lib::repo::Repo as _;
+use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::rewrite::rebase_commit;
-use jj_lib::settings::UserSettings;
 use pollster::FutureExt as _;
 use test_case::test_case;
 use testutils::CommitBuilderExt as _;
@@ -28,6 +26,7 @@ use testutils::TestResult;
 use testutils::assert_tree_eq;
 use testutils::create_tree;
 use testutils::repo_path;
+use testutils::settings_with_same_change;
 
 #[test]
 fn test_simplify_conflict_after_resolving_parent() -> TestResult {
@@ -246,16 +245,218 @@ fn test_rebase_on_lossy_merge(same_change: SameChange) -> TestResult {
     Ok(())
 }
 
-fn settings_with_same_change(same_change: SameChange) -> UserSettings {
-    let mut config = testutils::base_user_config();
-    let mut layer = ConfigLayer::empty(ConfigSource::User);
-    let same_change_str = match same_change {
-        SameChange::Keep => "keep",
-        SameChange::Accept => "accept",
+/// A merge must not silently drop content that both sides carry.
+///
+/// Two bugfixes independently add the same dependency line, and are merged
+/// together twice -- once to base feature X on, once to base feature Y on:
+///
+/// ```text
+///        base          "packages" WITHOUT "bun"
+///        /  \
+///       A    B         both independently ADD "bun", plus one change of their own
+///       |\  /|
+///       | \/ |
+///       | /\ |
+///  AB_for_X  AB_for_Y  two *separate* clean merges of A and B; both keep "bun"
+///        \    /
+///          XY          merging them must not lose "bun"
+/// ```
+///
+/// `AB_for_X` and `AB_for_Y` have two best common ancestors, `A` and `B`, and
+/// both of those carry "bun". Merging the bases but flattening the result into
+/// the term list unresolved gives
+/// `adds [AB_for_X(bun), base(no bun), AB_for_Y(bun)],
+/// removes [A(bun), B(bun)]`, so "bun" cancels to net 0 while the no-bun
+/// version wins with +1: the line is resolved away with no conflict marker,
+/// and -- because a merge commit's diff is taken against its auto-merged
+/// parents -- with no diff either. Merging and resolving the bases into one
+/// tree first keeps it.
+#[test]
+fn test_merge_does_not_drop_content_carried_by_both_sides() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let path = repo_path("devbox.json");
+
+    // Two well-separated regions, so that "packages" and "scripts" fall in
+    // different diff hunks.
+    let file = |bun: bool, env: &str, script: &str| {
+        format!(
+            "packages:\n  php\n{}  nginx\n\nenv:\n  PORT=8081\n{}\nscripts:\n  lint\n{}",
+            if bun { "  bun\n" } else { "" },
+            env,
+            script,
+        )
     };
-    layer
-        .set_value("merge.same-change", same_change_str)
-        .unwrap();
-    config.add_layer(layer);
-    testutils::user_settings_from_config(config)
+
+    let mut tx = repo.start_transaction();
+    let tree_base = create_tree(repo, &[(path, &file(false, "", ""))]);
+    let commit_base = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree_base)
+        .write_unwrap();
+    let tree_a = create_tree(repo, &[(path, &file(true, "  LOOKAROUND=1\n", ""))]);
+    let commit_a = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_a)
+        .write_unwrap();
+    let tree_b = create_tree(repo, &[(path, &file(true, "", "  less\n"))]);
+    let commit_b = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_b)
+        .write_unwrap();
+
+    // AB_for_X and AB_for_Y are two independent, cleanly-resolved merges of A
+    // and B. Both keep "bun": A and B made the same change to that region.
+    let parents = vec![commit_a.id().clone(), commit_b.id().clone()];
+    let merged_tree =
+        merge_commit_trees(tx.repo(), &[commit_a.clone(), commit_b.clone()]).block_on()?;
+    assert!(
+        merged_tree.path_value(path).block_on()?.is_resolved(),
+        "the test setup requires the two merges to be conflict-free"
+    );
+    let commit_ab_for_x = tx
+        .repo_mut()
+        .new_commit(parents.clone(), merged_tree.clone())
+        .write_unwrap();
+    let commit_ab_for_y = tx
+        .repo_mut()
+        .new_commit(parents, merged_tree)
+        .write_unwrap();
+    let repo = tx.commit("test").block_on()?;
+
+    let tree = merge_commit_trees(repo.as_ref(), &[commit_ab_for_x, commit_ab_for_y]).block_on()?;
+    let value = tree.path_value(path).block_on()?;
+    let Ok(Some(TreeValue::File { id, .. })) = value.clone().into_resolved() else {
+        panic!("expected a cleanly resolved file, got: {value:#?}");
+    };
+    let content = String::from_utf8(testutils::read_file(repo.store(), path, &id)).unwrap();
+    assert_eq!(content, file(true, "  LOOKAROUND=1\n", "  less\n"));
+
+    Ok(())
+}
+
+/// The reproduction from jj-vcs/jj#6369: `a` and `b` make the *same* change,
+/// so `c` and `d` resolve cleanly to it under `SameChange::Accept`, yet the
+/// merge of `c` and `d` used to go back to the base's content.
+#[test]
+fn test_merge_of_merges_with_same_change_keeps_the_change() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let path = repo_path("file.txt");
+
+    let mut tx = repo.start_transaction();
+    let tree_base = create_tree(repo, &[(path, "original\n")]);
+    let commit_base = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree_base)
+        .write_unwrap();
+    let tree_modified = create_tree(repo, &[(path, "modified\n")]);
+    let commit_a = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_modified.clone())
+        .write_unwrap();
+    let commit_b = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_modified)
+        .write_unwrap();
+
+    let parents = vec![commit_a.id().clone(), commit_b.id().clone()];
+    let merged_tree = merge_commit_trees(tx.repo(), &[commit_a, commit_b]).block_on()?;
+    let commit_c = tx
+        .repo_mut()
+        .new_commit(parents.clone(), merged_tree.clone())
+        .write_unwrap();
+    let commit_d = tx
+        .repo_mut()
+        .new_commit(parents, merged_tree)
+        .write_unwrap();
+    let repo = tx.commit("test").block_on()?;
+
+    let tree = merge_commit_trees(repo.as_ref(), &[commit_c, commit_d]).block_on()?;
+    let value = tree.path_value(path).block_on()?;
+    let Ok(Some(TreeValue::File { id, .. })) = value.clone().into_resolved() else {
+        panic!("expected a cleanly resolved file, got: {value:#?}");
+    };
+    assert_eq!(testutils::read_file(repo.store(), path, &id), b"modified\n");
+
+    Ok(())
+}
+
+/// A conflicted merge base must not let content revert to the base's own
+/// version.
+///
+/// ```text
+///    base        "original"
+///     / \
+///    a   b       "A" and "B" -- a genuine conflict
+///     \ /
+///      m         conflicted merge of a and b
+///     / \
+///   r1   r2      two *different* manual resolutions of m
+/// ```
+///
+/// `r1` and `r2` have a single merge base, `m`, whose tree is conflicted.
+/// Flattening that conflict into the term list puts `a` and `b` on the remove
+/// side, where they cancel `r1` and `r2`, leaving "original" -- a version
+/// *neither side chose* -- to win, with no conflict at all.
+///
+/// Both `r1` and `r2` changed the base's conflict, so they are merged against
+/// a virtual merge base that holds the conflict's sides between marker lines,
+/// and the merge is a conflict between "A" and "B".
+#[test]
+fn test_merge_of_two_resolutions_does_not_revert_to_the_base() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let path = repo_path("file");
+
+    let mut tx = repo.start_transaction();
+    let tree_base = create_tree(repo, &[(path, "original\n")]);
+    let commit_base = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree_base)
+        .write_unwrap();
+    let tree_a = create_tree(repo, &[(path, "A\n")]);
+    let commit_a = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_a.clone())
+        .write_unwrap();
+    let tree_b = create_tree(repo, &[(path, "B\n")]);
+    let commit_b = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_b.clone())
+        .write_unwrap();
+
+    let tree_m = merge_commit_trees(tx.repo(), &[commit_a.clone(), commit_b.clone()]).block_on()?;
+    assert!(
+        !tree_m.path_value(path).block_on()?.is_resolved(),
+        "the test setup requires m to be conflicted"
+    );
+    let commit_m = tx
+        .repo_mut()
+        .new_commit(vec![commit_a.id().clone(), commit_b.id().clone()], tree_m)
+        .write_unwrap();
+    // Two different manual resolutions of the same conflict.
+    let commit_r1 = tx
+        .repo_mut()
+        .new_commit(vec![commit_m.id().clone()], tree_a)
+        .write_unwrap();
+    let commit_r2 = tx
+        .repo_mut()
+        .new_commit(vec![commit_m.id().clone()], tree_b)
+        .write_unwrap();
+    let repo = tx.commit("test").block_on()?;
+
+    let tree = merge_commit_trees(repo.as_ref(), &[commit_r1, commit_r2]).block_on()?;
+    let value = tree.path_value(path).block_on()?.simplify();
+    assert!(!value.is_resolved(), "expected a conflict, got: {value:#?}");
+    let adds: Vec<Vec<u8>> = value
+        .adds()
+        .map(|add| match add {
+            Some(TreeValue::File { id, .. }) => testutils::read_file(repo.store(), path, id),
+            other => panic!("expected a file among the sides, got: {other:?}"),
+        })
+        .collect();
+    assert_eq!(adds, [b"A\n".to_vec(), b"B\n".to_vec()]);
+
+    Ok(())
 }

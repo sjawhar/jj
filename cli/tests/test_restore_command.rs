@@ -18,6 +18,7 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
 
 #[test]
 fn test_restore() {
@@ -591,6 +592,43 @@ fn test_restore_interactive_with_paths() -> TestResult {
     [EOF]
     ");
     Ok(())
+}
+
+#[test]
+fn test_restore_resolution_of_a_merge_into_one_parent() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y". Restoring "f" from "d"
+    // into "p1" gives "p1" "y", and "d", rebased, holds "y" with no conflict, as
+    // before virtual merge bases, so neither side's tool has anything to
+    // resolve.
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir
+        .run_jj(["restore", "--from", "d", "--into", "p1", "f"])
+        .success();
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @"
+    y
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "-r", "d", "--tool", ":ours"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "-r", "d", "--tool", ":theirs"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @"
+    y
+    [EOF]
+    ");
 }
 
 #[must_use]

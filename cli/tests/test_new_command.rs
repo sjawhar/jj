@@ -263,6 +263,107 @@ fn test_new_merge_conflicts() {
 }
 
 #[test]
+fn test_new_merge_same_change_of_same_change_merges() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // https://github.com/jj-vcs/jj/issues/6369: "a" and "b" make the same
+    // change, "c" and "d" are two separate merges of them, and merging those
+    // used to resolve cleanly to "original" -- content that neither side has.
+    create_commit_with_files(&work_dir, "base", &[], &[("file", "original\n")]);
+    create_commit_with_files(&work_dir, "a", &["base"], &[("file", "modified\n")]);
+    create_commit_with_files(&work_dir, "b", &["base"], &[("file", "modified\n")]);
+    create_commit_with_files(&work_dir, "c", &["a", "b"], &[]);
+    create_commit_with_files(&work_dir, "d", &["a", "b"], &[]);
+
+    work_dir.run_jj(["new", "c|d"]).success();
+    assert_eq!(work_dir.read_file("file"), "modified\n");
+
+    // With "keep", the merge of the merge bases of "c" and "d" is the
+    // *conflicted* merge of "a" and "b". Both sides hold "modified", so the
+    // merge keeps it although that base cannot be resolved.
+    work_dir.run_jj(["new", "root()"]).success();
+    work_dir
+        .run_jj(["new", "c|d", "--config=merge.same-change=keep"])
+        .success();
+    assert_eq!(work_dir.read_file("file"), "modified\n");
+
+    // Whatever the merge produced has to survive a working-copy snapshot: the
+    // merged file must hold no conflict markers that the next snapshot would
+    // store as ordinary content, silently turning a conflict into text that
+    // merely looks like one.
+    let before = get_working_copy_commit_id(&work_dir);
+    // Writing the file makes the snapshot read it again.
+    work_dir.write_file("file", "modified\n");
+    work_dir.run_jj(["status"]).success(); // snapshots the working copy
+    assert_eq!(get_working_copy_commit_id(&work_dir), before);
+    assert_eq!(work_dir.read_file("file"), "modified\n");
+}
+
+#[test]
+fn test_new_merge_of_two_different_resolutions_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" and "b" change the file differently, and "p1" and "p2" are two merges
+    // of them that resolve that conflict differently. "p1" and "p2" have the two
+    // merge bases "a" and "b", whose own merge does not resolve, so merging them
+    // must keep both resolutions in a conflict rather than pick one.
+    create_commit_with_files(&work_dir, "base", &[], &[("file", "o\n")]);
+    create_commit_with_files(&work_dir, "a", &["base"], &[("file", "x\n")]);
+    create_commit_with_files(&work_dir, "b", &["base"], &[("file", "y\n")]);
+    create_commit_with_files(&work_dir, "p1", &["a", "b"], &[("file", "x\n")]);
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("file", "y\n")]);
+
+    work_dir.run_jj(["new", "p1", "p2"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
+    file    2-sided conflict
+    [EOF]
+    ");
+    // The conflict's base is the virtual merge base, whose own lines start like
+    // conflict markers, so jj materializes the conflict with longer markers.
+    // Its opening line carries its salt and names the terms of the conflict of
+    // "a" and "b" that it stands for, each with the commit it comes from. Each
+    // side carries the label of the commit it comes from: "p1" for "x" and
+    // "p2" for "y".
+    let materialized = work_dir.read_file("file");
+    insta::assert_snapshot!(materialized, @r#"
+    <<<<<<<<<<< conflict 1 of 1
+    %%%%%%%%%%% diff from: zsuskuln 4d032ef7 "a"
+    \\\\\\\\\\\        to: vruxwmqv a902e1f4 "p1"
+    -<<<<<<< jj virtual merge base b4545da3c0e3cdbb5ce105488a2cb6de 0 file:587be6b4c3f93f93c489c0111bba5596147a26cb@zsuskuln%204d032ef7%20%22a%22 file:13e7564ea0c889e81bcba6f8e496b2a74cdb32fa@rlvkpnrz%20893e9773%20%22base%22 file:975fbec8256d3e8a3797e7a3611380f27c49f4ac@royxmykx%2095edb631%20%22b%22
+     x
+    -======= b4545da3c0e3cdbb5ce105488a2cb6de
+    -y
+    ->>>>>>> b4545da3c0e3cdbb5ce105488a2cb6de
+    +++++++++++ znkkpsqq 9ca67c80 "p2"
+    y
+    >>>>>>>>>>> conflict 1 of 1 ends
+    "#);
+
+    // A snapshot of the working copy reads the file back as the same conflict.
+    let before = get_working_copy_commit_id(&work_dir);
+    // Writing the file makes the snapshot parse it again.
+    work_dir.write_file("file", &materialized);
+    work_dir.run_jj(["status"]).success(); // snapshots the working copy
+    assert_eq!(get_working_copy_commit_id(&work_dir), before);
+    assert_eq!(work_dir.read_file("file"), materialized);
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
+    file    2-sided conflict
+    [EOF]
+    ");
+
+    // A child keeps the conflict.
+    work_dir.run_jj(["new"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
+    file    2-sided conflict
+    [EOF]
+    ");
+}
+
+#[test]
 fn test_new_merge_same_change() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
@@ -1016,4 +1117,14 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
 fn get_short_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     let template = r#"if(description, description, "root")"#;
     work_dir.run_jj(["log", "-T", template])
+}
+
+#[must_use]
+fn get_working_copy_commit_id(work_dir: &TestWorkDir) -> String {
+    work_dir
+        .run_jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned()
 }

@@ -15,7 +15,11 @@
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit;
+use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
 
 #[test]
 fn test_basics() {
@@ -521,6 +525,47 @@ fn test_abandon_tracking_bookmarks() {
     Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
     [EOF]
     ");
+}
+
+#[test]
+fn test_abandon_parent_of_a_resolved_merge_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y", so its parent tree is a
+    // conflict whose base is the virtual merge base of "a" and "b". Abandoning
+    // "p2" rebases "d" with that parent tree as the base, which cancels every
+    // term but the virtual merge base, now a side: the merge replaces it with
+    // the conflict of "a" and "b" that it stands for, so "f" is a conflict of
+    // "x" and "y" against "o".
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir.run_jj(["abandon", "p2"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "d");
+}
+
+#[test]
+fn test_abandon_parent_of_a_merge_with_an_edit_in_the_disputed_hunk_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" and "b" lines 1 to 3; "d" merges "p1" and "p2"
+    // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
+    // where "a" and "b" disagree. Abandoning "p2" gives "d" a conflict of its
+    // own and "a"'s changes from "o", as before virtual merge bases.
+    create_b2_merge(&work_dir);
+    work_dir.run_jj(["abandon", "p2"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "d");
 }
 
 #[must_use]

@@ -1765,7 +1765,7 @@ fn test_git_colocated_update_index_3_sided_conflict() -> TestResult {
         .success();
 
     insta::assert_snapshot!(get_log_output(&work_dir), @"
-    @      2d396332267d4158d0554a636343498ad74b1555
+    @      bfe028d0db0886220e76dfbb4d43e955e8db73f9
     ├─┬─╮
     │ │ ○  5008c8807feaa955d02e96cb1b0dcf51536fefb8 side-3
     │ ○ │  da6e0a03f8b72f6868a9ea33836123fe965c0cb4 side-2
@@ -1782,7 +1782,7 @@ fn test_git_colocated_update_index_3_sided_conflict() -> TestResult {
     insta::assert_snapshot!(get_index_state(work_dir.root()), @"
     Ours         Mode(FILE) eb8299123d2a ctime=0:0 mtime=0:0 size=0 flags=2000 .jj-do-not-resolve-this-conflict
     Unconflicted Mode(FILE) df967b96a579 ctime=[nonzero] mtime=[nonzero] size=5 flags=0 base.txt
-    Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
+    Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
     Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 side-1.txt
     Unconflicted Mode(FILE) 7b44e11df720 ctime=0:0 mtime=0:0 size=0 flags=0 side-2.txt
     Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 side-3.txt
@@ -1791,8 +1791,8 @@ fn test_git_colocated_update_index_3_sided_conflict() -> TestResult {
     work_dir.run_jj(["new"]).success();
 
     insta::assert_snapshot!(get_log_output(&work_dir), @"
-    @  05c0d46f4f8e6fee4b1ee268242bc11a71745739
-    ×      2d396332267d4158d0554a636343498ad74b1555
+    @  f6c34b4d9f68fdce506bd0ac417f2a5cc4ae3418
+    ×      bfe028d0db0886220e76dfbb4d43e955e8db73f9
     ├─┬─╮
     │ │ ○  5008c8807feaa955d02e96cb1b0dcf51536fefb8 side-3
     │ ○ │  da6e0a03f8b72f6868a9ea33836123fe965c0cb4 side-2
@@ -1808,7 +1808,7 @@ fn test_git_colocated_update_index_3_sided_conflict() -> TestResult {
     insta::assert_snapshot!(get_index_state(work_dir.root()), @"
     Ours         Mode(FILE) eb8299123d2a ctime=0:0 mtime=0:0 size=0 flags=2000 .jj-do-not-resolve-this-conflict
     Unconflicted Mode(FILE) df967b96a579 ctime=[nonzero] mtime=[nonzero] size=5 flags=0 base.txt
-    Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
+    Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
     Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 side-1.txt
     Unconflicted Mode(FILE) 7b44e11df720 ctime=0:0 mtime=0:0 size=0 flags=0 side-2.txt
     Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 side-3.txt
@@ -1821,7 +1821,7 @@ fn test_git_colocated_update_index_3_sided_conflict() -> TestResult {
     insta::assert_snapshot!(get_index_state(work_dir.root()), @"
     Unconflicted Mode(FILE) f73f3093ff86 ctime=0:0 mtime=0:0 size=0 flags=0 .jj-do-not-resolve-this-conflict
     Unconflicted Mode(FILE) df967b96a579 ctime=[nonzero] mtime=[nonzero] size=5 flags=0 base.txt
-    Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
+    Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 conflict.txt
     Unconflicted Mode(FILE) dd8f930010b3 ctime=0:0 mtime=0:0 size=0 flags=0 side-1.txt
     Unconflicted Mode(FILE) 7b44e11df720 ctime=0:0 mtime=0:0 size=0 flags=0 side-2.txt
     Unconflicted Mode(FILE) 42f37a71bf20 ctime=0:0 mtime=0:0 size=0 flags=0 side-3.txt

@@ -426,6 +426,32 @@ impl<T> Merge<T> {
         self
     }
 
+    /// Whether `self` and `other` have the same adds and the same removes, as
+    /// multisets, after [`Self::simplify()`]. Unlike `==`, this does not
+    /// depend on the order of the terms.
+    pub fn same_terms_as(&self, other: &Self) -> bool
+    where
+        T: Eq + Hash,
+    {
+        let self_mapping = self.get_simplified_mapping();
+        let other_mapping = other.get_simplified_mapping();
+        self_mapping.len() == other_mapping.len()
+            && self.count_terms(&self_mapping) == other.count_terms(&other_mapping)
+    }
+
+    /// Counts the terms at `indices`, which alternate between adds and
+    /// removes, keyed by whether the term is an add and by its value.
+    fn count_terms(&self, indices: &[usize]) -> HashMap<(bool, &T), usize>
+    where
+        T: Eq + Hash,
+    {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| (position % 2 == 0, &self.values[index]))
+            .counts()
+    }
+
     /// If this merge can be trivially resolved, returns the value it resolves
     /// to.
     pub fn resolve_trivial(&self, same_change: SameChange) -> Option<&T>
@@ -1134,6 +1160,25 @@ mod tests {
             c(&[0, 0, 3, 1, 3, 2, 4]).update_from_simplified(c(&[10, 1, 11, 2, 4])),
             c(&[0, 0, 10, 1, 11, 2, 4])
         );
+    }
+
+    #[test]
+    fn test_same_terms_as() {
+        // The same adds and removes, in another order
+        assert!(c(&[0, 1, 2]).same_terms_as(&c(&[2, 1, 0])));
+        assert!(c(&[0, 1, 2, 3, 4]).same_terms_as(&c(&[4, 3, 2, 1, 0])));
+        assert!(c(&[0, 1, 2, 1, 0]).same_terms_as(&c(&[2, 1, 0, 1, 0])));
+        // Terms that `simplify()` drops are ignored
+        assert!(c(&[0, 1, 2, 3, 3]).same_terms_as(&c(&[2, 1, 0])));
+        assert!(c(&[0]).same_terms_as(&c(&[1, 1, 0])));
+        // An add differs
+        assert!(!c(&[0, 1, 2]).same_terms_as(&c(&[0, 1, 3])));
+        assert!(!c(&[0, 1, 2, 1, 0]).same_terms_as(&c(&[0, 1, 2, 1, 2])));
+        // A remove differs
+        assert!(!c(&[0, 1, 2]).same_terms_as(&c(&[0, 3, 2])));
+        assert!(!c(&[0, 1, 2, 3, 4]).same_terms_as(&c(&[0, 1, 2, 5, 4])));
+        // The number of sides differs
+        assert!(!c(&[0]).same_terms_as(&c(&[0, 1, 2])));
     }
 
     #[test]

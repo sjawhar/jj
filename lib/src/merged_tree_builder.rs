@@ -58,6 +58,17 @@ impl MergedTreeBuilder {
 
     /// Create new tree(s) from the base tree(s) and overrides.
     pub async fn write_tree(self) -> BackendResult<MergedTree> {
+        let tree = self.write_tree_no_resolve().await?;
+        if tree.has_conflict() {
+            tree.resolve().await
+        } else {
+            Ok(tree)
+        }
+    }
+
+    /// Create new tree(s) from the base tree(s) and overrides, without
+    /// attempting to resolve the conflicts of the result.
+    pub async fn write_tree_no_resolve(self) -> BackendResult<MergedTree> {
         let store = self.base_tree.store().clone();
         let labels = self.base_tree.labels().clone();
         let new_tree_ids = self.write_merged_trees().await?;
@@ -73,10 +84,7 @@ impl MergedTreeBuilder {
         let (labels, new_tree_ids) = labels.simplify_with(&new_tree_ids);
         match new_tree_ids.into_resolved() {
             Ok(single_tree_id) => Ok(MergedTree::resolved(store, single_tree_id)),
-            Err(tree_ids) => {
-                let tree = MergedTree::new(store, tree_ids, labels);
-                tree.resolve().await
-            }
+            Err(tree_ids) => Ok(MergedTree::new(store, tree_ids, labels)),
         }
     }
 

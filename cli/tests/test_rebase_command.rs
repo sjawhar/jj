@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::A_LINES;
+use crate::common::B_LINES;
+use crate::common::B2_LINES;
 use crate::common::CommandOutput;
+use crate::common::SIX_LINES;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::assert_no_virtual_merge_base_text;
+use crate::common::create_b2_merge;
 use crate::common::create_commit;
 use crate::common::create_commit_with_files;
+use crate::common::create_criss_cross_commits;
+use crate::common::create_criss_cross_commits_with;
 
 #[test]
 fn test_rebase_invalid() {
@@ -3074,6 +3082,374 @@ fn test_rebase_simplify_parents() {
     ◆    zzzzzzzz  00000000
     [EOF]
     ");
+}
+
+#[test]
+fn test_rebase_merge_onto_one_parent_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y", so its parent tree is a
+    // conflict whose base is the virtual merge base of "a" and "b". Rebasing
+    // "d" onto "p1" merges with that parent tree as the base, which cancels
+    // every term but the virtual merge base, now a side: the merge replaces it
+    // with the conflict of "a" and "b" that it stands for, so "f" is a conflict
+    // of "p1"'s "x" and "d"'s "y" against "o".
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "d", "-d", "p1"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    // "x" keeps the label of the rebase destination and "y" that of the rebased
+    // revision; "o", a term of the conflict that the virtual merge base stands
+    // for, takes the virtual merge base's label.
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @r#"
+    <<<<<<< conflict 1 of 1
+    %%%%%%% diff from: rlvkpnrz 00d5a0ff "o"
+    \\\\\\\        to: vruxwmqv 6e354dd6 "p1" (rebase destination)
+    -o
+    +x
+    +++++++ kmkuslsw 9652d8e1 "d" (rebased revision)
+    y
+    >>>>>>> conflict 1 of 1 ends
+    [EOF]
+    "#);
+    assert_no_virtual_merge_base_text(&work_dir, "d");
+}
+
+#[test]
+fn test_rebase_sibling_of_a_conflicted_merge_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "z" merges "p1" and "p2" and keeps their conflict; "c" and "q", children
+    // of "z", resolve it to "x" and to "y".
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
+    create_commit_with_files(&work_dir, "c", &["z"], &[("f", "x\n")]);
+    create_commit_with_files(&work_dir, "q", &["z"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "c");
+}
+
+#[test]
+fn test_rebase_sibling_of_a_conflicted_merge_with_a_deletion() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" deletes "f" and "b" changes it; "p1" and "p2", two merges of them,
+    // delete it and keep "y". "z", the merge of "p1" and "p2", holds a conflict
+    // whose base is a placeholder file, as the merge bases' conflict is not of
+    // text files. "c" and "q", children of "z", delete "f" and keep "y".
+    create_commit_with_files(&work_dir, "o", &[], &[("f", "o\n"), ("g", "g\n")]);
+    create_commit_deleting_f(&work_dir, "a", &["o"]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", "y\n")]);
+    create_commit_deleting_f(&work_dir, "p1", &["a", "b"]);
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", "y\n")]);
+    create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
+    create_commit_deleting_f(&work_dir, "c", &["z"]);
+    create_commit_with_files(&work_dir, "q", &["z"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
+    f    2-sided conflict including 1 deletion
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "c");
+}
+
+#[test]
+fn test_rebase_across_a_conflicted_parent_gives_its_base() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "m" is a conflicted merge of "a" and "b"; "c1", a child of "m", holds "b"
+    // and "c2" holds "a". Rebasing "c1" onto "c2" gives "o", the base of "m"'s
+    // conflict, with no conflict, as it did before virtual merge bases.
+    create_commit_with_files(&work_dir, "o", &[], &[("f", "o\n")]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", "a\n")]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", "b\n")]);
+    create_commit_with_files(&work_dir, "m", &["a", "b"], &[]);
+    create_commit_with_files(&work_dir, "c1", &["m"], &[("f", "b\n")]);
+    create_commit_with_files(&work_dir, "c2", &["m"], &[("f", "a\n")]);
+    work_dir
+        .run_jj(["rebase", "-r", "c1", "-d", "c2"])
+        .success();
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "c1", "f"]), @"
+    o
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c1"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+}
+
+#[test]
+fn test_rebase_merge_with_an_edit_in_the_disputed_hunk_onto_one_parent_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" and "b" lines 1 to 3; "d" merges "p1" and "p2"
+    // and resolves "f" to "b"'s text with "b2" changed to "B2", inside the hunk
+    // where "a" and "b" disagree. Rebasing "d" onto "p1" gives a conflict of
+    // "d"'s and "a"'s changes from "o", as before virtual merge bases.
+    create_b2_merge(&work_dir);
+    work_dir.run_jj(["rebase", "-r", "d", "-d", "p1"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "d");
+}
+
+#[test]
+fn test_rebase_sibling_with_an_edit_in_the_disputed_hunk_conflicts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "z" merges "p1" and "p2" and keeps their conflict; "c" resolves it to
+    // "a"'s text and "q" to "b"'s text with "b2" changed to "B2".
+    create_criss_cross_commits_with(&work_dir, SIX_LINES, A_LINES, B_LINES);
+    create_commit_with_files(&work_dir, "z", &["p1", "p2"], &[]);
+    create_commit_with_files(&work_dir, "c", &["z"], &[("f", A_LINES)]);
+    create_commit_with_files(&work_dir, "q", &["z"], &[("f", B2_LINES)]);
+    work_dir.run_jj(["rebase", "-r", "c", "-d", "q"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "c"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "c");
+}
+
+#[test]
+fn test_rebase_merge_with_an_edit_outside_the_disputed_hunk_conflicts_in_the_working_copy() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2", resolves "f" to "y", and changes line 5, outside
+    // the hunk where "a" and "b" disagree. Rebased onto "p1", "d" holds a
+    // conflict whose sides do not merge, so the working copy shows it with
+    // conflict markers, and an edit elsewhere in the file keeps it.
+    create_criss_cross_commits_with(
+        &work_dir,
+        SIX_LINES,
+        "x\n2\n3\n4\n5\n6\n",
+        "y\n2\n3\n4\n5\n6\n",
+    );
+    create_commit_with_files(
+        &work_dir,
+        "d",
+        &["p1", "p2"],
+        &[("f", "y\n2\n3\n4\nFIVE\n6\n")],
+    );
+    work_dir.run_jj(["rebase", "-r", "d", "-d", "p1"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "d"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    work_dir.run_jj(["new", "d"]).success();
+    let materialized = work_dir.read_file("f");
+    assert!(
+        materialized.starts_with(b"<<<<<<< conflict 1 of 1\n"),
+        "expected conflict markers in the working copy, got {materialized}"
+    );
+    work_dir.write_file("f", format!("{materialized}SEVEN\n"));
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "@");
+}
+
+#[test]
+fn test_rebase_parent_of_a_resolved_merge_onto_a_merge_base() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "d" merges "p1" and "p2" and resolves "f" to "y". Rebasing "p2" onto "a"
+    // gives "p2" "o", and "d", rebased, holds "y" with no conflict, as before
+    // virtual merge bases, so neither side's tool has anything to resolve.
+    create_criss_cross_commits(&work_dir);
+    create_commit_with_files(&work_dir, "d", &["p1", "p2"], &[("f", "y\n")]);
+    work_dir.run_jj(["rebase", "-s", "p2", "-d", "a"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "p2", "f"]), @"
+    o
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @"
+    y
+    [EOF]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "-r", "d", "--tool", ":ours"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "-r", "d", "--tool", ":theirs"]), @"
+    ------- stderr -------
+    Error: No conflicts found at this revision
+    [EOF]
+    [exit status: 2]
+    ");
+    insta::assert_snapshot!(work_dir.run_jj(["file", "show", "-r", "d", "f"]), @"
+    y
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_rebase_keeps_an_edit_outside_a_conflict_whose_base_is_a_virtual_base() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "w" merges "p1" and "p2" and keeps their conflict at line 1 of "f", whose
+    // base is the virtual merge base of "a" and "b"; line 5, outside that
+    // conflict, is changed to "FIVE" in the working copy. "s" and "u", children
+    // of "w", resolve "f" to "x" and to "y", each with "FIVE". Rebasing "u"
+    // onto "s" gives a conflict whose every side holds "FIVE".
+    create_criss_cross_commits_with(
+        &work_dir,
+        SIX_LINES,
+        "x\n2\n3\n4\n5\n6\n",
+        "y\n2\n3\n4\n5\n6\n",
+    );
+    create_commit_with_files(&work_dir, "w", &["p1", "p2"], &[]);
+    let materialized = work_dir.read_file("f").to_string();
+    let edited = materialized.replacen("\n5\n", "\nFIVE\n", 1);
+    assert_ne!(edited, materialized);
+    work_dir.write_file("f", edited);
+    create_commit_with_files(&work_dir, "s", &["w"], &[("f", "x\n2\n3\n4\nFIVE\n6\n")]);
+    create_commit_with_files(&work_dir, "u", &["w"], &[("f", "y\n2\n3\n4\nFIVE\n6\n")]);
+    work_dir.run_jj(["rebase", "-r", "u", "-d", "s"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "u"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    // Each side and the base hold "FIVE"; the base, "o"'s text with the edit,
+    // takes the virtual merge base's label.
+    insta::assert_snapshot!(work_dir.run_jj([
+        "file",
+        "show",
+        "-r",
+        "u",
+        "f",
+        "--config=ui.conflict-marker-style=snapshot",
+    ]), @r#"
+    <<<<<<< conflict 1 of 1
+    +++++++ lylxulpl d4946a06 "s" (rebase destination)
+    x
+    ------- rlvkpnrz 43d2ae9c "o"
+    1
+    +++++++ nkmrtpmo e426b116 "u" (rebased revision)
+    y
+    >>>>>>> conflict 1 of 1 ends
+    2
+    3
+    4
+    FIVE
+    6
+    [EOF]
+    "#);
+    assert_no_virtual_merge_base_text(&work_dir, "u");
+}
+
+#[test]
+fn test_rebase_keeps_an_edit_where_the_merge_bases_merge() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" to "x" and line 9 to "9a", and "b" line 1 to
+    // "y"; "p1" and "p2", merges of "a" and "b", hold "x" and "y", each with
+    // "9a". "w" merges "p1" and "p2" and keeps their conflict at line 1; line
+    // 9, where "a" and "b" merge, is changed to "9b" in the working copy. "s"
+    // and "u", children of "w", resolve "f" to "x" and to "y", each with "9b".
+    // Rebasing "u" onto "s" gives a conflict, and no file holds a virtual
+    // merge base's text.
+    let text = |first: &str, nine: &str| format!("{first}\n2\n3\n4\n5\n6\n7\n8\n{nine}\n10\n");
+    create_commit_with_files(&work_dir, "o", &[], &[("f", &*text("o", "9"))]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", &*text("x", "9a"))]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", &*text("y", "9"))]);
+    create_commit_with_files(&work_dir, "p1", &["a", "b"], &[("f", &*text("x", "9a"))]);
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", &*text("y", "9a"))]);
+    create_commit_with_files(&work_dir, "w", &["p1", "p2"], &[]);
+    let materialized = work_dir.read_file("f").to_string();
+    let edited = materialized.replacen("\n9a\n", "\n9b\n", 1);
+    assert_ne!(edited, materialized);
+    work_dir.write_file("f", edited);
+    create_commit_with_files(&work_dir, "s", &["w"], &[("f", &*text("x", "9b"))]);
+    create_commit_with_files(&work_dir, "u", &["w"], &[("f", &*text("y", "9b"))]);
+    work_dir.run_jj(["rebase", "-r", "u", "-d", "s"]).success();
+    insta::assert_snapshot!(work_dir.run_jj(["resolve", "--list", "-r", "u"]), @"
+    f    2-sided conflict
+    [EOF]
+    ");
+    assert_no_virtual_merge_base_text(&work_dir, "u");
+}
+
+#[test]
+fn test_rebase_after_an_edit_where_a_virtual_base_opens_in_a_resolved_hunk() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // "a" changes line 1 of "f" to "x1" and "x2", and "b" to "y1"; "p1", a
+    // merge of "a" and "b", keeps "a"'s text, and "p2" adds "Q" and "W" around
+    // "x2". "w" merges "p1" and "p2" and keeps their conflict, which holds
+    // only the tail of the virtual merge base's block; line 5 is changed to
+    // "FIVE" in the working copy. "s", a child of "w", resolves "f" to "p2"'s
+    // text with "FIVE". Rebased onto "p1", "s" holds no marker line of a
+    // virtual merge base, whole or cut.
+    let ten = |head: &str, five: &str| format!("{head}2\n3\n4\n{five}\n6\n7\n8\n9\n10\n");
+    create_commit_with_files(&work_dir, "o", &[], &[("f", &*ten("1\n", "5"))]);
+    create_commit_with_files(&work_dir, "a", &["o"], &[("f", &*ten("x1\nx2\n", "5"))]);
+    create_commit_with_files(&work_dir, "b", &["o"], &[("f", &*ten("y1\n", "5"))]);
+    create_commit_with_files(
+        &work_dir,
+        "p1",
+        &["a", "b"],
+        &[("f", &*ten("x1\nx2\n", "5"))],
+    );
+    let p2_text = ten("x1\nQ\nx2\nW\n", "5");
+    create_commit_with_files(&work_dir, "p2", &["a", "b"], &[("f", &*p2_text)]);
+    create_commit_with_files(&work_dir, "w", &["p1", "p2"], &[]);
+    let materialized = work_dir.read_file("f").to_string();
+    let edited = materialized.replacen("\n5\n", "\nFIVE\n", 1);
+    assert_ne!(edited, materialized);
+    work_dir.write_file("f", edited);
+    let s_text = ten("x1\nQ\nx2\nW\n", "FIVE");
+    create_commit_with_files(&work_dir, "s", &["w"], &[("f", &*s_text)]);
+    work_dir.run_jj(["rebase", "-r", "s", "-d", "p1"]).success();
+    assert_no_virtual_merge_base_text(&work_dir, "s");
+}
+
+/// Makes a commit named `name` with `parents` that deletes the file "f".
+fn create_commit_deleting_f(work_dir: &TestWorkDir, name: &str, parents: &[&str]) {
+    work_dir
+        .run_jj_with(|cmd| cmd.args(["new", "-m", name]).args(parents))
+        .success();
+    work_dir.remove_file("f");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", name])
+        .success();
 }
 
 #[must_use]

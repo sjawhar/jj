@@ -56,6 +56,7 @@ use crate::merge::SameChange;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
 use crate::tree_merge::MergeOptions;
+use crate::virtual_base;
 
 /// Minimum length of conflict markers.
 pub const MIN_CONFLICT_MARKER_LEN: usize = 7;
@@ -1054,6 +1055,11 @@ fn parse_git_style_conflict_hunk(input: &[u8], expected_marker_len: usize) -> Me
 /// Parses conflict markers in `content` and returns an updated version of
 /// `file_ids` with the new contents. If no (valid) conflict markers remain, a
 /// single resolves `FileId` will be returned.
+///
+/// A base that is a virtual merge base stands for the terms of the conflict it
+/// names: the changes that the new contents make to it are made to those
+/// terms, and the base becomes their virtual merge base, never a plain file
+/// that holds its marker lines (see [`virtual_base`]).
 pub async fn update_from_content(
     file_ids: &Merge<Option<FileId>>,
     store: &Store,
@@ -1092,42 +1098,62 @@ pub async fn update_from_content(
     };
 
     let mut contents = simplified_file_ids.map(|_| vec![]);
-    for hunk in hunks {
+    for hunk in &hunks {
         if let Some(slice) = hunk.as_resolved() {
             for content in &mut contents {
                 content.extend_from_slice(slice);
             }
         } else {
-            for (content, slice) in zip(&mut contents, hunk) {
-                content.extend(Vec::from(slice));
+            for (content, slice) in zip(&mut contents, hunk.iter()) {
+                content.extend_from_slice(slice);
             }
         }
     }
 
     // Now write the new files contents we found by parsing the file with conflict
     // markers.
-    let new_file_ids: Vec<Option<FileId>> = try_join_all(zip(&contents, &simplified_file_ids).map(
-        async |(content, file_id)| -> BackendResult<Option<FileId>> {
-            if file_id.is_some() || !content.is_empty() {
-                let file_id = store.write_file(path, &mut content.as_slice()).await?;
-                Ok(Some(file_id))
-            } else {
-                // The missing side of a conflict is still represented by
-                // the empty string we materialized it as
-                Ok(None)
-            }
-        },
-    ))
-    .await?;
+    let write = async |content: &Vec<u8>, file_id: &Option<FileId>| {
+        if file_id.is_some() || !content.is_empty() {
+            let file_id = store.write_file(path, &mut content.as_slice()).await?;
+            Ok(Some(file_id))
+        } else {
+            // The missing side of a conflict is still represented by
+            // the empty string we materialized it as
+            BackendResult::Ok(None)
+        }
+    };
+    // A base that is a virtual merge base stands for the terms of the conflict
+    // it names, so a change to it is a change to those terms.
+    let write_base = async |index: usize, content: &Vec<u8>, file_id: &Option<FileId>| {
+        if let Some(old_id) = file_id
+            && let Some(file_id) = virtual_base::rewrite_virtual_base(
+                store,
+                path,
+                old_id,
+                &old_contents,
+                index,
+                &hunks,
+            )
+            .await?
+        {
+            return Ok(Some(file_id));
+        }
+        write(content, file_id).await
+    };
+    let adds = zip(contents.adds(), simplified_file_ids.adds())
+        .map(|(content, file_id)| write(content, file_id));
+    let removes = zip(contents.removes(), simplified_file_ids.removes())
+        .enumerate()
+        .map(|(index, (content, file_id))| write_base(index, content, file_id));
+    let (adds, removes) = try_join!(try_join_all(adds), try_join_all(removes))?;
+    let new_file_ids = Merge::from_removes_adds(removes, adds);
 
     // If the conflict was simplified, expand the conflict to the original
     // number of sides.
-    let new_file_ids = if new_file_ids.len() != file_ids.iter().len() {
-        file_ids
-            .clone()
-            .update_from_simplified(Merge::from_vec(new_file_ids))
+    let new_file_ids = if new_file_ids.iter().len() != file_ids.iter().len() {
+        file_ids.clone().update_from_simplified(new_file_ids)
     } else {
-        Merge::from_vec(new_file_ids)
+        new_file_ids
     };
     Ok(new_file_ids)
 }
