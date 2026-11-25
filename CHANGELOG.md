@@ -108,13 +108,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   conflict, such as a parent's own line there, jj's snapshot changes each
   side of the file's conflict there from its own text to the merge's, and
   that change goes into the term of the merge bases' conflict whose side
-  holds it, so a later abandon of the merge or a rebase of its children
-  keeps what the parents' merge held there. Where the merge also left a
-  conflict at the edge of that hunk, a line that the person adds or changes
-  there goes into the terms of both sides of the merge bases' conflict, not
-  into its base's term, and that conflict stays whole in the virtual merge
-  base, so the merge's own conflict stays a conflict. A line that looks
-  like a marker line is the person's text. A change of the lines that show
+  holds it, so that after an edit away from that conflict a later abandon
+  of the merge or a rebase of its children keeps what the parents' merge
+  held there; after an edit at its edge, `jj abandon` of the merge gives a
+  conflict that holds the parent's line. Where the file still shows some of
+  the marker lines of that conflict, as the base of a conflict that the merge
+  left at its edge does, a line that the person adds or changes at the start
+  or the end of a side goes to the start or the end of every side, into each
+  side's term and not into the base's term, and that conflict stays whole in
+  the virtual merge base, so the merge's own conflict stays a conflict. That
+  rule applies only where the file still shows a marker line of the conflict,
+  or where the edit touches no line inside it; anywhere else the change
+  goes into every term, as above. This is a limit: where the conflict's own
+  merge resolved a whole block of the virtual merge base, with a parent's
+  own line inside the side that it took and no marker line of that block in
+  the file, and the person changes a line inside that block, the snapshot
+  writes the block's new text into all three terms, in place of B's and o's
+  own text there. Take o `1 2 3 4 5 6 7 8`, A `x1 x2 2 3 4 5 6 7 xA` and
+  B `y1 2 3 4 5 6 7 yB`, P1 and P2, two merges of A and B, with A's text
+  and with `x1 Q x2 2 3 4 5 6 7 yB`, a merge w of P1 and P2, two children
+  s and u of w that hold its file with `xA` and with `yB` at the last line,
+  and `x1` changed to `X1` in w. A conflict's sides are counted here after
+  each side that equals a base cancels with it. A rebase of u onto s holds
+  `X1 Q x2` at line 1 as resolved text, where jj 0.45.1 gives a 2-sided
+  conflict whose `y1` side holds neither `X1` nor `Q`. `jj abandon w` gives
+  u a 2-sided conflict at line 1 with `Q` on 1 of 2 sides, where jj 0.45.1
+  and this release without the edit give a clean `x1 Q x2 2 3 4 5 6 7 yB`.
+  `jj rebase -s P2 -o A` gives w a clean `X1 Q x2 2 3 4 5 6 7 8`, which
+  holds the edit and `Q` and drops the merge bases' older text, where
+  jj 0.45.1 and this release without the edit give a 2-sided conflict at
+  line 1. `jj rebase -r s -o P1` gives s a clean `x1 x2 2 3 4 5 6 7 xA`,
+  where jj 0.45.1 and this release without the edit give a 2-sided conflict
+  of `x1 x2` and `y1` over `1`, which holds neither `X1` nor `Q`, since
+  that rebase leaves the merge that carried them. A line that looks like
+  a marker line is the person's text. A change of the lines that show
   the virtual merge base inside a conflict that the person kept is not made:
   those lines are derived from the merge bases. Where a merge base's own
   merge bases disagreed, so that a term is itself a virtual merge base, the

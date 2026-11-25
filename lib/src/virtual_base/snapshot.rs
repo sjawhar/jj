@@ -942,7 +942,8 @@ mod tests {
         // block of the base's opening line and finds no other by those sides,
         // in three passes, so it reads 4N in all. Comparing a base's sides
         // with those of each block of VB in turn reads N for each base that
-        // no block holds, N² in all.
+        // no block holds, N² in all. The test bounds the count from above
+        // only: a finder that compares fewer blocks is no worse.
         const N: usize = 64;
         let text = |side: &str| BString::from((0..N).map(|i| format!("{side}\ns{i}\n")).join(""));
         let terms = Merge::from_vec(vec![text("x"), text("o"), text("y")]);
@@ -955,10 +956,7 @@ mod tests {
         for (old, new) in zip(terms.iter(), edited) {
             assert_eq!(new, old.to_string().replacen("\ns0\n", "\nS0\n", 1));
         }
-        assert!(
-            (N..=8 * N).contains(&read),
-            "{read} blocks read for {N} blocks"
-        );
+        assert!(read <= 8 * N, "{read} blocks read for {N} blocks");
     }
 
     #[test]
