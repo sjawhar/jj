@@ -2983,12 +2983,14 @@ impl BesideCut {
     }
 
     /// The hunks at `f` of s rebased onto P1, which takes w's change away,
-    /// once `edit` is made: at line 1, the text of s, P1's text and B's term
-    /// against P2's text and o's term, and the rest resolved. With an edit,
-    /// the edit is at the end of s's text and of B's term, after `y1`, and
-    /// o's term holds none of it. `Q` is on one side of three, as with no
-    /// edit. The `2` that move2 moves joins line 1's hunk, as o's term no
-    /// longer holds it.
+    /// once `edit` is made, after each side that equals a base cancels with
+    /// it: at line 1 a conflict, and the rest resolved. With no edit, its
+    /// sides are the text of s, P1's text and B's term, and its bases P2's
+    /// text and o's term. With an edit, its sides are A's term, which holds
+    /// P2's `Q` and the edit, P1's text and B's term, which holds the edit
+    /// after `y1`, and its bases w's side 2 and o's term, which holds none of
+    /// the edit. `Q` is on one side of three, as with no edit. The `2` that
+    /// move2 moves joins line 1's hunk, as o's term no longer holds it.
     fn onto_p1(edit: Option<Self>) -> Hunks {
         match edit {
             None => vec![
@@ -3017,9 +3019,11 @@ impl BesideCut {
     }
 
     /// The hunks at `f` of u rebased onto s once `edit` is made: V's conflict
-    /// at line 1, the text of s and B's term against o's term, and the rest
-    /// resolved. The edit is at the end of both sides and not in o's term,
-    /// and `Q` is on s's side, as with no edit.
+    /// at line 1, and the rest resolved. With no edit, its sides are the text
+    /// of s and B's term, and its base o's term. With an edit, its sides are
+    /// A's term, which holds P2's `Q` and the edit at its end, and B's term,
+    /// which holds the edit at its end, and its base o's term, which holds
+    /// none of it. `Q` is on the first side, as with no edit.
     fn onto_s(edit: Option<Self>) -> Hunks {
         match edit {
             None => vec![

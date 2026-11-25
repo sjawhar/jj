@@ -116,24 +116,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   left at its edge does, a line that the person adds or changes at the start
   or the end of a side goes to the start or the end of every side, into each
   side's term and not into the base's term, and that conflict stays whole in
-  the virtual merge base, so the merge's own conflict stays a conflict. That
-  rule applies only where the file still shows a marker line of the conflict,
-  or where the edit touches no line inside it; anywhere else the change
-  goes into every term, as above. This is a limit: where the conflict's own
-  merge resolved a whole block of the virtual merge base, with a parent's
-  own line inside the side that it took and no marker line of that block in
-  the file, and the person changes a line inside that block, the snapshot
-  writes the block's new text into all three terms, in place of B's and o's
-  own text there. Take o `1 2 3 4 5 6 7 8`, A `x1 x2 2 3 4 5 6 7 xA` and
-  B `y1 2 3 4 5 6 7 yB`, P1 and P2, two merges of A and B, with A's text
-  and with `x1 Q x2 2 3 4 5 6 7 yB`, a merge w of P1 and P2, two children
-  s and u of w that hold its file with `xA` and with `yB` at the last line,
-  and `x1` changed to `X1` in w. A conflict's sides are counted here after
-  each side that equals a base cancels with it. A rebase of u onto s holds
-  `X1 Q x2` at line 1 as resolved text, where jj 0.45.1 gives a 2-sided
-  conflict whose `y1` side holds neither `X1` nor `Q`. `jj abandon w` gives
-  u a 2-sided conflict at line 1 with `Q` on 1 of 2 sides, where jj 0.45.1
-  and this release without the edit give a clean `x1 Q x2 2 3 4 5 6 7 yB`.
+  the virtual merge base, so the merge's own conflict stays a conflict. The
+  conflict stays whole only where no change of the person's touches it, or
+  where the file still shows a marker line of the conflict and each change
+  lies inside it; anywhere else the change goes into every term, as above.
+  This is a limit: where the conflict's own merge resolved a whole block of
+  the virtual merge base, with a parent's own line inside the side that it
+  took and no marker line of that block in the file, and the person changes
+  a line inside that block, the snapshot writes the block's new text into
+  every term of the merge bases' conflict, in place of the other side's and
+  the base's text there. Take o `1 2 3 4 5 6 7 8`, A `x1 x2 2 3 4 5 6 7 xA`
+  and B `y1 2 3 4 5 6 7 yB`, P1 and P2, two merges of A and B, with A's
+  text and with `x1 Q x2 2 3 4 5 6 7 yB`, a merge w of P1 and P2, two
+  children s and u of w that hold its file with `xA` and with `yB` at the
+  last line, and `x1` changed to `X1` in w. A conflict's sides are counted
+  here after each side that equals a base cancels with it. A rebase of u
+  onto s holds `X1 Q x2` at line 1 as resolved text, where jj 0.45.1 gives
+  a 2-sided conflict whose `y1` side holds neither `X1` nor `Q`.
+  `jj abandon w` gives u a 2-sided conflict at line 1 with `Q` on 1 of 2
+  sides, where jj 0.45.1 and this release without the edit give a clean
+  `x1 Q x2 2 3 4 5 6 7 yB`.
   `jj rebase -s P2 -o A` gives w a clean `X1 Q x2 2 3 4 5 6 7 8`, which
   holds the edit and `Q` and drops the merge bases' older text, where
   jj 0.45.1 and this release without the edit give a 2-sided conflict at
