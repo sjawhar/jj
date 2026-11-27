@@ -66,10 +66,12 @@ jobs:
     # 2025-03-20 (aseipp): peak p99 builds seemed to be long, bump 15m -> 20m
     # 2025-10-06 (aseipp): x86 macos runners consistently slower, bump 20m -> 25m
     # 2026-08-28 (slerpy): x86 macos & arm windows are timing out, bump 25m -> 30m
+    # 2026-11-27 (sjawhar/jj fork): the fork's runners take up to 28.4m (x86 macos)
+    #   and 27.9m (arm windows) to pass, and x86 macos hit 30m on 4 of 33 runs, the
+    #   longest canceled one at 30.4m; bump 30m -> 65m, over twice the longest
     #
-    # The "nix flake" jobs below use the same timeout, so update there too if
-    # you update here.
-    timeout-minutes: 30
+    # The "nix flake" jobs below have their own timeout, measured the same way.
+    timeout-minutes: 65
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -131,9 +133,11 @@ jobs:
     strategy:
       fail-fast: ${{ github.event_name == 'merge_group' }}
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # The fork's macos-15 runner took 25.0m to pass and was canceled at its old
+    # 25m bound after 25.4m (2026-11-27); 55m is over twice the longer of the two.
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
