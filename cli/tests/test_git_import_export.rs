@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
+
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use testutils::TestResult;
@@ -241,6 +243,117 @@ fn test_git_import_undo() -> TestResult {
     [EOF]
     ");
     Ok(())
+}
+
+/// `jj git import` reports the conflicted merge commits it brings in without
+/// merging their parents, which is the only way to tell whether a merge commit
+/// is empty: for a merge of many commits that takes seconds, and an import can
+/// bring in many such commits. So the report lists every conflicted merge
+/// commit the import brings in, and says of none of them that it is empty.
+#[test]
+fn test_git_import_reports_merges_without_merging_their_parents() -> TestResult {
+    let test_env = TestEnvironment::default();
+    // The commits are made in one repository, and Git fetches them into the
+    // Git repository of another, whose `jj git import` brings them in.
+    test_env.run_jj_in(".", ["git", "init", "source"]).success();
+    let source_dir = test_env.work_dir("source");
+    for side in ["left", "right"] {
+        source_dir.run_jj(["new", "root()", "-m", side]).success();
+        source_dir.write_file("file", format!("{side}\n"));
+        source_dir
+            .run_jj(["bookmark", "create", "-r@", side])
+            .success();
+    }
+    // Two merges of the two sides, both conflicted: one is empty, the other
+    // adds a file. The commit on top of the second is empty and has one parent,
+    // whose tree tells whether it is empty, so the report still leaves it out.
+    source_dir
+        .run_jj(["new", "left", "right", "-m", "empty merge"])
+        .success();
+    source_dir
+        .run_jj(["bookmark", "create", "-r@", "empty-merge"])
+        .success();
+    source_dir
+        .run_jj(["new", "left", "right", "-m", "merge"])
+        .success();
+    source_dir.write_file("other", "other\n");
+    source_dir
+        .run_jj(["bookmark", "create", "-r@", "merge"])
+        .success();
+    source_dir.run_jj(["new", "-m", "child"]).success();
+    source_dir
+        .run_jj(["bookmark", "create", "-r@", "child"])
+        .success();
+    source_dir.run_jj(["git", "export"]).success();
+
+    let dest_git_path = test_env.env_root().join("dest-git");
+    git::init(&dest_git_path);
+    test_env
+        .run_jj_in(".", ["git", "init", "--git-repo=dest-git", "dest"])
+        .success();
+    let source_git_path = source_dir.root().join(".jj/repo/store/git");
+    git::add_remote(&dest_git_path, "source", source_git_path.to_str().unwrap());
+    git::fetch(&dest_git_path, "source");
+    let dest_dir = test_env.work_dir("dest");
+
+    let trace_path = test_env.env_root().join("import-trace.json");
+    let output =
+        dest_dir.run_jj_with(|cmd| cmd.env("JJ_TRACE", &trace_path).args(["git", "import"]));
+    assert_eq!(
+        count_parent_merges(&trace_path),
+        0,
+        "the import merged the parents of a commit"
+    );
+    // Both merges are listed, and neither is said to be empty; the empty
+    // commit with one parent is left out.
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    bookmark: child@source       [new] untracked
+    bookmark: empty-merge@source [new] untracked
+    bookmark: left@source        [new] untracked
+    bookmark: merge@source       [new] untracked
+    bookmark: right@source       [new] untracked
+    New conflicts appeared in 2 commits:
+      vruxwmqv 3bf0127d merge@source | (conflict) merge
+      royxmykx 1f8e87d2 empty-merge@source | (conflict) empty merge
+    Hint: To resolve the conflicts, start by creating a commit on top of
+    one of the first conflicted commits:
+      jj new vruxwmqv
+      jj new royxmykx
+    Then use `jj resolve`, or edit the conflict markers in the file directly.
+    Once the conflicts are resolved, you can inspect the result with `jj diff`.
+    Then run `jj squash` to move the resolution into the conflicted commit.
+    [EOF]
+    ");
+
+    // The control: `jj log` of the empty merge, whose summary says that it is
+    // empty, merges the commit's parents, and the trace shows it.
+    let trace_path = test_env.env_root().join("log-trace.json");
+    let output = dest_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TRACE", &trace_path)
+            .args(["log", "--no-graph", "-r", "empty-merge@source"])
+    });
+    assert_ne!(
+        count_parent_merges(&trace_path),
+        0,
+        "the trace of `jj log` shows no merge of a commit's parents"
+    );
+    insta::assert_snapshot!(output, @"
+    royxmykx test.user@example.com 2001-02-03 08:05:12 empty-merge@source 1f8e87d2 (conflict)
+    (empty) empty merge
+    [EOF]
+    ");
+    Ok(())
+}
+
+/// The number of events in the trace `JJ_TRACE` wrote at `path` of the spans
+/// of `merge_commit_trees` and its variants, which `Commit::is_empty()` and the
+/// revset `empty()` call to tell whether a merge commit is empty.
+fn count_parent_merges(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .matches(r#""name":"merge_commit_trees"#)
+        .count()
 }
 
 #[test]

@@ -389,6 +389,7 @@ async fn fetch_new_remote(
     };
     let should_track_default = settings.get_bool("git.track-default-bookmark-on-clone")?;
     let mut tx = workspace_command.start_transaction();
+    tx.mark_import_from_git();
     let (default_branch, import_stats) = {
         let mut git_fetch = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)?;
 

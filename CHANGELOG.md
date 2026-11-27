@@ -201,6 +201,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the paths where a commit's terms do not cancel, and write the trees of the
   terms once, at the end. The merge's result is unchanged.
 
+* `jj git import`, `jj git fetch` and `jj git clone`, and the import of Git
+  refs a colocated workspace makes, no longer merge the parents of each
+  conflicted merge commit they bring in, abandon or leave conflicted, which
+  was the only way to tell whether such a commit is empty. Their report of the
+  commits with new conflicts now lists every conflicted merge commit, empty or
+  not, and marks no merge commit as empty. An import of a fork's release
+  commits, about a hundred conflicted merges of about a hundred commits each,
+  took minutes for that report alone.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights

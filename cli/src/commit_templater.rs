@@ -154,6 +154,9 @@ pub struct CommitTemplateLanguage<'repo> {
     build_fn_table: CommitTemplateBuildFnTable<'repo>,
     keyword_cache: CommitKeywordCache,
     cache_extensions: ExtensionsMap,
+    /// Whether `commit.empty()` of a merge commit is false without merging
+    /// the commit's parents. See [`Self::skip_merge_emptiness()`].
+    skip_merge_emptiness: bool,
 }
 
 impl<'repo> CommitTemplateLanguage<'repo> {
@@ -191,6 +194,7 @@ impl<'repo> CommitTemplateLanguage<'repo> {
             build_fn_table,
             keyword_cache: CommitKeywordCache::default(),
             cache_extensions,
+            skip_merge_emptiness: false,
         }
     }
 
@@ -207,6 +211,16 @@ impl<'repo> CommitTemplateLanguage<'repo> {
             aliases_map: self.revset_parse_context.fileset_aliases_map,
             path_converter: self.path_converter,
         }
+    }
+
+    /// Makes `commit.empty()` false for a merge commit, without merging the
+    /// commit's parents, which is the only way to tell whether a merge commit
+    /// is empty. A report of the commits that an import from Git brings in
+    /// uses this: merging the parents of a merge of many commits takes
+    /// seconds, and an import can bring in many such commits. The report then
+    /// says nothing about whether such a commit is empty.
+    pub fn skip_merge_emptiness(&mut self) {
+        self.skip_merge_emptiness = true;
     }
 }
 
@@ -1413,8 +1427,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
             let repo = language.repo;
-            let out_property =
-                self_property.and_then(|commit| Ok(commit.is_empty(repo).block_on()?));
+            let skip_merges = language.skip_merge_emptiness;
+            let out_property = self_property.and_then(move |commit| {
+                if skip_merges && commit.parent_ids().len() > 1 {
+                    return Ok(false);
+                }
+                Ok(commit.is_empty(repo).block_on()?)
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
