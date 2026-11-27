@@ -186,6 +186,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and merges whose base is itself conflicted.
   [#6369](https://github.com/jj-vcs/jj/issues/6369)
 
+* A merge of many commits no longer writes the trees of all its terms, and
+  merges again every conflict, at every commit. jj merges such commits one at
+  a time, each against the merge of the ones before it, and resolves every
+  step; the merge gains terms at each step, and resolving a step wrote a tree
+  for each term at every directory the step changed and merged again each
+  conflict the steps before it had left. A merge of about a hundred commits,
+  which a fork's release commit can be, took tens of seconds, and a command
+  that asks for the merge of such a commit's parents — `jj git import`
+  reporting the commits an operation made conflicted, or `jj log` of one of
+  them, whose summary says whether the commit is empty — took that long for
+  each commit it touched. The steps now carry the merge as one tree of what it
+  resolves to, with the terms of each path that does not resolve, merge only
+  the paths where a commit's terms do not cancel, and write the trees of the
+  terms once, at the end. The merge's result is unchanged.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights
