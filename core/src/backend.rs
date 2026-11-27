@@ -782,6 +782,17 @@ pub trait Backend: Any + Send + Sync + Debug {
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>>;
 
+    /// Returns the size in bytes of a file's contents, if the backend can tell
+    /// it without reading the contents (from an object header, for example).
+    /// A caller that bounds the bytes it holds in memory, as the working
+    /// copy's checkout does, reserves them before it calls
+    /// [`Self::read_file()`].
+    ///
+    /// The default implementation returns `Ok(None)`.
+    async fn file_size(&self, _path: &RepoPath, _id: &FileId) -> BackendResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// Writes the contents of the writer to the backend. Returns the ID of the
     /// written file.
     async fn write_file(

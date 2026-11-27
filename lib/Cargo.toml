@@ -66,6 +66,7 @@ shlex = { workspace = true }
 smallvec = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+thread_local = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
@@ -95,9 +96,12 @@ jj-lib = { path = ".", features = ["test-fakes"], default-features = false }
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = [ "fs" ] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = [ "inotify" ] }
+
 [features]
 default = ["git"]
-git = ["dep:gix"]
+git = ["dep:gix", "dep:thread_local"]
 watchman = ["dep:watchman_client", "dep:tokio"]
 testing = ["git"]
 test-fakes = ["testing", "dep:clap"]

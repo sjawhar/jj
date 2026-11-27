@@ -30,6 +30,8 @@ use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -50,6 +52,7 @@ use pollster::FutureExt as _;
 use prost::Message as _;
 use smallvec::SmallVec;
 use thiserror::Error;
+use thread_local::ThreadLocal;
 
 use crate::backend::Backend;
 use crate::backend::BackendError;
@@ -183,6 +186,11 @@ pub struct GitBackend {
     // used in a single-threaded context.
     base_repo: gix::ThreadSafeRepository,
     repo: Mutex<gix::Repository>,
+    /// The repository handle that each thread reads file and symlink
+    /// contents through ([`Self::read_repo()`]).
+    read_repos: ThreadLocal<gix::Repository>,
+    /// How many handles `read_repos` has opened.
+    read_repos_opened: AtomicUsize,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -209,6 +217,8 @@ impl GitBackend {
         Self {
             base_repo,
             repo: Mutex::new(repo),
+            read_repos: ThreadLocal::new(),
+            read_repos_opened: AtomicUsize::new(0),
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -359,6 +369,33 @@ impl GitBackend {
 
     fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
         self.repo.lock().unwrap()
+    }
+
+    /// Returns the calling thread's own repository handle for reads of file
+    /// and symlink contents, which is opened on the thread's first read (or
+    /// taken over from a thread that has ended) and has a delta-base pack
+    /// cache of its own. So reads on several threads, as the working copy's
+    /// checkout runs them, take no lock. The handles of all threads are
+    /// closed when the backend is dropped.
+    fn read_repo(&self) -> &gix::Repository {
+        self.read_repos.get_or(|| self.open_read_repo())
+    }
+
+    fn open_read_repo(&self) -> gix::Repository {
+        let opened = self.read_repos_opened.fetch_add(1, Ordering::Relaxed);
+        let mut repo = self.base_repo.to_thread_local();
+        // Keep gix's default 96 MiB delta-base pack cache for the first 4
+        // handles (384 MiB in all on 4-CPU hosts), and cap each further
+        // handle's at 16 MiB, so that the caches of a host with many CPUs do
+        // not grow by 96 MiB for each thread.
+        if opened >= FULL_PACK_CACHE_READ_REPOS {
+            repo.objects.set_pack_cache(|| {
+                Box::new(gix::odb::pack::cache::lru::StaticLinkedList::<64>::new(
+                    SMALL_PACK_CACHE_BYTES,
+                ))
+            });
+        }
+        repo
     }
 
     /// Returns a new thread-local handle for the underlying Git repository.
@@ -512,10 +549,10 @@ impl GitBackend {
         self.save_extra_metadata_table(mut_table, &table_lock)
     }
 
-    fn read_file_sync(&self, id: &FileId) -> BackendResult<Vec<u8>> {
-        let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
-        let mut blob = locked_repo
+    fn read_blob_sync(&self, id: &impl ObjectId) -> BackendResult<Vec<u8>> {
+        let repo = self.read_repo();
+        let git_blob_id = validate_git_object_id(repo, id)?;
+        let mut blob = repo
             .try_find_object(git_blob_id)
             .map_err(|err| to_read_object_err(err, id))?
             .ok_or_else(|| not_found_err(id))?
@@ -1065,6 +1102,13 @@ fn import_extra_metadata_entries_from_heads(
     Ok(())
 }
 
+/// How many of a backend's read handles keep gix's default delta-base pack
+/// cache of 96 MiB.
+const FULL_PACK_CACHE_READ_REPOS: usize = 4;
+
+/// The delta-base pack cache of each further read handle.
+const SMALL_PACK_CACHE_BYTES: usize = 16 << 20;
+
 impl Debug for GitBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         f.debug_struct("GitBackend")
@@ -1100,6 +1144,10 @@ impl Backend for GitBackend {
     }
 
     fn concurrency(&self) -> usize {
+        // The backend's methods do their work before they return, so a caller
+        // that buffers futures gains nothing from more. Callers that read on
+        // several threads, as the working copy's checkout does, read through
+        // a handle of each thread's own (`read_repo()`).
         1
     }
 
@@ -1108,8 +1156,20 @@ impl Backend for GitBackend {
         _path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
-        let data = self.read_file_sync(id)?;
+        let data = self.read_blob_sync(id)?;
         Ok(Box::pin(Cursor::new(data)))
+    }
+
+    async fn file_size(&self, _path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+        // The size is in the object's header: a loose object inflates only its
+        // first bytes, and a packed delta gives the size of its result.
+        let repo = self.read_repo();
+        let git_blob_id = validate_git_object_id(repo, id)?;
+        let header = repo
+            .try_find_header(git_blob_id)
+            .map_err(|err| to_read_object_err(err, id))?
+            .ok_or_else(|| not_found_err(id))?;
+        Ok(Some(header.size()))
     }
 
     async fn write_file(
@@ -1125,15 +1185,7 @@ impl Backend for GitBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
-        let mut blob = locked_repo
-            .try_find_object(git_blob_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?
-            .try_into_blob()
-            .map_err(|err| to_read_object_err(err, id))?;
-        let target = String::from_utf8(blob.take_data())
+        let target = String::from_utf8(self.read_blob_sync(id)?)
             .map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?;
         Ok(target)
     }

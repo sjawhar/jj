@@ -2326,6 +2326,22 @@ from `"ignore"` or  `"auto"` to `"respect"`, `jj` may not update the stored
 executable bit until you modify the file's contents or update its modification
 time, e.g. with `touch`.
 
+### Parallel checkout threads
+
+The number of threads used to read file contents and write files when checking
+out a tree to the working copy. Must be a positive integer. When unset, defaults
+to the number of CPUs available to the process (`available_parallelism`, falling
+back to 1).
+
+```toml
+[working-copy]
+checkout-threads = 4
+```
+
+The setting applies to the checkouts of a workspace's working copy and of
+`jj file edit`. The temporary working copies of `jj run` and of the diff and
+merge editors always use the default.
+
 ## Ways to specify `jj` config: details
 
 ### User config files

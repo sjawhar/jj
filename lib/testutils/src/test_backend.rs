@@ -237,6 +237,22 @@ impl Backend for TestBackend {
         .await
     }
 
+    async fn file_size(&self, path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+        let path = path.to_owned();
+        let id = id.clone();
+        self.run_async(
+            move |data| match data.files.get(&path).and_then(|items| items.get(&id)) {
+                None => Err(BackendError::ObjectNotFound {
+                    object_type: "file".to_string(),
+                    hash: id.hex(),
+                    source: Some(format!("at path {path:?}").into()),
+                }),
+                Some(contents) => Ok(Some(contents.len() as u64)),
+            },
+        )
+        .await
+    }
+
     async fn write_file(
         &self,
         path: &RepoPath,

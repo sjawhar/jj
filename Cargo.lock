@@ -2823,6 +2823,7 @@ dependencies = [
  "test-case",
  "testutils",
  "thiserror 2.0.21",
+ "thread_local",
  "tokio",
  "toml",
  "toml_edit",

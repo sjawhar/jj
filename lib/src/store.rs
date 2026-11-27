@@ -234,6 +234,12 @@ impl Store {
         self.backend.read_file(path, id).await
     }
 
+    /// Returns the size of a file's contents if the backend can tell it
+    /// without reading them. See [`Backend::file_size()`].
+    pub async fn file_size(&self, path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+        self.backend.file_size(path, id).await
+    }
+
     pub async fn write_file(
         &self,
         path: &RepoPath,
