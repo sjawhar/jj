@@ -171,6 +171,27 @@ impl MergedTree {
     /// Tries to resolve any conflicts, resolving any conflicts that can be
     /// automatically resolved and leaving the rest unresolved.
     pub async fn resolve(self) -> BackendResult<Self> {
+        let store = self.store.clone();
+        let resolved = self.resolve_unchecked().await?;
+        // If debug assertions are enabled, check that the merge was idempotent. In
+        // particular, that this last simplification doesn't enable further automatic
+        // resolutions
+        if cfg!(debug_assertions) {
+            let re_merged = merge_trees(&store, resolved.tree_ids.clone())
+                .await
+                .unwrap();
+            debug_assert_eq!(re_merged, resolved.tree_ids);
+        }
+        Ok(resolved)
+    }
+
+    /// Resolves as [`Self::resolve`] does, without checking in a debug build
+    /// that the result resolves no further. A step of the merge of many
+    /// commits ([`crate::rewrite`]) resolves so: the merge of a file's terms
+    /// depends on their order, the simplification after the merge can reorder
+    /// them, and the next step merges them again, as the steps that
+    /// [`crate::merge_fold`] carries, which make no such check, do.
+    pub(crate) async fn resolve_unchecked(self) -> BackendResult<Self> {
         let merged = merge_trees(&self.store, self.tree_ids).await?;
         // If the result can be resolved, then `merge_trees()` above would have returned
         // a resolved merge. However, that function will always preserve the arity of
@@ -181,13 +202,6 @@ impl MergedTree {
         } else {
             self.labels.simplify_with(&merged)
         };
-        // If debug assertions are enabled, check that the merge was idempotent. In
-        // particular, that this last simplification doesn't enable further automatic
-        // resolutions
-        if cfg!(debug_assertions) {
-            let re_merged = merge_trees(&self.store, simplified.clone()).await.unwrap();
-            debug_assert_eq!(re_merged, simplified);
-        }
         Ok(Self {
             store: self.store,
             tree_ids: simplified,
@@ -451,7 +465,10 @@ impl MergedTree {
             start = end;
         }
         let merge = merge.into_map(|(tree, label, _)| (tree, label));
-        let inverted_bases = inverted_bases(&merge, overrides)?;
+        let inverted_bases = inverted_bases(
+            merge.removes().map(|(tree, _)| tree),
+            overrides.iter().map(|(path, _)| path.as_ref()),
+        )?;
         let tree = Self::merge_unsimplified(merge);
         let store = tree.store();
         let mut replaced = vec![];
@@ -506,17 +523,16 @@ impl MergedTree {
     }
 }
 
-/// The files that the trees at the bases of `merge` hold as bases of their
-/// conflicts, by path, outside the paths of `overrides`: in the merge, each is
+/// The files that `removes`, the trees at the bases of a merge, hold as bases
+/// of their conflicts, by path, outside `override_paths`: in the merge, each is
 /// a side.
-fn inverted_bases(
-    merge: &Merge<(MergedTree, String)>,
-    overrides: &[(RepoPathBuf, MergedTreeValue)],
+pub(crate) fn inverted_bases<'a>(
+    removes: impl IntoIterator<Item = &'a MergedTree>,
+    override_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> BackendResult<BTreeMap<RepoPathBuf, HashSet<TreeValue>>> {
-    let override_paths: HashSet<&RepoPath> =
-        overrides.iter().map(|(path, _)| path.as_ref()).collect();
+    let override_paths: HashSet<&RepoPath> = override_paths.into_iter().collect();
     let mut bases: BTreeMap<RepoPathBuf, HashSet<TreeValue>> = BTreeMap::new();
-    for (tree, _) in merge.removes().filter(|(tree, _)| tree.has_conflict()) {
+    for tree in removes.into_iter().filter(|tree| tree.has_conflict()) {
         for (path, value) in tree.conflicts() {
             let value = value?;
             if path

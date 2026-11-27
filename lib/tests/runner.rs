@@ -29,6 +29,7 @@ mod test_local_working_copy;
 mod test_local_working_copy_concurrent;
 mod test_local_working_copy_executable_bit;
 mod test_local_working_copy_sparse;
+mod test_merge_folds;
 mod test_merge_operations;
 mod test_merge_rules;
 mod test_merge_trees;

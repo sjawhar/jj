@@ -51,17 +51,27 @@ use crate::virtual_base;
 /// conflict takes it instead. Each term of such a value keeps the label of the
 /// side or the merge base it comes from. Every other path is merged as
 /// [`MergedTree::merge`] merges it.
+///
+/// Returns with the merge the paths where it replaced a virtual merge base, as
+/// [`MergedTree::merge_with_overrides`] says. The merge is resolved as
+/// [`MergedTree::resolve_unchecked`] resolves it.
 pub(crate) async fn merge_parent_trees(
     store: &Arc<Store>,
     side1: (MergedTree, String),
     base: (MergedTree, String),
     side2: (MergedTree, String),
     resolve: bool,
-) -> BackendResult<MergedTree> {
+) -> BackendResult<(MergedTree, Vec<RepoPathBuf>)> {
     let overrides = rule_overrides(store, &side1.0, &base.0, &side2.0).await?;
     let merge = Merge::from_vec(vec![side1, base, side2]);
     let merge = merge.into_map(|(tree, label)| (tree, label, None));
-    MergedTree::merge_with_overrides(merge, &overrides, resolve).await
+    let (tree, replaced) = MergedTree::merge_replacing(merge, &overrides, false).await?;
+    let tree = if resolve {
+        tree.resolve_unchecked().await?
+    } else {
+        tree
+    };
+    Ok((tree, replaced))
 }
 
 /// The values that [`merge_parent_trees`] writes over the merge of `side1`
@@ -73,10 +83,49 @@ async fn rule_overrides(
     base: &MergedTree,
     side2: &MergedTree,
 ) -> BackendResult<Vec<(RepoPathBuf, MergedTreeValue)>> {
+    let paths = override_paths(
+        store,
+        side1.has_conflict(),
+        || conflicts(side1),
+        base,
+        side2,
+    )
+    .await?;
+    // The futures are made before they are buffered: with the closure that
+    // makes them inside the stream, rustc cannot prove that the merge's future
+    // is `Send`.
+    let values = paths
+        .iter()
+        .map(|path| rule_override(store, side1, base, side2, path))
+        .collect_vec();
+    futures::stream::iter(values)
+        .buffered(store.concurrency())
+        .try_collect()
+        .await
+}
+
+/// The paths where [`merge_parent_trees`] writes the value that
+/// [`merge_parent_values`] gives over the merge of `side1` and `side2` against
+/// `base`, where `side1_has_conflict` says whether `side1` has a conflict and
+/// `side1_conflicts` gives its conflicts, as [`MergedTree::conflicts`] yields
+/// them. No path is inside another.
+pub(crate) async fn override_paths(
+    store: &Store,
+    side1_has_conflict: bool,
+    side1_conflicts: impl FnOnce() -> BackendResult<Vec<(RepoPathBuf, MergedTreeValue)>>,
+    base: &MergedTree,
+    side2: &MergedTree,
+) -> BackendResult<Vec<RepoPathBuf>> {
     let same_change = store.merge_options().same_change;
     let base_conflicts = conflicts(base)?;
-    let side1_conflicts = if same_change == SameChange::Accept || !base_conflicts.is_empty() {
-        conflicts(side1)?
+    // Under `merge.same-change=accept`, a path where both sides hold the same
+    // conflict takes the rule's value too. A side that holds no conflict at
+    // all holds none of them, so the first side, which can be the merge of
+    // many commits, is not read for a second side that has none.
+    let both_sides_conflict =
+        same_change == SameChange::Accept && side1_has_conflict && side2.has_conflict();
+    let side1_conflicts = if both_sides_conflict || !base_conflicts.is_empty() {
+        side1_conflicts()?
     } else {
         vec![]
     };
@@ -86,7 +135,7 @@ async fn rule_overrides(
         .collect();
     // A flattened merge against a resolved V leaves a conflict that both sides
     // hold unresolved.
-    if same_change == SameChange::Accept {
+    if both_sides_conflict {
         for (path, value1) in &side1_conflicts {
             if side2.path_value(path).await?.same_terms_as(value1) {
                 paths.insert(path);
@@ -116,10 +165,8 @@ async fn rule_overrides(
                 .unwrap_or(path)
         })
         .collect();
-    // The value at a path decides everything inside it. The futures are made
-    // before they are buffered: with the closure that makes them inside the
-    // stream, rustc cannot prove that the merge's future is `Send`.
-    let values = paths
+    // The value at a path decides everything inside it.
+    Ok(paths
         .iter()
         .filter(|path| {
             !path
@@ -127,12 +174,8 @@ async fn rule_overrides(
                 .skip(1)
                 .any(|ancestor| paths.contains(ancestor))
         })
-        .map(|path| rule_override(store, side1, base, side2, path))
-        .collect_vec();
-    futures::stream::iter(values)
-        .buffered(store.concurrency())
-        .try_collect()
-        .await
+        .map(|path| (*path).to_owned())
+        .collect())
 }
 
 /// The value that [`merge_parent_trees`] writes at `path`, with the path.

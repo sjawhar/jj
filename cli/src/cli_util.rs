@@ -203,6 +203,32 @@ use crate::ui::Ui;
 
 const SHORT_CHANGE_ID_TEMPLATE_TEXT: &str = "format_short_change_id_with_change_offset(self)";
 
+/// The summary template of the report of an import from Git, which lists the
+/// commits the import brings in, abandons or leaves conflicted. Where
+/// `templates.commit_summary` is the default, it is the same summary without
+/// saying whether a merge commit is empty: only a merge of the commit's
+/// parents can tell that, which for a merge of many commits takes seconds, and
+/// an import can bring in many such commits. A summary the user configured is
+/// used as it is, so a template that asks whether a commit is empty gets the
+/// answer, and pays that merge.
+fn import_commit_summary_template_text(
+    config: &StackedConfig,
+    commit_summary_template_text: &str,
+) -> String {
+    let name = "templates.commit_summary";
+    let is_default = config
+        .layers()
+        .iter()
+        .rev()
+        .find(|layer| matches!(layer.look_up_item(name), Ok(Some(_))))
+        .is_some_and(|layer| layer.source == ConfigSource::Default);
+    if is_default {
+        "format_commit_summary_of_import(self)".to_owned()
+    } else {
+        commit_summary_template_text.to_owned()
+    }
+}
+
 #[derive(Clone)]
 struct ChromeTracingFlushGuard {
     _inner: Option<Rc<tracing_chrome::FlushGuard>>,
@@ -1240,6 +1266,9 @@ pub struct WorkspaceCommandHelper {
     env: WorkspaceCommandEnvironment,
     // TODO: Parsed template can be cached if it doesn't capture 'repo lifetime
     commit_summary_template_text: String,
+    /// The summary template of the report of an import from Git: see
+    /// [`import_commit_summary_template_text()`].
+    import_commit_summary_template_text: String,
     op_summary_template_text: String,
     may_snapshot_working_copy: bool,
     may_update_working_copy: bool,
@@ -1277,6 +1306,8 @@ impl WorkspaceCommandHelper {
     ) -> Result<Self, CommandError> {
         let settings = workspace.settings();
         let commit_summary_template_text = settings.get_string("templates.commit_summary")?;
+        let import_commit_summary_template_text =
+            import_commit_summary_template_text(settings.config(), &commit_summary_template_text);
         let op_summary_template_text = settings.get_string("templates.op_summary")?;
         let may_update_working_copy =
             may_snapshot_working_copy && env.command.should_commit_transaction();
@@ -1286,6 +1317,7 @@ impl WorkspaceCommandHelper {
             user_repo: ReadonlyUserRepo::new(repo),
             env,
             commit_summary_template_text,
+            import_commit_summary_template_text,
             op_summary_template_text,
             may_snapshot_working_copy,
             may_update_working_copy,
@@ -1294,6 +1326,7 @@ impl WorkspaceCommandHelper {
         // mutable operation.
         helper.parse_operation_template(ui, &helper.op_summary_template_text)?;
         helper.parse_commit_template(ui, &helper.commit_summary_template_text)?;
+        helper.parse_commit_template(ui, &helper.import_commit_summary_template_text)?;
         helper.parse_commit_template(ui, SHORT_CHANGE_ID_TEMPLATE_TEXT)?;
         Ok(helper)
     }
@@ -1461,7 +1494,7 @@ impl WorkspaceCommandHelper {
             if num_rebased > 0 {
                 writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
             }
-            self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
+            self.finish_transaction(ui, tx, "import git head", git_import_export_lock, false)
                 .await?;
         }
         Ok(())
@@ -1502,7 +1535,7 @@ impl WorkspaceCommandHelper {
                 "Rebased {num_rebased} descendant commits off of commits rewritten from Git."
             )?;
         }
-        self.finish_transaction(ui, tx, "import git refs", git_import_export_lock)
+        self.finish_transaction(ui, tx, "import git refs", git_import_export_lock, true)
             .await?;
         writeln!(
             ui.status(),
@@ -2021,6 +2054,20 @@ to the current parents may contain changes from multiple commits.
             .labeled(["commit"])
     }
 
+    /// Template for one-line summary of a commit in the report of an
+    /// operation's changes. The report of an import from Git uses
+    /// [`import_commit_summary_template_text()`].
+    fn report_summary_template(&self, imports_from_git: bool) -> TemplateRenderer<'_, Commit> {
+        let language = self.commit_template_language();
+        let text = if imports_from_git {
+            &self.import_commit_summary_template_text
+        } else {
+            &self.commit_summary_template_text
+        };
+        self.reparse_valid_template(&language, text)
+            .labeled(["commit"])
+    }
+
     /// Template for one-line summary of an operation.
     pub fn operation_summary_template(&self) -> TemplateRenderer<'_, Operation> {
         let language = self.operation_template_language();
@@ -2376,15 +2423,20 @@ to the current parents may contain changes from multiple commits.
             helper: self,
             tx,
             id_prefix_context,
+            imports_from_git: false,
         }
     }
 
+    /// Commits `tx` and reports what it changed. `imports_from_git` says that
+    /// `tx` imports commits from Git (see
+    /// [`WorkspaceCommandTransaction::mark_import_from_git()`]).
     async fn finish_transaction(
         &mut self,
         ui: &Ui,
         mut tx: Transaction,
         description: impl Into<String>,
         git_import_export_lock: &GitImportExportLock,
+        imports_from_git: bool,
     ) -> Result<(), CommandError> {
         let old_repo = tx.base_repo().clone();
 
@@ -2466,7 +2518,8 @@ to the current parents may contain changes from multiple commits.
             }
         }
 
-        self.report_repo_changes(ui, &old_repo).await?;
+        self.report_repo_changes(ui, &old_repo, imports_from_git)
+            .await?;
 
         if !self.env.command.should_commit_transaction() {
             writeln!(
@@ -2509,11 +2562,14 @@ to the current parents may contain changes from multiple commits.
     }
 
     /// Inform the user about important changes to the repo since the previous
-    /// operation (when `old_repo` was loaded).
+    /// operation (when `old_repo` was loaded). `imports_from_git` says that the
+    /// operation imported commits from Git, whose report doesn't ask whether a
+    /// merge commit is empty.
     async fn report_repo_changes(
         &self,
         ui: &Ui,
         old_repo: &Arc<ReadonlyRepo>,
+        imports_from_git: bool,
     ) -> Result<(), CommandError> {
         let Some(mut fmt) = ui.status_formatter() else {
             return Ok(());
@@ -2546,8 +2602,20 @@ to the current parents may contain changes from multiple commits.
         // are millions of commits added to the repo, assuming the revset engine can
         // efficiently skip non-conflicting commits. Filter out empty commits mostly so
         // `jj new <conflicted commit>` doesn't result in a message about new conflicts.
-        let conflicts = RevsetExpression::filter(RevsetFilterPredicate::HasConflict)
-            .filtered(RevsetFilterPredicate::File(FilesetExpression::all()));
+        let conflicts = RevsetExpression::filter(RevsetFilterPredicate::HasConflict);
+        let non_empty =
+            RevsetExpression::filter(RevsetFilterPredicate::File(FilesetExpression::all()));
+        let conflicts = if imports_from_git {
+            // Whether a merge commit is empty is known only by merging its parents,
+            // which for a merge of many commits takes seconds, and an import can
+            // bring in many such commits. So the report of an import keeps every
+            // conflicted merge commit, empty or not. The union tests the number of
+            // parents first, so a merge commit's emptiness is never asked.
+            let merges = RevsetExpression::filter(RevsetFilterPredicate::ParentCount(2..u32::MAX));
+            conflicts.intersection(&merges.union(&non_empty))
+        } else {
+            conflicts.intersection(&non_empty)
+        };
         let removed_conflicts_expr = new_heads.range(&old_heads).intersection(&conflicts);
         let added_conflicts_expr = old_heads.range(&new_heads).intersection(&conflicts);
 
@@ -2602,7 +2670,7 @@ to the current parents may contain changes from multiple commits.
             writeln!(fmt, "New conflicts appeared in {num_conflicted} commits:")?;
             print_updated_commits(
                 fmt.as_mut(),
-                &self.commit_summary_template(),
+                &self.report_summary_template(imports_from_git),
                 new_conflicts_by_change_id.values().flatten().copied(),
             )?;
         }
@@ -2812,6 +2880,9 @@ pub struct WorkspaceCommandTransaction<'a> {
     tx: Transaction,
     /// Cache of index built against the current MutableRepo state.
     id_prefix_context: OnceCell<IdPrefixContext>,
+    /// Whether the transaction imports commits from Git. See
+    /// [`Self::mark_import_from_git()`].
+    imports_from_git: bool,
 }
 
 impl WorkspaceCommandTransaction<'_> {
@@ -2836,6 +2907,16 @@ impl WorkspaceCommandTransaction<'_> {
     pub fn repo_mut(&mut self) -> &mut MutableRepo {
         self.id_prefix_context.take(); // invalidate
         self.tx.repo_mut()
+    }
+
+    /// Marks the transaction as one that imports commits from Git. Its reports
+    /// of the commits it brings in, abandons or leaves conflicted then keep
+    /// every conflicted merge commit, and summarize commits with the import's
+    /// summary template (`import_commit_summary_template_text()`): only merging a merge
+    /// commit's parents can tell whether it is empty, and for a merge of many
+    /// commits that takes seconds, for each such commit the import brings in.
+    pub fn mark_import_from_git(&mut self) {
+        self.imports_from_git = true;
     }
 
     pub fn check_out(&mut self, commit: &Commit) -> Result<Commit, CheckOutCommitError> {
@@ -2863,11 +2944,18 @@ impl WorkspaceCommandTransaction<'_> {
         self.commit_summary_template().format(commit, formatter)
     }
 
-    /// Template for one-line summary of a commit within transaction.
+    /// Template for one-line summary of a commit within transaction. In a
+    /// transaction that imports commits from Git, it is the import's summary
+    /// template (see [`Self::mark_import_from_git()`]).
     pub fn commit_summary_template(&self) -> TemplateRenderer<'_, Commit> {
         let language = self.commit_template_language();
+        let text = if self.imports_from_git {
+            &self.helper.import_commit_summary_template_text
+        } else {
+            &self.helper.commit_summary_template_text
+        };
         self.helper
-            .reparse_valid_template(&language, &self.helper.commit_summary_template_text)
+            .reparse_valid_template(&language, text)
             .labeled(["commit"])
     }
 
@@ -2893,7 +2981,12 @@ impl WorkspaceCommandTransaction<'_> {
     }
 
     pub async fn finish(self, ui: &Ui, description: impl Into<String>) -> Result<(), CommandError> {
-        let Self { helper, mut tx, .. } = self;
+        let Self {
+            helper,
+            mut tx,
+            imports_from_git,
+            ..
+        } = self;
         if !tx.repo().has_changes() {
             writeln!(ui.status(), "Nothing changed.")?;
             return Ok(());
@@ -2906,7 +2999,13 @@ impl WorkspaceCommandTransaction<'_> {
         // Git HEAD export happens atomically with the transaction commit.
         let git_import_export_lock = helper.lock_git_import_export()?;
         helper
-            .finish_transaction(ui, tx, description, &git_import_export_lock)
+            .finish_transaction(
+                ui,
+                tx,
+                description,
+                &git_import_export_lock,
+                imports_from_git,
+            )
             .await
     }
 
