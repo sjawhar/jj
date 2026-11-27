@@ -20,7 +20,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in parallel across multiple threads (configurable with
   `working-copy.checkout-threads`, defaulting to the number of CPUs available to
   the process), creating each new file once with its mode and writing its
-  contents in fewer system calls.
+  contents in fewer system calls. A new file's mode now follows the process's
+  umask (`0755` or `0644` less the umask's bits) instead of being set to
+  exactly `0755` or `0644`.
 
 ### Fixed bugs
 

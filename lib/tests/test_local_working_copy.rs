@@ -3636,9 +3636,8 @@ fn test_checkout_threads_failed_write_fails(threads: usize) -> TestResult {
     let repo = &test_workspace.repo;
     let workspace_root = test_workspace.workspace.workspace_root().to_owned();
 
-    // Commit 1 writes several files, including one whose old file we will make
-    // impossible to recreate, or on Unix an unwritable directory where a new
-    // file must go.
+    // The commit writes several files, and one into a directory that is made
+    // unwritable (on Unix), so that the create of that file fails.
     let locked_dir = workspace_root.join("locked");
     std::fs::create_dir(&locked_dir)?;
     let mut entries: Vec<(RepoPathBuf, String)> = (0..16)
@@ -3848,6 +3847,35 @@ fn test_checkout_threads_setting() -> TestResult {
     let measures = tree_state.last_checkout_measures();
     assert_eq!(measures.threads, 1);
     assert_eq!(measures.writers, 1);
+
+    // Setting 4 starts 4 threads, and more than one of them writes files.
+    let four_settings = checkout_threads_settings(Some(4), "");
+    let four_tree_settings = TreeStateSettings::try_from_user_settings(&four_settings)?;
+    assert_eq!(four_tree_settings.checkout_threads.get(), 4);
+    let wc_root = test_repo.env.root().join("wc4");
+    let state_dir = test_repo.env.root().join("state4");
+    std::fs::create_dir(&wc_root)?;
+    std::fs::create_dir(&state_dir)?;
+    let mut tree_state = TreeState::init(
+        repo.store().clone(),
+        wc_root,
+        state_dir,
+        &four_tree_settings,
+    )?;
+    let tree = create_tree_with(repo, |builder| {
+        for i in 0..64 {
+            let p = repo_path_buf(format!("g{i:02}.txt"));
+            builder.file(&p, format!("file {i}\n"));
+        }
+    });
+    tree_state.check_out(&tree)?;
+    let measures = tree_state.last_checkout_measures();
+    assert_eq!(measures.threads, 4);
+    assert!(
+        measures.writers > 1,
+        "expected more than one writer, got {}",
+        measures.writers
+    );
     Ok(())
 }
 

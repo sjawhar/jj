@@ -14,12 +14,14 @@
 
 #![expect(missing_docs)]
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::DirEntry;
@@ -37,6 +39,8 @@ use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
+use std::panic;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::path::PathBuf;
 use std::slice;
@@ -46,6 +50,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::mpsc::Receiver;
@@ -699,7 +704,8 @@ fn create_parent_dirs(
     let mut dir_path = working_copy_path.to_owned();
     for c in parent_path.components() {
         // Ensure that the name is a normal entry of the current dir_path.
-        dir_path.push(c.to_fs_name().map_err(|err| err.with_path(repo_path))?);
+        let name = c.to_fs_name().map_err(|err| err.with_path(repo_path))?;
+        dir_path.push(name);
         // A directory named ".git" or ".jj" can be temporarily created. It
         // might trick workspace path discovery, but is harmless so long as the
         // directory is empty.
@@ -720,11 +726,13 @@ fn create_parent_dirs(
         };
         // Invalid component (e.g. "..") should have been rejected.
         // The current dir_path should be an entry of dir_path.parent().
-        reject_reserved_existing_path(&dir_path).inspect_err(|_| {
-            if new_dir_created {
-                fs::remove_dir(&dir_path).ok();
-            }
-        })?;
+        if could_alias_reserved_name(OsStr::new(name)) {
+            reject_reserved_existing_path(&dir_path).inspect_err(|_| {
+                if new_dir_created {
+                    fs::remove_dir(&dir_path).ok();
+                }
+            })?;
+        }
         if !is_dir {
             return Ok(None); // Skip existing file or symlink
         }
@@ -745,7 +753,9 @@ fn create_parent_dirs(
 /// If the existing file points to ".git" or ".jj", this function returns an
 /// error.
 fn remove_old_file(disk_path: &Path) -> Result<bool, CheckoutError> {
-    reject_reserved_existing_path(disk_path)?;
+    if disk_path.file_name().is_none_or(could_alias_reserved_name) {
+        reject_reserved_existing_path(disk_path)?;
+    }
     match fs::remove_file(disk_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -792,53 +802,141 @@ fn remove_old_submodule_dir(disk_path: &Path) -> Result<bool, CheckoutError> {
 /// points to (a name alias on a case-insensitive file system, for example),
 /// git/jj CLI could be tricked to load configuration from an
 /// attacker-controlled location. So the file is removed and an error returned
-/// before anything is written to it.
-#[cfg_attr(windows, expect(unused_variables))]
+/// before anything is written to it. Only a name that
+/// [`could_alias_reserved_name()`] is checked so.
 fn create_new_file(
     disk_path: &Path,
     exec_bit: ExecBit,
     old_file_removed: bool,
+    dir_cache: &mut DirCache,
 ) -> Result<Option<File>, CheckoutError> {
-    let mut options = OpenOptions::new();
-    // Don't overwrite un-ignored file. Don't follow symlink.
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(exec_bit.new_file_mode());
-    let file = match options.open(disk_path) {
+    let open_error = || format!("Failed to open file {} for writing", disk_path.display());
+    let file = match dir_cache.create_new(disk_path, exec_bit) {
         Ok(file) => file,
         Err(err) if old_file_removed => {
             return Err(CheckoutError::Other {
-                message: format!("Failed to open file {} for writing", disk_path.display()),
+                message: open_error(),
                 err: err.into(),
             });
         }
         Err(err) => {
-            reject_existing_entry(disk_path, err)?;
+            reject_existing_entry(disk_path, err, open_error)?;
             return Ok(None);
         }
     };
-    reject_reserved_existing_file(&file, disk_path).inspect_err(|_| {
-        // We keep the error from `reject_reserved_existing_file`
-        fs::remove_file(disk_path).ok();
-    })?;
+    if disk_path.file_name().is_none_or(could_alias_reserved_name) {
+        reject_reserved_existing_file(&file, disk_path).inspect_err(|_| {
+            // We keep the error from `reject_reserved_existing_file`
+            fs::remove_file(disk_path).ok();
+        })?;
+    }
     Ok(Some(file))
+}
+
+/// The directory that a checkout thread created its last new file in, kept
+/// open so that the next file in it is created relative to it (`openat()`),
+/// which looks up one name instead of every component of the path.
+///
+/// The directories were created by the coordinating thread, never through a
+/// symlink. A directory that holds a file the checkout created is never
+/// removed during the checkout, so the kept directory is still the one at its
+/// path.
+#[derive(Default)]
+struct DirCache {
+    #[cfg(unix)]
+    dir: Option<(PathBuf, rustix::fd::OwnedFd)>,
+}
+
+impl DirCache {
+    /// Creates `disk_path` new (`O_CREAT | O_EXCL`, which does not follow a
+    /// symlink there) for writing, with the mode of `exec_bit`.
+    #[cfg_attr(windows, expect(unused_variables))]
+    fn create_new(&mut self, disk_path: &Path, exec_bit: ExecBit) -> io::Result<File> {
+        #[cfg(unix)]
+        if let (Some(parent), Some(name)) = (disk_path.parent(), disk_path.file_name()) {
+            use rustix::fs::Mode;
+            use rustix::fs::OFlags;
+            if self.dir.as_ref().is_none_or(|(path, _)| path != parent) {
+                let dir = rustix::fs::open(
+                    parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                self.dir = Some((parent.to_owned(), dir));
+            }
+            let (_, dir) = self.dir.as_ref().expect("the directory was just opened");
+            let mode = if exec_bit.0 {
+                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
+            } else {
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
+            };
+            let file = rustix::fs::openat(
+                dir,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                mode,
+            )?;
+            return Ok(File::from(file));
+        }
+        let mut options = OpenOptions::new();
+        // Don't overwrite un-ignored file. Don't follow symlink.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(exec_bit.new_file_mode());
+        options.open(disk_path)
+    }
 }
 
 /// Handles the error `err` of a checkout's create of a new entry at
 /// `disk_path`: returns `Ok(())` if an entry is already there, so that the
-/// path is skipped, and an error if none is or if the entry may point to a
-/// ".git" or ".jj" entry.
-fn reject_existing_entry(disk_path: &Path, err: io::Error) -> Result<(), CheckoutError> {
+/// path is skipped, and an error if the entry may point to a ".git" or ".jj"
+/// entry. If no entry is there, returns `err` itself with the message that
+/// `message` makes.
+fn reject_existing_entry(
+    disk_path: &Path,
+    err: io::Error,
+    message: impl FnOnce() -> String,
+) -> Result<(), CheckoutError> {
     if err.kind() != io::ErrorKind::AlreadyExists {
         // Workaround for "Access is denied. (os error 5)" error on Windows.
-        disk_path
-            .symlink_metadata()
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to stat {}", disk_path.display()),
-                err: err.into(),
-            })?;
+        match disk_path.symlink_metadata() {
+            Ok(_) => {}
+            Err(stat_err) if stat_err.kind() == io::ErrorKind::NotFound => {
+                return Err(CheckoutError::Other {
+                    message: message(),
+                    err: err.into(),
+                });
+            }
+            Err(stat_err) => {
+                return Err(CheckoutError::Other {
+                    message: format!("Failed to stat {}", disk_path.display()),
+                    err: stat_err.into(),
+                });
+            }
+        }
     }
     reject_reserved_existing_path(disk_path)
+}
+
+/// Whether the entry name `name` could point to the ".git" or ".jj" entry of
+/// its directory on some file system, as git's own name rules see it: a name
+/// that is ".git" or ".jj" in any ASCII case and with trailing dots or spaces
+/// (Windows), any name that holds `~` (8.3 short names), `:` (NTFS streams)
+/// or `\`, and any name that is not ASCII (HFS+ ignores some code points, and
+/// case-insensitive file systems fold more than ASCII). Any other name never
+/// does, so the checks of the entry's identity against ".git" and ".jj" are
+/// run only for these names.
+fn could_alias_reserved_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    if !name.is_ascii() || name.contains(['~', ':', '\\']) {
+        return true;
+    }
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    RESERVED_DIR_NAMES
+        .iter()
+        .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
 }
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
@@ -1049,6 +1147,10 @@ pub struct TreeState {
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
     filter_strategy: FilterStrategy,
+    /// Whether a checkout converts file contents for the working copy: by EOL
+    /// conversion, or by a smudge filter that the gitattributes may name. If
+    /// not, the contents go to disk as the store has them.
+    update_converts_contents: bool,
     checkout_threads: NonZeroUsize,
     /// The bound on the bytes of file contents that a checkout holds read and
     /// not yet written, unless one file is larger.
@@ -1147,6 +1249,8 @@ impl TreeState {
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
             filter_strategy: FilterStrategy::new(working_copy_path, filter_settings.clone()),
+            update_converts_contents: *eol_conversion_mode == EolConversionMode::InputOutput
+                || filter_settings.enabled,
             checkout_threads: *checkout_threads,
             max_bytes_in_flight: DEFAULT_MAX_BYTES_IN_FLIGHT,
             last_checkout_measures: CheckoutMeasures::default(),
@@ -2349,26 +2453,19 @@ impl TreeState {
             };
 
         let output = {
-            let (job_sender, job_receiver) = channel();
             let (result_sender, result_receiver) = channel();
             let context = CheckoutContext {
                 tree_state: &*self,
                 labels: new_tree.labels(),
                 git_attributes: &git_attributes,
-                jobs: Mutex::new(job_receiver),
                 bytes_in_flight: BytesInFlight::new(self.max_bytes_in_flight),
                 aborted: AtomicBool::new(false),
                 first_error: Mutex::new(None),
                 writers: AtomicUsize::new(0),
             };
             thread::scope(|scope| {
-                let mut coordinator = CheckoutCoordinator::new(
-                    &context,
-                    scope,
-                    job_sender,
-                    result_sender,
-                    result_receiver,
-                );
+                let mut coordinator =
+                    CheckoutCoordinator::new(&context, scope, result_sender, result_receiver);
                 let walked =
                     coordinator.walk(old_tree, new_tree, matcher, conflicts_to_rematerialize);
                 coordinator.finish(walked)
@@ -2482,105 +2579,165 @@ const MAX_CONTENTS_WRITE: usize = 8 << 20;
 /// The size that a checkout worker's buffer for contents starts at.
 const MIN_CONTENTS_BUF: usize = 64 << 10;
 
+/// The most jobs that a checkout's coordinating thread hands to the worker
+/// threads at once. A checkout's first batches are smaller, so that a small
+/// checkout spreads over the workers too.
+const MAX_JOB_BATCH: usize = 64;
+
 /// The jobs that a checkout's coordinating thread keeps queued or running for
-/// each worker thread before it waits for one to finish.
-const QUEUED_JOBS_PER_THREAD: usize = 16;
+/// each worker thread before it waits for some to finish.
+const QUEUED_JOBS_PER_THREAD: usize = 4 * MAX_JOB_BATCH;
 
 /// What a checkout measured of its threads and of its bytes in flight, for
 /// tests ([`TreeState::last_checkout_measures()`]).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CheckoutMeasures {
-    /// The worker threads that the checkout started.
+    /// The threads that read and wrote the checkout's files: the worker
+    /// threads that the checkout started, or 1 where the calling thread did
+    /// that work itself.
     pub threads: usize,
-    /// The worker threads that wrote at least one file, symlink or conflict.
+    /// The threads that wrote at least one file, symlink or conflict.
     pub writers: usize,
     /// The most bytes of file contents that were read and not yet written at
     /// one time.
     pub peak_bytes_in_flight: u64,
 }
 
-/// The bytes of file contents that a checkout's workers have read and not yet
-/// written, under a bound. A worker reserves the bytes of a file before it
-/// reads it and gives them back once the file is written. Reservations are
-/// granted in the order they are asked for, each once its bytes fit under the
-/// bound or, for a file larger than the bound, once nothing else is in flight.
-/// So the bytes in flight never pass the bound or the largest file, whichever
-/// is larger.
+/// The bytes of file contents that a checkout's threads have read and not yet
+/// written, under a bound. A thread reserves the bytes of a file before it
+/// reads it and gives them back once the file is written. A reservation is
+/// granted once its bytes fit under the bound or, for a file larger than the
+/// bound, once nothing else is in flight. So the bytes in flight never pass
+/// the bound or the largest file, whichever is larger.
+///
+/// While every reservation fits, the count is one atomic and no thread takes
+/// a lock. A reservation that does not fit waits in a queue, and while the
+/// queue is not empty every new reservation joins it, so that they are granted
+/// in the order they came and a large file is not kept waiting by smaller ones
+/// that come after it.
 struct BytesInFlight {
     limit: u64,
-    state: Mutex<BytesInFlightState>,
+    in_flight: AtomicU64,
+    peak: AtomicU64,
+    /// The reservations in the queue.
+    waiters: AtomicUsize,
+    /// Set when the checkout stops: the reservations that wait give up.
+    closed: AtomicBool,
+    queue: Mutex<ReservationQueue>,
     changed: Condvar,
 }
 
-struct BytesInFlightState {
-    in_flight: u64,
-    peak: u64,
-    /// The ticket that the next reservation takes.
+struct ReservationQueue {
+    /// The ticket that the next reservation to join the queue takes.
     next_ticket: u64,
     /// The ticket of the reservation that is granted next.
     next_grant: u64,
-    /// Set when the checkout stops: the reservations that wait give up.
-    closed: bool,
 }
 
 impl BytesInFlight {
     fn new(limit: u64) -> Self {
         Self {
             limit,
-            state: Mutex::new(BytesInFlightState {
-                in_flight: 0,
-                peak: 0,
+            in_flight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            queue: Mutex::new(ReservationQueue {
                 next_ticket: 0,
                 next_grant: 0,
-                closed: false,
             }),
             changed: Condvar::new(),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BytesInFlightState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, ReservationQueue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds `bytes` to the bytes in flight if they fit under the bound, or if
+    /// nothing else is in flight. Returns whether it did.
+    fn try_add(&self, bytes: u64) -> bool {
+        let mut in_flight = self.in_flight.load(AtomicOrdering::SeqCst);
+        loop {
+            let new_in_flight = in_flight.saturating_add(bytes);
+            if in_flight != 0 && new_in_flight > self.limit {
+                return false;
+            }
+            match self.in_flight.compare_exchange_weak(
+                in_flight,
+                new_in_flight,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.peak.fetch_max(new_in_flight, AtomicOrdering::Relaxed);
+                    return true;
+                }
+                Err(actual) => in_flight = actual,
+            }
+        }
     }
 
     /// Waits until `bytes` may be in flight and reserves them. Returns `None`
     /// if the checkout stopped meanwhile.
     fn reserve(&self, bytes: u64) -> Option<BytesReservation<'_>> {
-        let mut state = self.lock();
-        let ticket = state.next_ticket;
-        state.next_ticket += 1;
-        while !state.closed
-            && (state.next_grant != ticket
-                || state.in_flight != 0 && state.in_flight.saturating_add(bytes) > self.limit)
-        {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        if state.closed {
+        if self.closed.load(AtomicOrdering::SeqCst) {
             return None;
         }
-        state.next_grant += 1;
-        state.in_flight += bytes;
-        state.peak = state.peak.max(state.in_flight);
-        drop(state);
-        // The next reservation may fit as well.
-        self.changed.notify_all();
-        Some(BytesReservation {
+        let reservation = || BytesReservation {
             bytes_in_flight: self,
             bytes,
-        })
+        };
+        if self.waiters.load(AtomicOrdering::SeqCst) == 0 && self.try_add(bytes) {
+            return Some(reservation());
+        }
+        let mut queue = self.lock_queue();
+        // Counted before the bytes in flight are read again, and under the
+        // lock: a release that this reservation misses sees the count, and
+        // notifies once this thread waits.
+        self.waiters.fetch_add(1, AtomicOrdering::SeqCst);
+        let ticket = queue.next_ticket;
+        queue.next_ticket += 1;
+        let reserved = loop {
+            if self.closed.load(AtomicOrdering::SeqCst) {
+                break false;
+            }
+            if queue.next_grant == ticket && self.try_add(bytes) {
+                queue.next_grant += 1;
+                break true;
+            }
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(PoisonError::into_inner);
+        };
+        self.waiters.fetch_sub(1, AtomicOrdering::SeqCst);
+        drop(queue);
+        // The next reservation in the queue may fit as well.
+        self.changed.notify_all();
+        reserved.then(reservation)
+    }
+
+    fn release(&self, bytes: u64) {
+        self.in_flight.fetch_sub(bytes, AtomicOrdering::SeqCst);
+        if self.waiters.load(AtomicOrdering::SeqCst) != 0 {
+            // A waiting reservation holds the lock from its look at the bytes
+            // in flight until it waits, so it is notified after either.
+            drop(self.lock_queue());
+            self.changed.notify_all();
+        }
     }
 
     /// Makes every reservation that waits, and every later one, give up.
     fn close(&self) {
-        self.lock().closed = true;
+        self.closed.store(true, AtomicOrdering::SeqCst);
+        drop(self.lock_queue());
         self.changed.notify_all();
     }
 
     fn peak(&self) -> u64 {
-        self.lock().peak
+        self.peak.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -2592,8 +2749,7 @@ struct BytesReservation<'a> {
 
 impl Drop for BytesReservation<'_> {
     fn drop(&mut self) {
-        self.bytes_in_flight.lock().in_flight -= self.bytes;
-        self.bytes_in_flight.changed.notify_all();
+        self.bytes_in_flight.release(self.bytes);
     }
 }
 
@@ -2602,6 +2758,9 @@ impl Drop for BytesReservation<'_> {
 struct CheckoutJob {
     /// The job's slot in [`CheckoutCoordinator::slots`].
     index: usize,
+    /// The key of the path's name ([`folded_name_key()`]), which the
+    /// coordinating thread keeps while the job is with the workers.
+    name_key: u64,
     path: RepoPathBuf,
     disk_path: PathBuf,
     /// The path's value in the new tree.
@@ -2613,6 +2772,7 @@ struct CheckoutJob {
 /// What a worker sends back for each job that it takes.
 struct CheckoutResult {
     index: usize,
+    name_key: u64,
     /// `None` if the job failed, or did not run because the checkout stopped.
     outcome: Option<JobOutcome>,
 }
@@ -2652,14 +2812,25 @@ struct CheckoutOutput {
     measures: CheckoutMeasures,
 }
 
+/// What one thread that reads and writes a checkout's files keeps from one
+/// file to the next.
+#[derive(Default)]
+struct CheckoutWorker {
+    /// The buffer that file contents go through.
+    buf: Vec<u8>,
+    dir_cache: DirCache,
+}
+
+/// The results of one batch of jobs, with the index of the worker that sends
+/// them.
+type BatchResults = (usize, Vec<CheckoutResult>);
+
 /// What the threads of one checkout share.
 struct CheckoutContext<'a> {
     tree_state: &'a TreeState,
     /// The conflict labels of the new tree.
     labels: &'a ConflictLabels,
     git_attributes: &'a GitAttributes,
-    /// The queue of jobs: each worker takes the next one.
-    jobs: Mutex<Receiver<CheckoutJob>>,
     bytes_in_flight: BytesInFlight,
     aborted: AtomicBool,
     first_error: Mutex<Option<CheckoutError>>,
@@ -2688,45 +2859,60 @@ impl CheckoutContext<'_> {
         self.abort();
     }
 
-    /// The loop of one worker thread: it takes jobs from the queue until the
-    /// queue closes, and sends a result for each.
-    fn run_worker(&self, results: &Sender<CheckoutResult>) {
-        let mut buf = Vec::new();
+    /// The loop of one worker thread: it takes batches of jobs from its queue
+    /// until the queue closes, and sends the results of each batch. A job
+    /// that panics fails the checkout as an error does, and the worker goes
+    /// on to answer for the jobs left in its queue.
+    fn run_worker(
+        &self,
+        worker_index: usize,
+        jobs: Receiver<Vec<CheckoutJob>>,
+        results: &Sender<BatchResults>,
+    ) {
+        let mut worker = CheckoutWorker::default();
         let mut wrote = false;
-        loop {
-            let job = self
-                .jobs
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .recv();
-            let Ok(job) = job else {
-                break;
-            };
-            let index = job.index;
-            let _panic_guard = ResultOnPanic {
-                context: self,
-                results,
-                index,
-            };
-            let outcome = if self.is_aborted() {
-                None
-            } else {
-                match self.check_out_job(job, &mut buf).block_on() {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        self.fail(err);
-                        None
+        for batch in jobs {
+            let mut batch_results = Vec::with_capacity(batch.len());
+            for job in batch {
+                let (index, name_key) = (job.index, job.name_key);
+                let outcome = if self.is_aborted() {
+                    None
+                } else {
+                    let checked_out = panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.check_out_job(job, &mut worker).block_on()
+                    }));
+                    match checked_out {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(err)) => {
+                            self.fail(err);
+                            None
+                        }
+                        Err(payload) => {
+                            self.fail(CheckoutError::Other {
+                                message: "A checkout thread panicked".to_owned(),
+                                err: panic_message(payload.as_ref()).into(),
+                            });
+                            worker = CheckoutWorker::default();
+                            None
+                        }
                     }
-                }
-            };
-            wrote |= matches!(
-                outcome,
-                Some(JobOutcome {
-                    outcome: CheckoutOutcome::Written(_),
-                    ..
-                })
-            );
-            results.send(CheckoutResult { index, outcome }).ok();
+                };
+                wrote |= matches!(
+                    outcome,
+                    Some(JobOutcome {
+                        outcome: CheckoutOutcome::Written(_),
+                        ..
+                    })
+                );
+                batch_results.push(CheckoutResult {
+                    index,
+                    name_key,
+                    outcome,
+                });
+            }
+            if results.send((worker_index, batch_results)).is_err() {
+                break;
+            }
         }
         if wrote {
             self.writers.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2738,10 +2924,11 @@ impl CheckoutContext<'_> {
     async fn check_out_job(
         &self,
         job: CheckoutJob,
-        buf: &mut Vec<u8>,
+        worker: &mut CheckoutWorker,
     ) -> Result<Option<JobOutcome>, CheckoutError> {
         let CheckoutJob {
             index: _,
+            name_key: _,
             path,
             disk_path,
             value,
@@ -2784,13 +2971,19 @@ impl CheckoutContext<'_> {
                     true,
                     old_file_removed,
                     size_hint,
-                    buf,
+                    worker,
                 )
                 .await?
             }
             MaterializedTreeValue::Symlink { id: _, target } => {
                 if tree_state.symlink_support {
-                    (write_symlink(&disk_path, &target, old_file_removed)?, None)
+                    let outcome = write_symlink(
+                        &disk_path,
+                        &target,
+                        old_file_removed,
+                        &mut worker.dir_cache,
+                    )?;
+                    (outcome, None)
                 } else {
                     // The fake symlink file shouldn't be executable.
                     self.write_file(
@@ -2801,7 +2994,7 @@ impl CheckoutContext<'_> {
                         false,
                         old_file_removed,
                         size_hint,
-                        buf,
+                        worker,
                     )
                     .await?
                 }
@@ -2827,7 +3020,7 @@ impl CheckoutContext<'_> {
                         &contents,
                         exec_bit,
                         old_file_removed,
-                        buf,
+                        worker,
                     )
                     .await?;
                 if let CheckoutOutcome::Written(file_state) = &mut outcome {
@@ -2848,7 +3041,7 @@ impl CheckoutContext<'_> {
                     contents.as_bytes(),
                     ExecBit(false),
                     old_file_removed,
-                    buf,
+                    worker,
                 )
                 .await?
             }
@@ -2878,12 +3071,15 @@ impl CheckoutContext<'_> {
         apply_conversion: bool,
         old_file_removed: bool,
         size_hint: u64,
-        buf: &mut Vec<u8>,
+        worker: &mut CheckoutWorker,
     ) -> Result<(CheckoutOutcome, Option<FilterIgnoreReason>), CheckoutError> {
-        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed)? else {
+        let CheckoutWorker { buf, dir_cache } = worker;
+        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed, dir_cache)?
+        else {
             return Ok((CheckoutOutcome::Skipped, None));
         };
-        let (contents, unconverted) = if apply_conversion {
+        let mut unconverted = None;
+        let written = if apply_conversion && self.tree_state.update_converts_contents {
             let contents = self
                 .tree_state
                 .target_eol_strategy
@@ -2893,27 +3089,28 @@ impl CheckoutContext<'_> {
                     message: "Failed to convert the EOL for the content".to_string(),
                     err: err.into(),
                 })?;
-            self.convert_to_working_copy(contents, repo_path).await?
+            let (contents, reason) = self.convert_to_working_copy(contents, repo_path).await?;
+            unconverted = reason;
+            write_contents(contents, size_hint, buf, &mut file).await
         } else {
-            (
-                Box::new(contents) as Box<dyn AsyncRead + Send + Unpin>,
-                None,
-            )
+            // Neither the EOL conversion nor a filter is on: the contents go
+            // to the file as they are.
+            write_contents(contents, size_hint, buf, &mut file).await
         };
-        let size = write_contents(contents, size_hint, buf, &mut file)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!(
-                    "Failed to write the content to the file {}",
-                    disk_path.display()
-                ),
-                err: err.into(),
-            })?;
+        let size = written.map_err(|err| CheckoutError::Other {
+            message: format!(
+                "Failed to write the content to the file {}",
+                disk_path.display()
+            ),
+            err: err.into(),
+        })?;
         let file_state = new_file_state(&file, exec_bit, size, disk_path)?;
         Ok((CheckoutOutcome::Written(file_state), unconverted))
     }
 
-    /// Writes the file of a conflict that the checkout creates new.
+    /// Writes the file of a conflict that the checkout creates new. The
+    /// contents are converted before the file is created, so that a conversion
+    /// that fails leaves no file.
     async fn write_conflict(
         &self,
         repo_path: &RepoPath,
@@ -2921,11 +3118,22 @@ impl CheckoutContext<'_> {
         contents: &[u8],
         exec_bit: ExecBit,
         old_file_removed: bool,
-        buf: &mut Vec<u8>,
+        worker: &mut CheckoutWorker,
     ) -> Result<(CheckoutOutcome, Option<FilterIgnoreReason>), CheckoutError> {
-        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed)? else {
-            return Ok((CheckoutOutcome::Skipped, None));
+        let CheckoutWorker { buf, dir_cache } = worker;
+        let write_error = |err: io::Error| CheckoutError::Other {
+            message: format!("Failed to write conflict to file {}", disk_path.display()),
+            err: err.into(),
         };
+        if !self.tree_state.update_converts_contents {
+            let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed, dir_cache)?
+            else {
+                return Ok((CheckoutOutcome::Skipped, None));
+            };
+            file.write_all(contents).map_err(write_error)?;
+            let file_state = new_file_state(&file, exec_bit, contents.len() as u64, disk_path)?;
+            return Ok((CheckoutOutcome::Written(file_state), None));
+        }
         let size_hint = contents.len() as u64;
         let contents = self
             .tree_state
@@ -2937,12 +3145,13 @@ impl CheckoutContext<'_> {
                 err: err.into(),
             })?;
         let (contents, unconverted) = self.convert_to_working_copy(contents, repo_path).await?;
+        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed, dir_cache)?
+        else {
+            return Ok((CheckoutOutcome::Skipped, None));
+        };
         let size = write_contents(contents, size_hint, buf, &mut file)
             .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to write conflict to file {}", disk_path.display()),
-                err: err.into(),
-            })?;
+            .map_err(write_error)?;
         let file_state = new_file_state(&file, exec_bit, size, disk_path)?;
         Ok((CheckoutOutcome::Written(file_state), unconverted))
     }
@@ -2976,25 +3185,23 @@ impl CheckoutContext<'_> {
     }
 }
 
-/// Sends the result of a worker's job if the worker panics on it, so that the
-/// coordinating thread does not wait for the result forever.
-struct ResultOnPanic<'a> {
-    context: &'a CheckoutContext<'a>,
-    results: &'a Sender<CheckoutResult>,
-    index: usize,
+/// The message of a panic, from what it was raised with.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_owned()
+    }
 }
 
-impl Drop for ResultOnPanic<'_> {
-    fn drop(&mut self) {
-        if thread::panicking() {
-            self.context.abort();
-            let result = CheckoutResult {
-                index: self.index,
-                outcome: None,
-            };
-            self.results.send(result).ok();
-        }
-    }
+/// One worker thread's queue of jobs, as the coordinating thread sees it.
+struct WorkerQueue {
+    /// The queue's sender; the worker ends once this is dropped.
+    jobs: Sender<Vec<CheckoutJob>>,
+    /// How many jobs were sent to the worker that it has sent no result for.
+    outstanding: usize,
 }
 
 /// The coordinating thread of one checkout. It walks the diff in path order,
@@ -3007,27 +3214,48 @@ impl Drop for ResultOnPanic<'_> {
 ///   that this leaves empty;
 /// - creates the directory of a submodule;
 /// - and queues a file, symlink or conflict for the workers, which read its
-///   contents from the store and write it.
+///   contents from the store and write it. With one thread, this thread does
+///   that itself, and starts no worker.
 ///
 /// Workers create no directories, and remove nothing but a file they just
-/// created and must refuse. A directory that holds a queued path is never
-/// removed, since it is not empty once the path is written; this thread
-/// removes only directories that it found empty, as the checkout one path at a
-/// time would. So no removal runs under a worker that writes into the same
-/// directory.
+/// created and must refuse. Where this thread's work on a path could meet a
+/// worker's on an earlier one, it first waits for the workers to finish what
+/// is queued, so that the outcome is the one of a checkout one path at a time:
+///
+/// - before it removes the directories that a removed path leaves empty, if a
+///   queued path may be about to be created in one of them;
+/// - before a path whose name, or the name of a directory to create for it,
+///   differs from a queued path's by case only, which a case-insensitive file
+///   system takes for the same entry;
+/// - before a path below the path queued last, which only a conflicted tree
+///   has.
 struct CheckoutCoordinator<'scope, 'env> {
     context: &'scope CheckoutContext<'scope>,
     scope: &'scope thread::Scope<'scope, 'env>,
-    /// `None` once the queue is closed.
-    jobs: Option<Sender<CheckoutJob>>,
-    /// The sender that each new worker gets a clone of; `None` once the queue
-    /// is closed, so that `results` ends when the last worker does.
-    result_sender: Option<Sender<CheckoutResult>>,
-    results: Receiver<CheckoutResult>,
+    /// The workers' queues: empty before the first job is queued, and once
+    /// the checkout is finished.
+    workers: Vec<WorkerQueue>,
+    /// The worker that the next batch goes to if no worker has less to do.
+    next_worker: usize,
+    /// The sender that each worker gets a clone of; `None` once the workers
+    /// are started, so that `results` ends when the last worker does.
+    result_sender: Option<Sender<BatchResults>>,
+    results: Receiver<BatchResults>,
     threads: usize,
+    /// With one thread, what this thread keeps between the files that it
+    /// reads and writes itself.
+    inline_worker: Option<CheckoutWorker>,
+    inline_wrote: bool,
     spawned: usize,
-    queued: usize,
+    /// The jobs to send to a worker with the next batch.
+    pending: Vec<CheckoutJob>,
+    /// How many jobs were sent to the workers.
+    sent: usize,
+    /// How many jobs the workers sent a result for.
     received: usize,
+    /// For each key of a name ([`folded_name_key()`]), how many jobs with it
+    /// are pending or with the workers.
+    in_flight_names: HashMap<u64, u32>,
     /// What happened to each changed path, in the order of the diff.
     slots: Vec<CheckoutSlot>,
     deleted_files: HashSet<RepoPathBuf>,
@@ -3035,9 +3263,7 @@ struct CheckoutCoordinator<'scope, 'env> {
     sort: bool,
     /// The parent of the last path whose parent directories were created.
     prev_created_path: RepoPathBuf,
-    /// The directories that hold a queued path.
-    queued_dirs: HashSet<RepoPathBuf>,
-    /// The path queued last.
+    /// The path queued last for the workers.
     last_queued: RepoPathBuf,
 }
 
@@ -3045,20 +3271,25 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
     fn new(
         context: &'scope CheckoutContext<'scope>,
         scope: &'scope thread::Scope<'scope, 'env>,
-        jobs: Sender<CheckoutJob>,
-        result_sender: Sender<CheckoutResult>,
-        results: Receiver<CheckoutResult>,
+        result_sender: Sender<BatchResults>,
+        results: Receiver<BatchResults>,
     ) -> Self {
+        let threads = context.tree_state.checkout_threads.get();
         Self {
             context,
             scope,
-            jobs: Some(jobs),
+            workers: Vec::new(),
+            next_worker: 0,
             result_sender: Some(result_sender),
             results,
-            threads: context.tree_state.checkout_threads.get(),
+            threads,
+            inline_worker: (threads == 1).then(CheckoutWorker::default),
+            inline_wrote: false,
             spawned: 0,
-            queued: 0,
+            pending: Vec::new(),
+            sent: 0,
             received: 0,
+            in_flight_names: HashMap::new(),
             slots: Vec::new(),
             deleted_files: HashSet::new(),
             // TODO: maybe it's better not include the skipped counts in the "intended"
@@ -3072,7 +3303,6 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             },
             sort: false,
             prev_created_path: RepoPathBuf::root(),
-            queued_dirs: HashSet::new(),
             last_queued: RepoPathBuf::root(),
         }
     }
@@ -3113,6 +3343,11 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         Ok(())
     }
 
+    /// Whether a job is pending or with the workers.
+    fn has_in_flight(&self) -> bool {
+        !self.pending.is_empty() || self.received < self.sent
+    }
+
     /// Checks out one path whose value is `before` in the old tree and `after`
     /// in the new one.
     fn check_out_entry(
@@ -3144,17 +3379,6 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             return Ok(());
         }
 
-        // A worker may still be writing the path queued last. Before walking
-        // through that path to one below it (which only a conflicted tree
-        // has), wait for the worker, so that the walk finds what the worker
-        // made there, as if the paths were checked out one after the other.
-        if path
-            .strip_prefix(&self.last_queued)
-            .is_some_and(|rest| !rest.is_root())
-        {
-            self.wait_for_workers();
-        }
-
         let working_copy_path = self.context.tree_state.working_copy_path();
         // This path and the previous one we did work for may have a common prefix. We
         // can adjust the "working copy" path to the parent directory which we know
@@ -3162,6 +3386,33 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         // RepoPath::root() as the common prefix.
         let (common_prefix, adjusted_diff_file_path) =
             path.split_common_prefix(&self.prev_created_path);
+
+        let mut name_key = 0;
+        if self.inline_worker.is_none() {
+            name_key = folded_name_key(&path);
+            if self.has_in_flight() {
+                // The directories that this path may have created for it.
+                let common_prefix_len = common_prefix.as_internal_file_string().len();
+                let mut new_dirs = path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|dir| dir.as_internal_file_string().len() > common_prefix_len);
+                // A worker may still be writing the path queued last. Before
+                // walking through that path to one below it (which only a
+                // conflicted tree has), and before a path that a
+                // case-insensitive file system takes for a queued one, wait
+                // for the workers, so that this path finds what they made
+                // there, as if the paths were checked out one after the other.
+                if path
+                    .strip_prefix(&self.last_queued)
+                    .is_some_and(|rest| !rest.is_root())
+                    || self.in_flight_names.contains_key(&name_key)
+                    || new_dirs.any(|dir| self.in_flight_names.contains_key(&folded_name_key(dir)))
+                {
+                    self.wait_for_workers();
+                }
+            }
+        }
 
         let disk_path = if adjusted_diff_file_path.is_root() {
             // The path being "root" here implies that the entire path has already been
@@ -3222,6 +3473,7 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         } else {
             self.queue(CheckoutJob {
                 index: self.slots.len(),
+                name_key,
                 path,
                 disk_path,
                 value: after,
@@ -3265,7 +3517,22 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         // then on the next iteration recreation is skipped because of this
         // optimization.
         self.prev_created_path = RepoPathBuf::root();
-        remove_empty_parent_dirs(&path, disk_path, &self.queued_dirs);
+        // A directory above this path is removed only if it is empty. One that
+        // holds a queued path has that path's file in it, unless a worker is
+        // still to create it; and a directory with only such files in it is
+        // the directory of the path queued last, since the paths come in
+        // order and every other queued path's directory lies in a directory
+        // that this thread created below it. So wait for the workers if that
+        // directory is one of those above this path.
+        if self.has_in_flight()
+            && self
+                .last_queued
+                .parent()
+                .is_some_and(|dir| path.starts_with(dir))
+        {
+            self.wait_for_workers();
+        }
+        remove_empty_parent_dirs(&path, disk_path);
         self.deleted_files.insert(path);
         Ok(())
     }
@@ -3285,7 +3552,12 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
                     fs::remove_dir(disk_path).ok();
                 })?,
                 Err(err) => {
-                    reject_existing_entry(disk_path, err)?;
+                    reject_existing_entry(disk_path, err, || {
+                        format!(
+                            "Failed to create submodule directory {}",
+                            disk_path.display()
+                        )
+                    })?;
                     // Failing to materialize submodule, over a directory which
                     // is presumably the submodule before it was added in a
                     // commit, is not an error.
@@ -3315,76 +3587,145 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         Ok(())
     }
 
-    /// Queues a file, symlink or conflict for a worker.
-    fn queue(&mut self, job: CheckoutJob) -> Result<(), CheckoutError> {
-        for dir in job.path.ancestors().skip(1) {
-            if self.queued_dirs.contains(dir) {
-                break;
-            }
-            self.queued_dirs.insert(dir.to_owned());
-        }
-        let path: &RepoPath = &job.path;
-        path.clone_into(&mut self.last_queued);
-        if self.spawned < self.threads {
-            self.spawn_worker()?;
-        }
-        while self.queued - self.received >= self.threads * QUEUED_JOBS_PER_THREAD
-            && self.receive_result()
-        {}
-        self.slots.push(CheckoutSlot::Queued);
-        self.jobs
-            .as_ref()
-            .expect("the queue is open while the diff is walked")
-            .send(job)
-            .expect("the queue's receiver lives as long as the checkout");
-        self.queued += 1;
-        Ok(())
-    }
-
-    fn spawn_worker(&mut self) -> Result<(), CheckoutError> {
-        let context = self.context;
-        let results = self
-            .result_sender
-            .clone()
-            .expect("the queue is open while the diff is walked");
-        thread::Builder::new()
-            .name("jj checkout".to_owned())
-            .spawn_scoped(self.scope, move || context.run_worker(&results))
-            .map_err(|err| CheckoutError::Other {
-                message: "Failed to start a checkout thread".to_owned(),
-                err: err.into(),
-            })?;
-        self.spawned += 1;
-        Ok(())
-    }
-
-    /// Waits for the result of one queued job and records it. Returns false if
-    /// no worker is left to send one.
-    fn receive_result(&mut self) -> bool {
-        let Ok(CheckoutResult { index, outcome }) = self.results.recv() else {
-            return false;
-        };
-        self.received += 1;
-        if let Some(JobOutcome {
+    /// Records what a job did with its path.
+    fn record(&mut self, index: usize, outcome: JobOutcome) {
+        let JobOutcome {
             path,
             outcome,
             unconverted,
-        }) = outcome
-        {
-            if let Some(reason) = unconverted {
-                self.stats.unconverted_paths.insert(path.clone(), reason);
+        } = outcome;
+        if let Some(reason) = unconverted {
+            self.stats.unconverted_paths.insert(path.clone(), reason);
+        }
+        self.slots[index] = CheckoutSlot::Done(path, outcome);
+    }
+
+    /// Queues a file, symlink or conflict for the workers, or with one thread
+    /// reads and writes it now.
+    fn queue(&mut self, job: CheckoutJob) -> Result<(), CheckoutError> {
+        self.slots.push(CheckoutSlot::Queued);
+        if let Some(worker) = &mut self.inline_worker {
+            let index = job.index;
+            if let Some(outcome) = self.context.check_out_job(job, worker).block_on()? {
+                self.inline_wrote |= matches!(outcome.outcome, CheckoutOutcome::Written(_));
+                self.record(index, outcome);
             }
-            self.slots[index] = CheckoutSlot::Done(path, outcome);
+            return Ok(());
+        }
+
+        let path: &RepoPath = &job.path;
+        path.clone_into(&mut self.last_queued);
+        *self.in_flight_names.entry(job.name_key).or_insert(0) += 1;
+        if self.workers.is_empty() {
+            self.spawn_workers()?;
+        }
+        self.pending.push(job);
+        // The first batches are small, so that each worker gets jobs early.
+        if self.pending.len() >= (self.sent / self.threads).clamp(1, MAX_JOB_BATCH) {
+            self.flush();
+        }
+        while self.sent - self.received >= self.threads * QUEUED_JOBS_PER_THREAD
+            && self.receive_results()
+        {}
+        Ok(())
+    }
+
+    /// Starts the worker threads, each with a queue of its own.
+    fn spawn_workers(&mut self) -> Result<(), CheckoutError> {
+        // This thread keeps no sender of results: once every worker has
+        // ended, no result is waited for any longer.
+        let results = self
+            .result_sender
+            .take()
+            .expect("the workers are started once");
+        for worker_index in 0..self.threads {
+            let context = self.context;
+            let results = results.clone();
+            let (jobs, queue) = channel();
+            thread::Builder::new()
+                .name("jj checkout".to_owned())
+                .spawn_scoped(self.scope, move || {
+                    context.run_worker(worker_index, queue, &results);
+                })
+                .map_err(|err| CheckoutError::Other {
+                    message: "Failed to start a checkout thread".to_owned(),
+                    err: err.into(),
+                })?;
+            self.workers.push(WorkerQueue {
+                jobs,
+                outstanding: 0,
+            });
+            self.spawned += 1;
+        }
+        Ok(())
+    }
+
+    /// Sends the pending jobs as one batch to the worker that has the fewest
+    /// jobs to do, in turns among those that have as few.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let batch = mem::replace(&mut self.pending, Vec::with_capacity(MAX_JOB_BATCH));
+        let batch_len = batch.len();
+        let worker_count = self.workers.len();
+        let worker_index = (0..worker_count)
+            .map(|turn| (self.next_worker + turn) % worker_count)
+            .min_by_key(|&worker_index| self.workers[worker_index].outstanding)
+            .expect("the workers are started before a job is pending");
+        self.next_worker = (worker_index + 1) % worker_count;
+        self.sent += batch_len;
+        let worker = &mut self.workers[worker_index];
+        if worker.jobs.send(batch).is_ok() {
+            worker.outstanding += batch_len;
+        } else {
+            // The worker has ended, which it does not do before its queue is
+            // closed. No result comes for these jobs.
+            self.received += batch_len;
+            self.context.fail(CheckoutError::Other {
+                message: "A checkout thread ended early".to_owned(),
+                err: "the thread's queue is closed".into(),
+            });
+        }
+    }
+
+    /// Waits for the results of one batch of jobs and records them. Returns
+    /// false if no worker is left to send any.
+    fn receive_results(&mut self) -> bool {
+        let Ok((worker_index, results)) = self.results.recv() else {
+            return false;
+        };
+        if let Some(worker) = self.workers.get_mut(worker_index) {
+            worker.outstanding -= results.len();
+        }
+        for result in results {
+            let CheckoutResult {
+                index,
+                name_key,
+                outcome,
+            } = result;
+            self.received += 1;
+            if let Some(count) = self.in_flight_names.get_mut(&name_key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.in_flight_names.remove(&name_key);
+                }
+            }
+            if let Some(outcome) = outcome {
+                self.record(index, outcome);
+            }
         }
         true
     }
 
-    /// Waits until the workers have finished every queued job.
+    /// Sends the pending jobs, and waits until the workers have finished every
+    /// job.
     fn wait_for_workers(&mut self) {
-        while self.received < self.queued && self.receive_result() {}
+        self.flush();
+        while self.received < self.sent && self.receive_results() {}
     }
 
-    /// Closes the queue, waits for the workers to end, and returns what the
+    /// Closes the queues, waits for the workers to end, and returns what the
     /// checkout did, or its first error.
     fn finish(
         mut self,
@@ -3393,11 +3734,14 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         if let Err(err) = walked {
             self.context.fail(err);
         }
-        // Each worker ends once the queue is closed and empty, and `results`
+        if !self.context.is_aborted() {
+            self.flush();
+        }
+        // Each worker ends once its queue is closed and empty, and `results`
         // ends when the last worker does.
-        self.jobs = None;
+        self.workers.clear();
         self.result_sender = None;
-        while self.receive_result() {}
+        while self.receive_results() {}
         if let Some(err) = self
             .context
             .first_error
@@ -3416,8 +3760,6 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             });
         }
 
-        // The workers are done, so every directory that is empty now stays so.
-        self.queued_dirs.clear();
         let mut changed_file_states = Vec::with_capacity(self.slots.len());
         for slot in mem::take(&mut self.slots) {
             let CheckoutSlot::Done(path, outcome) = slot else {
@@ -3432,15 +3774,25 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
                     self.stats.skipped_files += 1;
                 }
                 CheckoutOutcome::AccessDenied(disk_path) => {
-                    remove_empty_parent_dirs(&path, &disk_path, &self.queued_dirs);
+                    // The workers are done, so every directory that is empty
+                    // now stays so.
+                    remove_empty_parent_dirs(&path, &disk_path);
                     self.deleted_files.insert(path);
                 }
             }
         }
-        let measures = CheckoutMeasures {
-            threads: self.spawned,
-            writers: self.context.writers.load(AtomicOrdering::Relaxed),
-            peak_bytes_in_flight: self.context.bytes_in_flight.peak(),
+        let measures = if self.inline_worker.is_some() {
+            CheckoutMeasures {
+                threads: 1,
+                writers: usize::from(self.inline_wrote),
+                peak_bytes_in_flight: self.context.bytes_in_flight.peak(),
+            }
+        } else {
+            CheckoutMeasures {
+                threads: self.spawned,
+                writers: self.context.writers.load(AtomicOrdering::Relaxed),
+                peak_bytes_in_flight: self.context.bytes_in_flight.peak(),
+            }
         };
         Ok(CheckoutOutput {
             stats: self.stats,
@@ -3452,16 +3804,27 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
     }
 }
 
+/// A key of `path` that is the same for two paths that differ by case only,
+/// which a case-insensitive file system takes for one entry. (Two paths that
+/// differ otherwise have the same key only by chance.)
+fn folded_name_key(path: &RepoPath) -> u64 {
+    // FNV-1a over the lower-case characters.
+    let mut key: u64 = 0xcbf2_9ce4_8422_2325;
+    let chars = path.as_internal_file_string().chars();
+    for c in chars.flat_map(char::to_lowercase) {
+        key = (key ^ u64::from(u32::from(c))).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    key
+}
+
 /// Removes the directories above `path`, at `disk_path`, that its removal
 /// left empty, from the deepest one up to the first one that is not empty,
-/// stopping before the working copy root. A directory in `queued_dirs` holds a
-/// path that a worker is to write, so it is not removed.
-fn remove_empty_parent_dirs(path: &RepoPath, disk_path: &Path, queued_dirs: &HashSet<RepoPathBuf>) {
+/// stopping before the working copy root.
+fn remove_empty_parent_dirs(path: &RepoPath, disk_path: &Path) {
     let mut dir = path.parent();
     let mut disk_dir = disk_path.parent().unwrap();
     while let Some(repo_dir) = dir {
-        if repo_dir.is_root() || queued_dirs.contains(repo_dir) || fs::remove_dir(disk_dir).is_err()
-        {
+        if repo_dir.is_root() || fs::remove_dir(disk_dir).is_err() {
             break;
         }
         disk_dir = disk_dir.parent().unwrap();
@@ -3561,9 +3924,25 @@ fn new_file_state(
     size: u64,
     disk_path: &Path,
 ) -> Result<FileState, CheckoutError> {
-    let metadata = file
+    #[cfg_attr(windows, expect(unused_mut))]
+    let mut metadata = file
         .metadata()
         .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    #[cfg(unix)]
+    if exec_bit.0 && metadata.permissions().mode() & 0o111 == 0 {
+        // The process's umask took every executable bit away from the mode
+        // that the file was created with, so the next snapshot would read the
+        // file as not executable. Set the mode on the handle, as the checkout
+        // did for every file before it created files with their mode.
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|err| CheckoutError::Other {
+                message: format!("Failed to set the mode of file {}", disk_path.display()),
+                err: err.into(),
+            })?;
+        metadata = file
+            .metadata()
+            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    }
     FileState::for_file(exec_bit, size, &metadata)
         .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
 }
@@ -3575,6 +3954,7 @@ fn write_symlink(
     disk_path: &Path,
     target: &str,
     old_file_removed: bool,
+    dir_cache: &mut DirCache,
 ) -> Result<CheckoutOutcome, CheckoutError> {
     let target = symlink_target_convert_to_disk(target);
 
@@ -3594,32 +3974,46 @@ fn write_symlink(
         );
     }
 
+    // If the new symlink were the entry that the name ".git" or ".jj" of its
+    // directory points to, git/jj CLI could be tricked to load configuration
+    // from an attacker-controlled location. So a name that could be one is
+    // tested with an empty file first: the symlink itself is never there
+    // under such a name.
+    if disk_path.file_name().is_none_or(could_alias_reserved_name) {
+        let Some(probe) = create_new_file(disk_path, ExecBit(false), old_file_removed, dir_cache)?
+        else {
+            return Ok(CheckoutOutcome::Skipped);
+        };
+        drop(probe);
+        fs::remove_file(disk_path).map_err(|err| CheckoutError::Other {
+            message: format!("Failed to remove temporary file {}", disk_path.display()),
+            err: err.into(),
+        })?;
+    }
+
     // On Windows, this will create a nonfunctional link for directories,
     // but at the moment we don't have enough information in the tree to
     // determine whether the symlink target is a file or a directory.
+    let symlink_error = || {
+        format!(
+            "Failed to create symlink from {} to {}",
+            disk_path.display(),
+            target.display()
+        )
+    };
     match symlink_file(&target, disk_path) {
         Ok(()) => {}
         Err(err) if !old_file_removed => {
-            reject_existing_entry(disk_path, err)?;
+            reject_existing_entry(disk_path, err, symlink_error)?;
             return Ok(CheckoutOutcome::Skipped);
         }
         Err(err) => {
             return Err(CheckoutError::Other {
-                message: format!(
-                    "Failed to create symlink from {} to {}",
-                    disk_path.display(),
-                    target.display()
-                ),
+                message: symlink_error(),
                 err: err.into(),
             });
         }
     }
-    // If the new symlink were the entry that the name ".git" or ".jj" of its
-    // directory points to, git/jj CLI could be tricked to load configuration
-    // from an attacker-controlled location.
-    reject_reserved_existing_path(disk_path).inspect_err(|_| {
-        fs::remove_file(disk_path).ok();
-    })?;
     let metadata = disk_path
         .symlink_metadata()
         .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;

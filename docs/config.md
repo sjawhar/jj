@@ -2338,6 +2338,10 @@ back to 1).
 checkout-threads = 4
 ```
 
+The setting applies to the checkouts of a workspace's working copy and of
+`jj file edit`. The temporary working copies of `jj run` and of the diff and
+merge editors always use the default.
+
 ## Ways to specify `jj` config: details
 
 ### User config files

@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -21,7 +22,6 @@ use std::fmt::Error;
 use std::fmt::Formatter;
 use std::fs;
 use std::io;
-use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -31,6 +31,7 @@ use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -186,16 +187,11 @@ pub struct GitBackend {
     // used in a single-threaded context.
     base_repo: gix::ThreadSafeRepository,
     repo: Mutex<gix::Repository>,
-    /// Handles for reads of file and symlink contents, each with a delta-base
-    /// pack cache of its own. A read takes one out (or opens one from
-    /// `base_repo`) and puts it back when it is done, so reads on several
-    /// threads, as the working copy's checkout runs them, hold no lock while
-    /// they read. The pool keeps as many handles as reads ran at once; handles
-    /// beyond the first four use a smaller per-handle pack cache so high-core
-    /// hosts stay bounded.
-    read_repos: Mutex<Vec<gix::Repository>>,
-    /// Total handles opened for `read_repos` so far (idle + in use).
-    read_repos_opened: AtomicUsize,
+    /// Tells this backend's read handles from other backends' in the slot
+    /// that each thread keeps one in ([`READ_REPO`]).
+    id: u64,
+    /// How many read handles of this backend threads keep at this time.
+    live_read_repos: Arc<AtomicUsize>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -222,8 +218,8 @@ impl GitBackend {
         Self {
             base_repo,
             repo: Mutex::new(repo),
-            read_repos: Mutex::new(Vec::new()),
-            read_repos_opened: AtomicUsize::new(0),
+            id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
+            live_read_repos: Arc::new(AtomicUsize::new(0)),
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -376,30 +372,45 @@ impl GitBackend {
         self.repo.lock().unwrap()
     }
 
-    /// Takes a repository handle for one read out of the pool, or opens a new
-    /// one if every handle is in use. The handle goes back to the pool when
-    /// the returned guard drops.
-    fn read_repo(&self) -> ReadRepo<'_> {
-        let pooled = self.read_repos.lock().unwrap().pop();
-        let repo = pooled.unwrap_or_else(|| {
-            let index = self.read_repos_opened.fetch_add(1, Ordering::Relaxed);
-            let mut repo = self.base_repo.to_thread_local();
-            // Keep gix's default 96 MiB delta-base pack cache for the first 4
-            // handles (384 MiB total on 4-CPU pods), and cap additional handles
-            // at 16 MiB each so high-core machines do not grow linearly at
-            // 96 MiB/thread.
-            if index >= 4 {
-                repo.objects.set_pack_cache(|| {
-                    Box::new(gix::odb::pack::cache::lru::StaticLinkedList::<64>::new(
-                        16 << 20,
-                    ))
-                });
+    /// Runs `read` with the calling thread's own repository handle for reads
+    /// of file and symlink contents, which is opened on the thread's first
+    /// read and has a delta-base pack cache of its own. So reads on several
+    /// threads, as the working copy's checkout runs them, take no lock, and a
+    /// thread's handle and cache go when the thread ends.
+    fn with_read_repo<T>(&self, read: impl FnOnce(&gix::Repository) -> T) -> T {
+        READ_REPO.with_borrow_mut(|slot| {
+            if slot
+                .as_ref()
+                .is_none_or(|read_repo| read_repo.backend_id != self.id)
+            {
+                // Close the handle of another backend before this one's is
+                // opened.
+                *slot = None;
+                *slot = Some(self.open_read_repo());
             }
-            repo
-        });
-        ReadRepo {
-            pool: &self.read_repos,
-            repo: Some(repo),
+            let read_repo = slot.as_ref().expect("the handle was just opened");
+            read(&read_repo.repo)
+        })
+    }
+
+    fn open_read_repo(&self) -> ThreadReadRepo {
+        let live = self.live_read_repos.fetch_add(1, Ordering::Relaxed);
+        let mut repo = self.base_repo.to_thread_local();
+        // Keep gix's default 96 MiB delta-base pack cache for the first 4
+        // handles (384 MiB in all on 4-CPU hosts), and cap each further
+        // handle's at 16 MiB, so that the caches of a host with many CPUs do
+        // not grow by 96 MiB for each thread.
+        if live >= FULL_PACK_CACHE_READ_REPOS {
+            repo.objects.set_pack_cache(|| {
+                Box::new(gix::odb::pack::cache::lru::StaticLinkedList::<64>::new(
+                    SMALL_PACK_CACHE_BYTES,
+                ))
+            });
+        }
+        ThreadReadRepo {
+            backend_id: self.id,
+            repo,
+            live_read_repos: self.live_read_repos.clone(),
         }
     }
 
@@ -555,15 +566,16 @@ impl GitBackend {
     }
 
     fn read_blob_sync(&self, id: &impl ObjectId) -> BackendResult<Vec<u8>> {
-        let repo = self.read_repo();
-        let git_blob_id = validate_git_object_id(&repo, id)?;
-        let mut blob = repo
-            .try_find_object(git_blob_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?
-            .try_into_blob()
-            .map_err(|err| to_read_object_err(err, id))?;
-        Ok(blob.take_data())
+        self.with_read_repo(|repo| {
+            let git_blob_id = validate_git_object_id(repo, id)?;
+            let mut blob = repo
+                .try_find_object(git_blob_id)
+                .map_err(|err| to_read_object_err(err, id))?
+                .ok_or_else(|| not_found_err(id))?
+                .try_into_blob()
+                .map_err(|err| to_read_object_err(err, id))?;
+            Ok(blob.take_data())
+        })
     }
 
     fn new_diff_platform(&self) -> BackendResult<gix::diff::blob::Platform> {
@@ -1107,26 +1119,53 @@ fn import_extra_metadata_entries_from_heads(
     Ok(())
 }
 
-/// A repository handle taken out of [`GitBackend`]'s pool for one read. It
-/// goes back to the pool when this drops.
-struct ReadRepo<'a> {
-    pool: &'a Mutex<Vec<gix::Repository>>,
-    repo: Option<gix::Repository>,
+/// The id that the next [`GitBackend`] takes.
+static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(0);
+
+/// How many of a backend's read handles keep gix's default delta-base pack
+/// cache of 96 MiB.
+const FULL_PACK_CACHE_READ_REPOS: usize = 4;
+
+/// The delta-base pack cache of each further read handle.
+const SMALL_PACK_CACHE_BYTES: usize = 16 << 20;
+
+thread_local! {
+    /// The repository handle that this thread reads file and symlink contents
+    /// through, for the backend it read from last
+    /// ([`GitBackend::with_read_repo()`]).
+    static READ_REPO: RefCell<Option<ThreadReadRepo>> = const { RefCell::new(None) };
 }
 
-impl Deref for ReadRepo<'_> {
-    type Target = gix::Repository;
+/// A thread's repository handle for the reads of one [`GitBackend`].
+struct ThreadReadRepo {
+    backend_id: u64,
+    repo: gix::Repository,
+    live_read_repos: Arc<AtomicUsize>,
+}
 
-    fn deref(&self) -> &Self::Target {
-        self.repo.as_ref().unwrap()
+impl Drop for ThreadReadRepo {
+    fn drop(&mut self) {
+        self.live_read_repos.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-impl Drop for ReadRepo<'_> {
+impl Drop for GitBackend {
     fn drop(&mut self) {
-        if let Some(repo) = self.repo.take() {
-            self.pool.lock().unwrap().push(repo);
-        }
+        // Close the handle that the thread dropping the backend may keep for
+        // its reads; it would keep the repository's files open otherwise.
+        // The handles of the threads that a checkout started went with those
+        // threads.
+        READ_REPO
+            .try_with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|read_repo| read_repo.backend_id == self.id)
+                {
+                    *slot = None;
+                }
+            })
+            .ok();
     }
 }
 
@@ -1167,8 +1206,8 @@ impl Backend for GitBackend {
     fn concurrency(&self) -> usize {
         // The backend's methods do their work before they return, so a caller
         // that buffers futures gains nothing from more. Callers that read on
-        // several threads, as the working copy's checkout does, get a handle
-        // of their own for each read (`read_repo()`).
+        // several threads, as the working copy's checkout does, read through
+        // a handle of each thread's own (`with_read_repo()`).
         1
     }
 
@@ -1184,13 +1223,14 @@ impl Backend for GitBackend {
     async fn file_size(&self, _path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
         // The size is in the object's header: a loose object inflates only its
         // first bytes, and a packed delta gives the size of its result.
-        let repo = self.read_repo();
-        let git_blob_id = validate_git_object_id(&repo, id)?;
-        let header = repo
-            .try_find_header(git_blob_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?;
-        Ok(Some(header.size()))
+        self.with_read_repo(|repo| {
+            let git_blob_id = validate_git_object_id(repo, id)?;
+            let header = repo
+                .try_find_header(git_blob_id)
+                .map_err(|err| to_read_object_err(err, id))?
+                .ok_or_else(|| not_found_err(id))?;
+            Ok(Some(header.size()))
+        })
     }
 
     async fn write_file(
