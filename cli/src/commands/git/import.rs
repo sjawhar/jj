@@ -53,6 +53,7 @@ pub async fn cmd_git_import(
     let remote_settings = workspace_command.settings().remote_settings()?;
     let import_options = load_git_import_options(ui, &git_settings, &remote_settings)?;
     let mut tx = workspace_command.start_transaction();
+    tx.mark_import_from_git();
     let stats = git::import_refs(tx.repo_mut(), &import_options).await?;
     print_git_import_stats(ui, &tx, &stats)?;
     tx.finish(ui, "import git refs").await?;
