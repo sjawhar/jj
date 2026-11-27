@@ -95,6 +95,9 @@ jj-lib = { path = ".", features = ["test-fakes"], default-features = false }
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = [ "fs" ] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = [ "inotify" ] }
+
 [features]
 default = ["git"]
 git = ["dep:gix"]

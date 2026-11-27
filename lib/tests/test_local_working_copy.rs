@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::assert_matches;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Component;
@@ -33,6 +35,8 @@ use itertools::Itertools as _;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::TreeId;
 use jj_lib::backend::TreeValue;
+use jj_lib::config::ConfigLayer;
+use jj_lib::config::ConfigSource;
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::conflicts::ConflictMaterializeOptions;
 use jj_lib::default_backend_factories::default_working_copy_factories;
@@ -44,9 +48,13 @@ use jj_lib::files::FileMergeHunkLevel;
 use jj_lib::fsmonitor::FsmonitorSettings;
 use jj_lib::git::get_git_backend;
 use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::local_working_copy::FileState;
+use jj_lib::local_working_copy::FileType;
 use jj_lib::local_working_copy::LocalWorkingCopy;
+use jj_lib::local_working_copy::MaterializedConflictData;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::default_checkout_threads;
 use jj_lib::matchers::FilesMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
@@ -61,6 +69,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::secret_backend::SecretBackend;
+use jj_lib::settings::UserSettings;
 use jj_lib::tree_builder::TreeBuilder;
 use jj_lib::tree_merge::MergeOptions;
 use jj_lib::working_copy::CheckoutError;
@@ -77,6 +86,7 @@ use testutils::TestRepoBackend;
 use testutils::TestResult;
 use testutils::TestWorkspace;
 use testutils::assert_tree_eq;
+use testutils::base_user_config;
 use testutils::commit_with_tree;
 use testutils::create_tree;
 use testutils::create_tree_with;
@@ -3263,5 +3273,644 @@ fn test_always_store_empty_tree() -> TestResult {
         .expect("empty tree should be stored in the git repo");
     assert_eq!(empty_tree.kind, gix::objs::Kind::Tree);
     assert!(empty_tree.data.is_empty());
+    Ok(())
+}
+
+fn checkout_threads_settings(threads: Option<usize>, extra_toml: &str) -> UserSettings {
+    let mut config = base_user_config();
+    let text = match threads {
+        Some(threads) => format!("working-copy.checkout-threads = {threads}\n{extra_toml}"),
+        None => extra_toml.to_owned(),
+    };
+    if !text.is_empty() {
+        config.add_layer(ConfigLayer::parse(ConfigSource::User, &text).unwrap());
+    }
+    testutils::user_settings_from_config(config)
+}
+
+#[test]
+fn test_checkout_threads_same_result() -> TestResult {
+    // Build one tree with nested directories, an executable file, a symlink,
+    // a conflict, a git submodule, an EOL conversion and a .gitattributes
+    // smudge filter, then check it out with 1 thread and with 4 threads and
+    // compare every entry on disk and in the recorded file states against the
+    // expected values and against each other.
+    let filter_exe = toml::Value::String(env!("CARGO_BIN_EXE_fake-filter").to_string());
+    let extra_toml = indoc::formatdoc!(
+        r#"
+        working-copy.eol-conversion = "input-output"
+        git.filter.enabled = true
+
+        [git.filter.drivers.upper]
+        smudge = [{filter_exe}, "--uppercase"]
+        "#
+    );
+
+    let check_out_with = |threads: usize| -> TestResult<(
+        TestWorkspace,
+        jj_lib::working_copy::CheckoutStats,
+        BTreeMap<RepoPathBuf, FileState>,
+    )> {
+        let settings = checkout_threads_settings(Some(threads), &extra_toml);
+        let mut test_workspace =
+            TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+        let repo = test_workspace.repo.clone();
+        let store = repo.store().clone();
+        let copy_id = CopyId::placeholder();
+        let mut tx = repo.start_transaction();
+        let submodule_id = write_random_commit(tx.repo_mut()).id().clone();
+        tx.commit("submodule").block_on()?;
+
+        let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
+        let mut add_file = |path: &RepoPath, content: &str, executable: bool| {
+            let id = testutils::write_file(&store, path, content);
+            builder.set_or_remove(
+                path.to_owned(),
+                Merge::normal(TreeValue::File {
+                    id,
+                    executable,
+                    copy_id: copy_id.clone(),
+                }),
+            );
+        };
+        add_file(
+            repo_path(".gitattributes"),
+            "filtered.txt filter=upper\n",
+            false,
+        );
+        add_file(repo_path("a/b/plain.txt"), "line1\nline2\n", false);
+        add_file(repo_path("a/b/bin.dat"), "raw\0bytes\n", false);
+        add_file(repo_path("bin/run.sh"), "#!/bin/sh\necho hi\n", true);
+        add_file(repo_path("filtered.txt"), "hello\nworld\n", false);
+        for i in 0..24 {
+            let p = repo_path_buf(format!("many/dir{}/file{i:02}.txt", i % 4));
+            add_file(&p, &format!("content-{i}\nline2\n"), i % 3 == 0);
+        }
+        let link_path = repo_path("links/to-plain");
+        let link_id = store
+            .write_symlink(link_path, "../a/b/plain.txt")
+            .block_on()?;
+        builder.set_or_remove(
+            link_path.to_owned(),
+            Merge::normal(TreeValue::Symlink(link_id)),
+        );
+        let sub_path = repo_path("sub/mod");
+        builder.set_or_remove(
+            sub_path.to_owned(),
+            Merge::normal(TreeValue::GitSubmodule(submodule_id)),
+        );
+        let conflict_path = repo_path("conflicts/both.txt");
+        let base_id = testutils::write_file(&store, conflict_path, "base\n");
+        let left_id = testutils::write_file(&store, conflict_path, "left\n");
+        let right_id = testutils::write_file(&store, conflict_path, "right\n");
+        builder.set_or_remove(
+            conflict_path.to_owned(),
+            Merge::from_removes_adds(
+                vec![Some(TreeValue::File {
+                    id: base_id,
+                    executable: false,
+                    copy_id: copy_id.clone(),
+                })],
+                vec![
+                    Some(TreeValue::File {
+                        id: left_id,
+                        executable: false,
+                        copy_id: copy_id.clone(),
+                    }),
+                    Some(TreeValue::File {
+                        id: right_id,
+                        executable: false,
+                        copy_id: copy_id.clone(),
+                    }),
+                ],
+            ),
+        );
+
+        let tree = builder.write_tree().block_on()?;
+        let commit = commit_with_tree(&store, tree);
+        let stats = test_workspace
+            .workspace
+            .check_out(repo.op_id().clone(), None, &commit)
+            .block_on()?;
+        let wc: &LocalWorkingCopy = test_workspace
+            .workspace
+            .working_copy()
+            .downcast_ref()
+            .unwrap();
+        let file_states: BTreeMap<_, _> = wc
+            .file_states()?
+            .iter()
+            .map(|(p, s)| (p.to_owned(), s))
+            .collect();
+        Ok((test_workspace, stats, file_states))
+    };
+
+    let (ws1, stats1, states1) = check_out_with(1)?;
+    let (ws4, stats4, states4) = check_out_with(4)?;
+    let symlinks = check_symlink_support().unwrap_or(false);
+
+    // CheckoutStats counts match expected and each other.
+    // 5 named files + 24 numbered files + 1 symlink + 1 submodule + 1 conflict = 32
+    assert_eq!(stats1.added_files, 32);
+    assert_eq!(stats1.updated_files, 0);
+    assert_eq!(stats1.removed_files, 0);
+    assert_eq!(stats1.skipped_files, 0);
+    assert!(stats1.unconverted_paths.is_empty());
+    assert_eq!(stats4.added_files, stats1.added_files);
+    assert_eq!(stats4.updated_files, stats1.updated_files);
+    assert_eq!(stats4.removed_files, stats1.removed_files);
+    assert_eq!(stats4.skipped_files, stats1.skipped_files);
+    assert!(stats4.unconverted_paths.is_empty());
+
+    // Recorded file states: same keys, file types, sizes, conflict data.
+    assert_eq!(states1.keys().collect_vec(), states4.keys().collect_vec());
+    for (path, s1) in &states1 {
+        let s4 = &states4[path];
+        assert_eq!(s1.file_type, s4.file_type, "file_type for {path:?}");
+        assert_eq!(s1.size, s4.size, "size for {path:?}");
+        assert_eq!(
+            s1.materialized_conflict_data, s4.materialized_conflict_data,
+            "conflict_data for {path:?}"
+        );
+    }
+
+    // Compare on-disk files, contents, modes, symlink and submodule against
+    // explicit expected values and between 1 and 4 threads.
+    let root1 = ws1.workspace.workspace_root();
+    let root4 = ws4.workspace.workspace_root();
+    let expected_conflict = indoc! {"
+        <<<<<<< conflict 1 of 1\r
+        %%%%%%% diff from: base\r
+        \\\\\\\\\\\\\\        to: side #1\r
+        -base\r
+        +left\r
+        +++++++ side #2\r
+        right\r
+        >>>>>>> conflict 1 of 1 ends\r
+    "};
+    for (root, states) in [(root1, &states1), (root4, &states4)] {
+        assert_eq!(
+            std::fs::read(root.join("a/b/plain.txt"))?,
+            b"line1\r\nline2\r\n"
+        );
+        assert_eq!(std::fs::read(root.join("a/b/bin.dat"))?, b"raw\0bytes\n");
+        assert_eq!(
+            std::fs::read(root.join("bin/run.sh"))?,
+            b"#!/bin/sh\r\necho hi\r\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("filtered.txt"))?,
+            b"HELLO\r\nWORLD\r\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("conflicts/both.txt"))?,
+            expected_conflict.as_bytes()
+        );
+        assert_eq!(
+            states[repo_path("conflicts/both.txt")].materialized_conflict_data,
+            Some(MaterializedConflictData {
+                conflict_marker_len: 7,
+            })
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                root.join("a/b/plain.txt")
+                    .symlink_metadata()?
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+            assert_ne!(
+                root.join("bin/run.sh")
+                    .symlink_metadata()?
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+        let sub_meta = root.join("sub/mod").symlink_metadata()?;
+        assert!(sub_meta.is_dir());
+        assert_eq!(
+            states[repo_path("sub/mod")].file_type,
+            FileType::GitSubmodule
+        );
+        let link_meta = root.join("links/to-plain").symlink_metadata()?;
+        if symlinks {
+            assert!(link_meta.file_type().is_symlink());
+            assert_eq!(
+                std::fs::read_link(root.join("links/to-plain"))?,
+                PathBuf::from(if cfg!(windows) {
+                    r"..\a\b\plain.txt"
+                } else {
+                    "../a/b/plain.txt"
+                })
+            );
+            assert_eq!(
+                states[repo_path("links/to-plain")].file_type,
+                FileType::Symlink
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(root.join("links/to-plain"))?,
+                b"../a/b/plain.txt"
+            );
+        }
+    }
+    for path in states1.keys() {
+        let p1 = path.to_fs_path_unchecked(root1);
+        let p4 = path.to_fs_path_unchecked(root4);
+        let m1 = p1.symlink_metadata()?;
+        let m4 = p4.symlink_metadata()?;
+        assert_eq!(m1.file_type(), m4.file_type(), "type for {path:?}");
+        #[cfg(unix)]
+        assert_eq!(
+            m1.permissions().mode(),
+            m4.permissions().mode(),
+            "mode for {path:?}"
+        );
+        if m1.is_file() {
+            assert_eq!(
+                std::fs::read(&p1)?,
+                std::fs::read(&p4)?,
+                "bytes for {path:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_refuses_reserved_path(threads: usize) -> TestResult {
+    for file_path_str in [
+        ".git",
+        ".jj",
+        ".git/pwned",
+        ".jj/pwned",
+        "sub/.git",
+        "sub/.jj",
+        "sub/.git/pwned",
+        "sub/.jj/pwned",
+    ] {
+        let settings = checkout_threads_settings(Some(threads), "");
+        let mut test_workspace =
+            TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+        let repo = &test_workspace.repo;
+        let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+        std::fs::create_dir(workspace_root.join(".git"))?;
+
+        let file_path = repo_path(file_path_str);
+        let tree = create_tree(repo, &[(file_path, "contents")]);
+        let commit = commit_with_tree(repo.store(), tree);
+        let result = test_workspace
+            .workspace
+            .check_out(repo.op_id().clone(), None, &commit)
+            .block_on();
+        assert_matches!(
+            result,
+            Err(CheckoutError::ReservedPathComponent { .. }),
+            "path={file_path_str}, threads={threads}"
+        );
+        assert!(!workspace_root.join(".git").join("pwned").exists());
+        assert!(!workspace_root.join(".jj").join("pwned").exists());
+        assert!(!workspace_root.join("sub").join(".git").exists());
+        assert!(!workspace_root.join("sub").join(".jj").exists());
+    }
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_skips_file_on_disk(threads: usize) -> TestResult {
+    let settings = checkout_threads_settings(Some(threads), "");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = &test_workspace.repo;
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    let existing_path = repo_path("dir/existing.txt");
+    let fresh_path = repo_path("dir/fresh.txt");
+    testutils::write_working_copy_file(&workspace_root, existing_path, "already here");
+
+    let tree = create_tree(
+        repo,
+        &[(existing_path, "from repo"), (fresh_path, "fresh content")],
+    );
+    let commit = commit_with_tree(repo.store(), tree);
+    let stats = test_workspace
+        .workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+
+    assert_eq!(stats.added_files, 2);
+    assert_eq!(stats.skipped_files, 1);
+    assert_eq!(
+        std::fs::read(workspace_root.join("dir/existing.txt"))?,
+        b"already here"
+    );
+    assert_eq!(
+        std::fs::read(workspace_root.join("dir/fresh.txt"))?,
+        b"fresh content"
+    );
+    let wc: &LocalWorkingCopy = test_workspace
+        .workspace
+        .working_copy()
+        .downcast_ref()
+        .unwrap();
+    let existing_state = wc.file_states()?.get(existing_path).unwrap();
+    assert_eq!(existing_state.size, 0);
+    assert_eq!(existing_state.mtime.0, 0);
+    assert_eq!(wc.file_states()?.get(fresh_path).unwrap().size, 13);
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_failed_write_fails(threads: usize) -> TestResult {
+    let settings = checkout_threads_settings(Some(threads), "");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = &test_workspace.repo;
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    // Commit 1 writes several files, including one whose old file we will make
+    // impossible to recreate, or on Unix an unwritable directory where a new
+    // file must go.
+    let locked_dir = workspace_root.join("locked");
+    std::fs::create_dir(&locked_dir)?;
+    let mut entries: Vec<(RepoPathBuf, String)> = (0..16)
+        .map(|i| (repo_path_buf(format!("ok/file{i:02}")), format!("ok-{i}")))
+        .collect();
+    entries.push((repo_path_buf("locked/cannot-write"), "boom".to_owned()));
+    let tree = create_tree_with(repo, |builder| {
+        for (path, content) in &entries {
+            builder.file(path, content);
+        }
+    });
+    let commit = commit_with_tree(repo.store(), tree);
+
+    let orig_perms = locked_dir.symlink_metadata()?.permissions();
+    #[cfg(unix)]
+    {
+        let mut readonly = orig_perms.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&locked_dir, readonly)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut readonly = orig_perms.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&locked_dir, readonly)?;
+    }
+    let result = test_workspace
+        .workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on();
+    std::fs::set_permissions(&locked_dir, orig_perms)?;
+
+    // On Windows a readonly directory attribute does not block file creation.
+    if !cfg!(windows) {
+        assert_matches!(result, Err(CheckoutError::Other { .. }));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_of_new_files_makes_no_probe_and_no_chmod(threads: usize) -> TestResult {
+    use nix::sys::inotify::AddWatchFlags;
+    use nix::sys::inotify::InitFlags;
+    use nix::sys::inotify::Inotify;
+
+    let settings = checkout_threads_settings(Some(threads), "");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = &test_workspace.repo;
+    let store = repo.store();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    // Pre-create the directories so inotify can watch every one of them before
+    // the checkout writes its new files.
+    let sub_dir = workspace_root.join("sub");
+    std::fs::create_dir(&sub_dir)?;
+
+    let inotify = Inotify::init(InitFlags::IN_NONBLOCK)?;
+    let mask = AddWatchFlags::IN_CREATE | AddWatchFlags::IN_DELETE | AddWatchFlags::IN_ATTRIB;
+    let _root_wd = inotify.add_watch(&workspace_root, mask)?;
+    let _sub_wd = inotify.add_watch(&sub_dir, mask)?;
+
+    let copy_id = CopyId::placeholder();
+    let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
+    for (path, content, executable) in [
+        (repo_path("plain.txt"), "hello\n", false),
+        (repo_path("script.sh"), "#!/bin/sh\n", true),
+        (repo_path("sub/nested.txt"), "nested\n", false),
+        (repo_path("sub/tool.sh"), "#!/bin/sh\necho ok\n", true),
+    ] {
+        let id = testutils::write_file(store, path, content);
+        builder.set_or_remove(
+            path.to_owned(),
+            Merge::normal(TreeValue::File {
+                id,
+                executable,
+                copy_id: copy_id.clone(),
+            }),
+        );
+    }
+    let tree = builder.write_tree().block_on()?;
+    let commit = commit_with_tree(store, tree);
+
+    test_workspace
+        .workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+
+    let mut events = Vec::new();
+    loop {
+        match inotify.read_events() {
+            Ok(batch) => events.extend(batch),
+            Err(nix::errno::Errno::EAGAIN) => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let created: Vec<String> = events
+        .iter()
+        .filter(|e| e.mask.contains(AddWatchFlags::IN_CREATE))
+        .filter_map(|e| e.name.as_ref().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let deleted: Vec<String> = events
+        .iter()
+        .filter(|e| e.mask.contains(AddWatchFlags::IN_DELETE))
+        .filter_map(|e| e.name.as_ref().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let attrib: Vec<String> = events
+        .iter()
+        .filter(|e| e.mask.contains(AddWatchFlags::IN_ATTRIB))
+        .filter_map(|e| e.name.as_ref().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+
+    assert_eq!(
+        created.len(),
+        4,
+        "expected 1 create per new file, got {created:?}"
+    );
+    assert!(
+        deleted.is_empty(),
+        "expected no probe-file delete events, got {deleted:?}"
+    );
+    assert!(
+        attrib.is_empty(),
+        "expected no chmod attribute events, got {attrib:?}"
+    );
+    // Check the created files' modes match the executable bit (respecting umask
+    // on the group/other bits).
+    assert_eq!(
+        workspace_root
+            .join("plain.txt")
+            .symlink_metadata()?
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_eq!(
+        workspace_root
+            .join("sub/nested.txt")
+            .symlink_metadata()?
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_ne!(
+        workspace_root
+            .join("script.sh")
+            .symlink_metadata()?
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_ne!(
+        workspace_root
+            .join("sub/tool.sh")
+            .symlink_metadata()?
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn test_checkout_threads_setting() -> TestResult {
+    // Unset defaults to available_parallelism (falling back to 1).
+    let unset_settings = checkout_threads_settings(None, "");
+    let unset_tree_settings = TreeStateSettings::try_from_user_settings(&unset_settings)?;
+    assert_eq!(
+        unset_tree_settings.checkout_threads,
+        default_checkout_threads()
+    );
+    assert_eq!(
+        unset_tree_settings.checkout_threads,
+        std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+    );
+
+    // Setting 0 or negative is rejected.
+    let zero_settings = checkout_threads_settings(Some(0), "");
+    assert!(TreeStateSettings::try_from_user_settings(&zero_settings).is_err());
+
+    // Setting 1 runs one writer thread; setting 4 allows up to 4.
+    let one_settings = checkout_threads_settings(Some(1), "");
+    let one_tree_settings = TreeStateSettings::try_from_user_settings(&one_settings)?;
+    assert_eq!(one_tree_settings.checkout_threads.get(), 1);
+
+    let test_repo = TestRepo::init_with_backend_and_settings(TestRepoBackend::Git, &one_settings);
+    let repo = &test_repo.repo;
+    let wc_root = test_repo.env.root().join("wc");
+    let state_dir = test_repo.env.root().join("state");
+    std::fs::create_dir(&wc_root)?;
+    std::fs::create_dir(&state_dir)?;
+    let mut tree_state =
+        TreeState::init(repo.store().clone(), wc_root, state_dir, &one_tree_settings)?;
+    let tree = create_tree_with(repo, |builder| {
+        for i in 0..32 {
+            let p = repo_path_buf(format!("f{i:02}.txt"));
+            builder.file(&p, format!("file {i}\n"));
+        }
+    });
+    tree_state.check_out(&tree)?;
+    let measures = tree_state.last_checkout_measures();
+    assert_eq!(measures.threads, 1);
+    assert_eq!(measures.writers, 1);
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_bounds_bytes_in_flight(threads: usize) -> TestResult {
+    let settings = checkout_threads_settings(Some(threads), "");
+    let tree_settings = TreeStateSettings::try_from_user_settings(&settings)?;
+    let test_repo = TestRepo::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = &test_repo.repo;
+    let wc_root = test_repo.env.root().join("wc");
+    let state_dir = test_repo.env.root().join("state");
+    std::fs::create_dir(&wc_root)?;
+    std::fs::create_dir(&state_dir)?;
+    let mut tree_state = TreeState::init(
+        repo.store().clone(),
+        wc_root.clone(),
+        state_dir,
+        &tree_settings,
+    )?;
+
+    // 32 files of 8 KiB each = 256 KiB total, with a bound of 20 KiB:
+    // peak must be > 0 and <= 20 KiB.
+    let bound: u64 = 20 << 10;
+    let file_size = 8 << 10;
+    tree_state.set_max_bytes_in_flight(bound);
+    let payload = "x".repeat(file_size);
+    let tree = create_tree_with(repo, |builder| {
+        for i in 0..32 {
+            let p = repo_path_buf(format!("chunk/f{i:02}.dat"));
+            builder.file(&p, &payload);
+        }
+    });
+    tree_state.check_out(&tree)?;
+    let peak = tree_state.last_checkout_measures().peak_bytes_in_flight;
+    assert!(
+        peak >= file_size as u64,
+        "expected peak >= {file_size}, got {peak}"
+    );
+    assert!(peak <= bound, "expected peak <= {bound}, got {peak}");
+
+    // Now check out a tree with a single file larger than the bound (48 KiB)
+    // alongside 8 KiB files: the large file runs alone, so peak <= 48 KiB.
+    let big_size = 48 << 10;
+    let big_payload = "y".repeat(big_size);
+    let tree2 = create_tree_with(repo, |builder| {
+        for i in 0..16 {
+            let p = repo_path_buf(format!("mix/s{i:02}.dat"));
+            builder.file(&p, &payload);
+        }
+        builder.file(repo_path("mix/big.dat"), &big_payload);
+    });
+    tree_state.check_out(&tree2)?;
+    let peak2 = tree_state.last_checkout_measures().peak_bytes_in_flight;
+    let expected_cap = bound.max(big_size as u64);
+    assert!(
+        peak2 >= big_size as u64,
+        "expected peak >= {big_size}, got {peak2}"
+    );
+    assert!(
+        peak2 <= expected_cap,
+        "expected peak <= {expected_cap}, got {peak2}"
+    );
+    assert_eq!(std::fs::read(wc_root.join("mix/big.dat"))?.len(), big_size);
     Ok(())
 }

@@ -28,19 +28,30 @@ use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read as _;
-use std::io::Write as _;
+use std::io::Write;
 use std::iter;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::channel;
+use std::thread;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -63,6 +74,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
+use crate::backend::BackendResult;
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
@@ -73,6 +85,7 @@ use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::config::ConfigGetError;
+use crate::config::ConfigGetResultExt as _;
 use crate::conflict_labels::ConflictLabels;
 use crate::conflicts;
 use crate::conflicts::ConflictMarkerStyle;
@@ -86,7 +99,6 @@ pub use crate::eol::EolConversionMode;
 use crate::eol::TargetEolStrategy;
 use crate::file_util::FileIdentity;
 use crate::file_util::check_symlink_support;
-use crate::file_util::copy_async_to_sync;
 use crate::file_util::persist_temp_file;
 use crate::file_util::symlink_file;
 pub use crate::filter::FilterSettings;
@@ -269,21 +281,14 @@ impl ExecBit {
         #[cfg(windows)]
         return Self(false);
     }
-}
 
-/// Set the executable bit of a file on-disk. This is a no-op on Windows.
-///
-/// On Unix, we manually set the executable bit to the previous value on-disk.
-/// This is necessary because we write all files by creating them new, so files
-/// won't preserve their permissions naturally.
-#[cfg_attr(windows, expect(unused_variables))]
-fn set_executable(exec_bit: ExecBit, disk_path: &Path) -> Result<(), io::Error> {
+    /// The mode that a checkout creates a new file with on Unix: executable
+    /// (0o755) or not (0o644), as far as the process's umask allows. Every
+    /// file is written by creating it new, so this is the file's whole mode.
     #[cfg(unix)]
-    {
-        let mode = if exec_bit.0 { 0o755 } else { 0o644 };
-        fs::set_permissions(disk_path, fs::Permissions::from_mode(mode))?;
+    fn new_file_mode(self) -> u32 {
+        if self.0 { 0o755 } else { 0o644 }
     }
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -775,55 +780,65 @@ fn remove_old_submodule_dir(disk_path: &Path) -> Result<bool, CheckoutError> {
     }
 }
 
-/// Checks if new file or symlink named `disk_path` can be created.
+/// Creates the file `disk_path` that a checkout writes new: once, without
+/// following a symlink, and on Unix with the mode of `exec_bit` as far as the
+/// process's umask allows.
 ///
-/// If the file already exists, this function return `Ok(false)` to signal
-/// that the path should be skipped.
+/// If an entry is already at `disk_path`, returns `Ok(None)` to signal that the
+/// path should be skipped, unless `old_file_removed` says that this checkout
+/// has just removed the file there: then it is an error.
 ///
-/// If the path may point to ".git" or ".jj" entry, this function returns an
-/// error.
-///
-/// This function can fail if `disk_path.parent()` isn't a directory.
-fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
-    // New file or symlink will be created by caller. If it were pointed to by
-    // name ".git" or ".jj", git/jj CLI could be tricked to load configuration
-    // from an attacker-controlled location. So we first test the path by
-    // creating an empty file.
-    let new_file = match OpenOptions::new()
-        .write(true)
-        .create_new(true) // Don't overwrite, don't follow symlink
-        .open(disk_path)
-    {
-        Ok(file) => Some(file),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => None,
-        // Workaround for "Access is denied. (os error 5)" error on Windows.
-        Err(_) => match disk_path.symlink_metadata() {
-            Ok(_) => None,
-            Err(err) => {
-                return Err(CheckoutError::Other {
-                    message: format!("Failed to stat {}", disk_path.display()),
-                    err: err.into(),
-                });
-            }
-        },
+/// If the new file is the entry that the name ".git" or ".jj" of its directory
+/// points to (a name alias on a case-insensitive file system, for example),
+/// git/jj CLI could be tricked to load configuration from an
+/// attacker-controlled location. So the file is removed and an error returned
+/// before anything is written to it.
+#[cfg_attr(windows, expect(unused_variables))]
+fn create_new_file(
+    disk_path: &Path,
+    exec_bit: ExecBit,
+    old_file_removed: bool,
+) -> Result<Option<File>, CheckoutError> {
+    let mut options = OpenOptions::new();
+    // Don't overwrite un-ignored file. Don't follow symlink.
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(exec_bit.new_file_mode());
+    let file = match options.open(disk_path) {
+        Ok(file) => file,
+        Err(err) if old_file_removed => {
+            return Err(CheckoutError::Other {
+                message: format!("Failed to open file {} for writing", disk_path.display()),
+                err: err.into(),
+            });
+        }
+        Err(err) => {
+            reject_existing_entry(disk_path, err)?;
+            return Ok(None);
+        }
     };
+    reject_reserved_existing_file(&file, disk_path).inspect_err(|_| {
+        // We keep the error from `reject_reserved_existing_file`
+        fs::remove_file(disk_path).ok();
+    })?;
+    Ok(Some(file))
+}
 
-    let new_file_created = new_file.is_some();
-
-    if let Some(new_file) = new_file {
-        reject_reserved_existing_file(new_file, disk_path).inspect_err(|_| {
-            // We keep the error from `reject_reserved_existing_file`
-            fs::remove_file(disk_path).ok();
-        })?;
-
-        fs::remove_file(disk_path).map_err(|err| CheckoutError::Other {
-            message: format!("Failed to remove temporary file {}", disk_path.display()),
-            err: err.into(),
-        })?;
-    } else {
-        reject_reserved_existing_path(disk_path)?;
+/// Handles the error `err` of a checkout's create of a new entry at
+/// `disk_path`: returns `Ok(())` if an entry is already there, so that the
+/// path is skipped, and an error if none is or if the entry may point to a
+/// ".git" or ".jj" entry.
+fn reject_existing_entry(disk_path: &Path, err: io::Error) -> Result<(), CheckoutError> {
+    if err.kind() != io::ErrorKind::AlreadyExists {
+        // Workaround for "Access is denied. (os error 5)" error on Windows.
+        disk_path
+            .symlink_metadata()
+            .map_err(|err| CheckoutError::Other {
+                message: format!("Failed to stat {}", disk_path.display()),
+                err: err.into(),
+            })?;
     }
-    Ok(new_file_created)
+    reject_reserved_existing_path(disk_path)
 }
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
@@ -841,7 +856,7 @@ fn file_identity_from_symlink_path(disk_path: &Path) -> io::Result<Option<FileId
 /// file descriptor.
 ///
 /// See [`reject_reserved_existing_file_identity`] for more info.
-fn reject_reserved_existing_file(file: File, disk_path: &Path) -> Result<(), CheckoutError> {
+fn reject_reserved_existing_file(file: &File, disk_path: &Path) -> Result<(), CheckoutError> {
     // Note: since the file is open, we don't expect that it's possible for
     // `io::ErrorKind::NotFound` to be a possible error returned here.
     let file_identity = FileIdentity::from_file(file).map_err(|err| CheckoutError::Other {
@@ -985,6 +1000,8 @@ pub struct TreeStateSettings {
     /// The fsmonitor (e.g. Watchman) to use, if any.
     pub fsmonitor_settings: FsmonitorSettings,
     pub filter_settings: FilterSettings,
+    /// The number of threads that a checkout reads and writes files on.
+    pub checkout_threads: NonZeroUsize,
 }
 
 impl TreeStateSettings {
@@ -996,8 +1013,19 @@ impl TreeStateSettings {
             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
             filter_settings: FilterSettings::try_from_settings(user_settings)?,
+            checkout_threads: user_settings
+                .get("working-copy.checkout-threads")
+                .optional()?
+                .unwrap_or_else(default_checkout_threads),
         })
     }
+}
+
+/// The number of threads that a checkout reads and writes files on when
+/// `working-copy.checkout-threads` is unset: the number of CPUs that the
+/// process may use, or 1 if that is unknown.
+pub fn default_checkout_threads() -> NonZeroUsize {
+    thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 pub struct TreeState {
@@ -1021,6 +1049,11 @@ pub struct TreeState {
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
     filter_strategy: FilterStrategy,
+    checkout_threads: NonZeroUsize,
+    /// The bound on the bytes of file contents that a checkout holds read and
+    /// not yet written, unless one file is larger.
+    max_bytes_in_flight: u64,
+    last_checkout_measures: CheckoutMeasures,
 }
 
 #[derive(Debug, Error)]
@@ -1095,6 +1128,7 @@ impl TreeState {
             exec_change_setting,
             fsmonitor_settings,
             filter_settings,
+            checkout_threads,
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
@@ -1113,6 +1147,9 @@ impl TreeState {
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
             filter_strategy: FilterStrategy::new(working_copy_path, filter_settings.clone()),
+            checkout_threads: *checkout_threads,
+            max_bytes_in_flight: DEFAULT_MAX_BYTES_IN_FLIGHT,
+            last_checkout_measures: CheckoutMeasures::default(),
         }
     }
 
@@ -2223,164 +2260,9 @@ fn snapshot_error_for_mtime_out_of_range(err: MtimeOutOfRange, path: &Path) -> S
 
 /// Functions to update local-disk files from the store.
 impl TreeState {
-    #[expect(clippy::too_many_arguments)]
-    async fn write_file(
-        &self,
-        repo_path: &RepoPath,
-        disk_path: &Path,
-        contents: impl AsyncRead + Send + Unpin,
-        exec_bit: ExecBit,
-        apply_conversion: bool,
-        git_attributes: &GitAttributes,
-        stats: &mut CheckoutStats,
-    ) -> Result<FileState, CheckoutError> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
-            .open(disk_path)
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to open file {} for writing", disk_path.display()),
-                err: err.into(),
-            })?;
-        let contents = if apply_conversion {
-            let file = self
-                .target_eol_strategy
-                .convert_eol_for_update(contents)
-                .await
-                .map_err(|err| CheckoutError::Other {
-                    message: "Failed to convert the EOL for the content".to_string(),
-                    err: err.into(),
-                })?;
-            let (contents, ignore_reason) = self
-                .filter_strategy
-                .convert_to_working_copy(file, repo_path, git_attributes)
-                .await
-                .map_err(|err| CheckoutError::Other {
-                    message: "Failed to use the filter to convert the contents.".to_string(),
-                    err,
-                })?;
-            if let Some(reason @ FilterIgnoreReason::FilterCommandFailed { .. }) = ignore_reason {
-                stats.unconverted_paths.insert(repo_path.to_owned(), reason);
-            }
-            contents
-        } else {
-            Box::new(contents)
-        };
-        let size = copy_async_to_sync(contents, &mut file)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!(
-                    "Failed to write the content to the file {}",
-                    disk_path.display()
-                ),
-                err: err.into(),
-            })?;
-        set_executable(exec_bit, disk_path)
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        // Read the file state from the file descriptor. That way, know that the file
-        // exists and is of the expected type, and the stat information is most likely
-        // accurate, except for other processes modifying the file concurrently (The
-        // mtime is set at write time and won't change when we close the file.)
-        let metadata = file
-            .metadata()
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_file(exec_bit, size as u64, &metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
-    }
-
-    fn write_symlink(&self, disk_path: &Path, target: String) -> Result<FileState, CheckoutError> {
-        let target = symlink_target_convert_to_disk(&target);
-
-        if cfg!(windows) {
-            // On Windows, "/" can't be part of valid file name, and "/" is also not a valid
-            // separator for the symlink target. See an example of this issue in
-            // https://github.com/jj-vcs/jj/issues/6934.
-            //
-            // We use debug_assert_* instead of assert_* because we want to avoid panic in
-            // release build, and we are sure that we shouldn't create invalid symlinks in
-            // tests.
-            debug_assert_ne!(
-                target.as_os_str().to_str().map(|path| path.contains('/')),
-                Some(true),
-                r#"Expect the symlink target doesn't contain "/", but got invalid symlink target: {}."#,
-                target.display()
-            );
-        }
-
-        // On Windows, this will create a nonfunctional link for directories,
-        // but at the moment we don't have enough information in the tree to
-        // determine whether the symlink target is a file or a directory.
-        symlink_file(&target, disk_path).map_err(|err| CheckoutError::Other {
-            message: format!(
-                "Failed to create symlink from {} to {}",
-                disk_path.display(),
-                target.display()
-            ),
-            err: err.into(),
-        })?;
-        let metadata = disk_path
-            .symlink_metadata()
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_symlink(&metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
-    }
-
-    async fn write_conflict(
-        &self,
-        repo_path: &RepoPath,
-        disk_path: &Path,
-        contents: &[u8],
-        exec_bit: ExecBit,
-        git_attributes: &GitAttributes,
-        stats: &mut CheckoutStats,
-    ) -> Result<FileState, CheckoutError> {
-        let contents = self
-            .target_eol_strategy
-            .convert_eol_for_update(contents)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: "Failed to convert the EOL when writing a merge conflict".to_string(),
-                err: err.into(),
-            })?;
-        let (contents, ignore_reason) = self
-            .filter_strategy
-            .convert_to_working_copy(contents, repo_path, git_attributes)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: "Failed to use the filter to convert the contents.".to_string(),
-                err,
-            })?;
-        if let Some(reason @ FilterIgnoreReason::FilterCommandFailed { .. }) = ignore_reason {
-            stats.unconverted_paths.insert(repo_path.to_owned(), reason);
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
-            .open(disk_path)
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to open file {} for writing", disk_path.display()),
-                err: err.into(),
-            })?;
-        let size = copy_async_to_sync(contents, &mut file)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to write conflict to file {}", disk_path.display()),
-                err: err.into(),
-            })? as u64;
-        set_executable(exec_bit, disk_path)
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        let metadata = file
-            .metadata()
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_file(exec_bit, size, &metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
-    }
-
     pub fn check_out(&mut self, new_tree: &MergedTree) -> Result<CheckoutStats, CheckoutError> {
         let old_tree = self.tree.clone();
-        let stats = self
-            .update(&old_tree, new_tree, self.sparse_matcher().as_ref())
-            .block_on()?;
+        let stats = self.update(&old_tree, new_tree, self.sparse_matcher().as_ref())?;
         self.tree = new_tree.clone();
         Ok(stats)
     }
@@ -2395,10 +2277,8 @@ impl TreeState {
         let added_matcher = DifferenceMatcher::new(&new_matcher, &old_matcher);
         let removed_matcher = DifferenceMatcher::new(&old_matcher, &new_matcher);
         let empty_tree = self.store.empty_merged_tree();
-        let added_stats = self.update(&empty_tree, &tree, &added_matcher).block_on()?;
-        let removed_stats = self
-            .update(&tree, &empty_tree, &removed_matcher)
-            .block_on()?;
+        let added_stats = self.update(&empty_tree, &tree, &added_matcher)?;
+        let removed_stats = self.update(&tree, &empty_tree, &removed_matcher)?;
         self.sparse_patterns = sparse_patterns;
         assert_eq!(added_stats.updated_files, 0);
         assert_eq!(added_stats.removed_files, 0);
@@ -2414,277 +2294,46 @@ impl TreeState {
         })
     }
 
-    async fn update(
+    /// Sets the bound on the bytes of file contents that a checkout holds read
+    /// and not yet written, in place of the default of 256 MiB. For tests.
+    #[doc(hidden)]
+    pub fn set_max_bytes_in_flight(&mut self, bytes: u64) {
+        self.max_bytes_in_flight = bytes;
+    }
+
+    /// What the last checkout measured of its threads and its bytes in flight.
+    /// For tests.
+    #[doc(hidden)]
+    pub fn last_checkout_measures(&self) -> CheckoutMeasures {
+        self.last_checkout_measures
+    }
+
+    /// Writes the changes from `old_tree` to `new_tree` that `matcher` matches
+    /// to the working copy.
+    ///
+    /// This thread walks the diff in path order ([`CheckoutCoordinator`]): it
+    /// removes old files and directories, creates directories and submodule
+    /// directories, and queues each file, symlink and conflict to write. Up to
+    /// `checkout_threads` worker threads read the queued contents from the
+    /// store and write them ([`CheckoutContext::run_worker()`]). The file
+    /// states are merged in the order of the diff.
+    fn update(
         &mut self,
         old_tree: &MergedTree,
         new_tree: &MergedTree,
         matcher: &dyn Matcher,
     ) -> Result<CheckoutStats, CheckoutError> {
-        // TODO: maybe it's better not include the skipped counts in the "intended"
-        // counts
-        let mut stats = CheckoutStats {
-            updated_files: 0,
-            added_files: 0,
-            removed_files: 0,
-            skipped_files: 0,
-            unconverted_paths: BTreeMap::new(),
-        };
-        let mut changed_file_states = Vec::new();
-        let mut deleted_files = HashSet::new();
         let git_attributes = GitAttributes::new(vec![
             Arc::new(TreeFileLoader::new(new_tree.clone())),
             Arc::new(TreeFileLoader::new(old_tree.clone())),
         ]);
-        let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
-
-        let mut process_diff_entry = async |path: RepoPathBuf,
-                                            before: MergedTreeValue,
-                                            after: MaterializedTreeValue|
-               -> Result<(), CheckoutError> {
-            if after.is_absent() {
-                stats.removed_files += 1;
-            } else if before.is_absent() {
-                stats.added_files += 1;
-            } else {
-                stats.updated_files += 1;
-            }
-
-            // Existing Git submodule can be a non-empty directory on disk. We
-            // shouldn't attempt to manage it as a tracked path.
-            //
-            // TODO: It might be better to add general support for paths not
-            // tracked by jj than processing submodules specially. For example,
-            // paths excluded by .gitignore can be marked as such so that
-            // newly-"unignored" paths won't be snapshotted automatically.
-            if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
-                && matches!(after, MaterializedTreeValue::GitSubmodule(_))
-            {
-                eprintln!("ignoring git submodule at {path:?}");
-                // Not updating the file state as if there were no diffs. Leave
-                // the state type as FileType::GitSubmodule if it was before.
-                return Ok(());
-            }
-
-            // This path and the previous one we did work for may have a common prefix. We
-            // can adjust the "working copy" path to the parent directory which we know
-            // is already created. If there is no common prefix, this will by default use
-            // RepoPath::root() as the common prefix.
-            let (common_prefix, adjusted_diff_file_path) =
-                path.split_common_prefix(&prev_created_path);
-
-            let disk_path = if adjusted_diff_file_path.is_root() {
-                // The path being "root" here implies that the entire path has already been
-                // created.
-                //
-                // e.g we may have have already processed a path like: "foo/bar/baz" and this is
-                // our `prev_created_path`.
-                //
-                // and the current path is:
-                // "foo/bar"
-                //
-                // This results in a common prefix of "foo/bar" with empty string for the
-                // remainder since its entire prefix has already been created.
-                // This means that we _dont_ need to create its parent dirs
-                // either.
-
-                path.to_fs_path(self.working_copy_path())?
-            } else {
-                let adjusted_working_copy_path =
-                    common_prefix.to_fs_path(self.working_copy_path())?;
-
-                // Create parent directories no matter if after.is_present(). This
-                // ensures that the path never traverses symlinks.
-                let Some(disk_path) =
-                    create_parent_dirs(&adjusted_working_copy_path, adjusted_diff_file_path)?
-                else {
-                    changed_file_states.push((path, FileState::placeholder()));
-                    stats.skipped_files += 1;
-                    return Ok(());
-                };
-
-                // Cache this path for the next iteration. This must occur after
-                // `create_parent_dirs` to ensure that the path is only set when
-                // no symlinks are encountered. Otherwise there could be
-                // opportunity for a filesystem write-what-where attack.
-                prev_created_path = path
-                    .parent()
-                    .map(RepoPath::to_owned)
-                    .expect("diff path has no parent");
-
-                disk_path
-            };
-
-            // If the path was present, check reserved path first and delete it.
-            let present_file_deleted = before.is_present()
-                && if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) {
-                    remove_old_submodule_dir(&disk_path)?
-                } else {
-                    remove_old_file(&disk_path)?
-                };
-
-            // If not, create temporary file to test the path validity.
-            if !present_file_deleted && !can_create_new_file(&disk_path)? {
-                if matches!(after, MaterializedTreeValue::GitSubmodule(_)) && disk_path.is_dir() {
-                    // Failing to materialize submodule, over a directory which
-                    // is presumably the submodule before it was added in a
-                    // commit, is not an error.
-                    // Falling through to the "after" state code, to set the
-                    // correct file state.
-                } else if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
-                    && after.is_absent()
-                {
-                    // Failing to delete un-tracked submodule directory is not
-                    // an error, as the, possibly untracked, contents would
-                    // otherwise be lost.
-                    // Falling through to the "after" state code in case there
-                    // are parents to be deleted.
-                } else {
-                    changed_file_states.push((path, FileState::placeholder()));
-                    stats.skipped_files += 1;
-                    return Ok(());
-                }
-            }
-
-            // We get the previous executable bit from the file states and not
-            // the tree value because only the file states store the on-disk
-            // executable bit.
-            let get_prev_exec = || self.file_states().get_exec_bit(&path);
-
-            // TODO: Check that the file has not changed before overwriting/removing it.
-            let file_state = match after {
-                MaterializedTreeValue::Absent | MaterializedTreeValue::AccessDenied(_) => {
-                    // Reset the previous path to avoid scenarios where this path is deleted,
-                    // then on the next iteration recreation is skipped because of this
-                    // optimization.
-                    prev_created_path = RepoPathBuf::root();
-
-                    let mut parent_dir = disk_path.parent().unwrap();
-                    loop {
-                        if fs::remove_dir(parent_dir).is_err() {
-                            break;
-                        }
-
-                        parent_dir = parent_dir.parent().unwrap();
-                    }
-                    deleted_files.insert(path);
-                    return Ok(());
-                }
-                MaterializedTreeValue::File(file) => {
-                    let exec_bit =
-                        ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
-                    self.write_file(
-                        &path,
-                        &disk_path,
-                        file.reader,
-                        exec_bit,
-                        true,
-                        &git_attributes,
-                        &mut stats,
-                    )
-                    .await?
-                }
-                MaterializedTreeValue::Symlink { id: _, target } => {
-                    if self.symlink_support {
-                        self.write_symlink(&disk_path, target)?
-                    } else {
-                        // The fake symlink file shouldn't be executable.
-                        self.write_file(
-                            &path,
-                            &disk_path,
-                            target.as_bytes(),
-                            ExecBit(false),
-                            false,
-                            &git_attributes,
-                            &mut stats,
-                        )
-                        .await?
-                    }
-                }
-                MaterializedTreeValue::GitSubmodule(_) => {
-                    eprintln!("ignoring git submodule at {path:?}");
-                    // Git behavior: Create the submodule directory but don't
-                    // populate/overwrite the contents.
-                    match fs::create_dir(&disk_path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(err) => eprintln!(
-                            "warning: failed to create submodule directory {path:?}: {err}"
-                        ),
-                    }
-                    FileState::for_gitsubmodule()
-                }
-                MaterializedTreeValue::Tree(_) => {
-                    panic!("unexpected tree entry in diff at {path:?}");
-                }
-                MaterializedTreeValue::FileConflict(file) => {
-                    let conflict_marker_len =
-                        choose_materialized_conflict_marker_len(&file.contents);
-                    let options = ConflictMaterializeOptions {
-                        marker_style: self.conflict_marker_style,
-                        marker_len: Some(conflict_marker_len),
-                        merge: self.store.merge_options().clone(),
-                    };
-                    let exec_bit = ExecBit::new_from_repo(
-                        file.executable.unwrap_or(false),
-                        self.exec_policy,
-                        get_prev_exec,
-                    );
-                    let contents =
-                        materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
-                    let mut file_state = self
-                        .write_conflict(
-                            &path,
-                            &disk_path,
-                            &contents,
-                            exec_bit,
-                            &git_attributes,
-                            &mut stats,
-                        )
-                        .await?;
-                    file_state.materialized_conflict_data = Some(MaterializedConflictData {
-                        conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
-                    });
-                    file_state
-                }
-                MaterializedTreeValue::OtherConflict { id, labels } => {
-                    // Unless all terms are regular files, we can't do much
-                    // better than trying to describe the merge.
-                    let contents = id.describe(&labels);
-                    // Since this is a dummy file, it shouldn't be executable.
-                    self.write_conflict(
-                        &path,
-                        &disk_path,
-                        contents.as_bytes(),
-                        ExecBit(false),
-                        &git_attributes,
-                        &mut stats,
-                    )
-                    .await?
-                }
-            };
-            changed_file_states.push((path, file_state));
-            Ok(())
-        };
-
-        let mut diff_stream = old_tree
-            .diff_stream_for_file_system(new_tree, matcher)
-            .map(async |TreeDiffEntry { path, values }| match values {
-                Ok(diff) => {
-                    let result =
-                        materialize_tree_value(&self.store, &path, diff.after, new_tree.labels())
-                            .await;
-                    (path, result.map(|value| (diff.before, value)))
-                }
-                Err(err) => (path, Err(err)),
-            })
-            .buffered(self.store.concurrency());
 
         // If a conflicted file didn't change between the two trees, but the conflict
         // labels did, we still need to re-materialize it in the working copy. We don't
         // need to do this if the conflicts have different numbers of sides though since
         // these conflicts are considered different, so they will be materialized by
         // `MergedTree::diff_stream_for_file_system` already.
-        let mut conflicts_to_rematerialize: HashMap<RepoPathBuf, MergedTreeValue> =
+        let conflicts_to_rematerialize: HashMap<RepoPathBuf, MergedTreeValue> =
             if old_tree.tree_ids().num_sides() == new_tree.tree_ids().num_sides()
                 && old_tree.labels() != new_tree.labels()
             {
@@ -2699,20 +2348,40 @@ impl TreeState {
                 HashMap::new()
             };
 
-        while let Some((path, data)) = diff_stream.next().await {
-            let (before, after) = data?;
-            conflicts_to_rematerialize.remove(&path);
-            process_diff_entry(path, before, after).await?;
-        }
-
-        if !conflicts_to_rematerialize.is_empty() {
-            for (path, conflict) in conflicts_to_rematerialize {
-                let materialized =
-                    materialize_tree_value(&self.store, &path, conflict.clone(), new_tree.labels())
-                        .await?;
-                process_diff_entry(path, conflict, materialized).await?;
-            }
-
+        let output = {
+            let (job_sender, job_receiver) = channel();
+            let (result_sender, result_receiver) = channel();
+            let context = CheckoutContext {
+                tree_state: &*self,
+                labels: new_tree.labels(),
+                git_attributes: &git_attributes,
+                jobs: Mutex::new(job_receiver),
+                bytes_in_flight: BytesInFlight::new(self.max_bytes_in_flight),
+                aborted: AtomicBool::new(false),
+                first_error: Mutex::new(None),
+                writers: AtomicUsize::new(0),
+            };
+            thread::scope(|scope| {
+                let mut coordinator = CheckoutCoordinator::new(
+                    &context,
+                    scope,
+                    job_sender,
+                    result_sender,
+                    result_receiver,
+                );
+                let walked =
+                    coordinator.walk(old_tree, new_tree, matcher, conflicts_to_rematerialize);
+                coordinator.finish(walked)
+            })
+        }?;
+        let CheckoutOutput {
+            stats,
+            mut changed_file_states,
+            deleted_files,
+            sort,
+            measures,
+        } = output;
+        if sort {
             // We need to re-sort the changed file states since we may have inserted a
             // conflicted file out of order.
             changed_file_states.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
@@ -2726,6 +2395,7 @@ impl TreeState {
             // report them as changed.
             self.watchman_clock = None;
         }
+        self.last_checkout_measures = measures;
         Ok(stats)
     }
 
@@ -2799,6 +2469,1163 @@ impl TreeState {
         self.tree = self.store.empty_merged_tree();
         self.reset(new_tree).await
     }
+}
+
+/// The bound on the bytes of file contents that a checkout holds read and not
+/// yet written, unless one file is larger.
+const DEFAULT_MAX_BYTES_IN_FLIGHT: u64 = 256 << 20;
+
+/// The most bytes that a checkout writes to a new file with one `write` call:
+/// a file whose contents are no larger goes in with one call.
+const MAX_CONTENTS_WRITE: usize = 8 << 20;
+
+/// The size that a checkout worker's buffer for contents starts at.
+const MIN_CONTENTS_BUF: usize = 64 << 10;
+
+/// The jobs that a checkout's coordinating thread keeps queued or running for
+/// each worker thread before it waits for one to finish.
+const QUEUED_JOBS_PER_THREAD: usize = 16;
+
+/// What a checkout measured of its threads and of its bytes in flight, for
+/// tests ([`TreeState::last_checkout_measures()`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CheckoutMeasures {
+    /// The worker threads that the checkout started.
+    pub threads: usize,
+    /// The worker threads that wrote at least one file, symlink or conflict.
+    pub writers: usize,
+    /// The most bytes of file contents that were read and not yet written at
+    /// one time.
+    pub peak_bytes_in_flight: u64,
+}
+
+/// The bytes of file contents that a checkout's workers have read and not yet
+/// written, under a bound. A worker reserves the bytes of a file before it
+/// reads it and gives them back once the file is written. Reservations are
+/// granted in the order they are asked for, each once its bytes fit under the
+/// bound or, for a file larger than the bound, once nothing else is in flight.
+/// So the bytes in flight never pass the bound or the largest file, whichever
+/// is larger.
+struct BytesInFlight {
+    limit: u64,
+    state: Mutex<BytesInFlightState>,
+    changed: Condvar,
+}
+
+struct BytesInFlightState {
+    in_flight: u64,
+    peak: u64,
+    /// The ticket that the next reservation takes.
+    next_ticket: u64,
+    /// The ticket of the reservation that is granted next.
+    next_grant: u64,
+    /// Set when the checkout stops: the reservations that wait give up.
+    closed: bool,
+}
+
+impl BytesInFlight {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            state: Mutex::new(BytesInFlightState {
+                in_flight: 0,
+                peak: 0,
+                next_ticket: 0,
+                next_grant: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BytesInFlightState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits until `bytes` may be in flight and reserves them. Returns `None`
+    /// if the checkout stopped meanwhile.
+    fn reserve(&self, bytes: u64) -> Option<BytesReservation<'_>> {
+        let mut state = self.lock();
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        while !state.closed
+            && (state.next_grant != ticket
+                || state.in_flight != 0 && state.in_flight.saturating_add(bytes) > self.limit)
+        {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if state.closed {
+            return None;
+        }
+        state.next_grant += 1;
+        state.in_flight += bytes;
+        state.peak = state.peak.max(state.in_flight);
+        drop(state);
+        // The next reservation may fit as well.
+        self.changed.notify_all();
+        Some(BytesReservation {
+            bytes_in_flight: self,
+            bytes,
+        })
+    }
+
+    /// Makes every reservation that waits, and every later one, give up.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    fn peak(&self) -> u64 {
+        self.lock().peak
+    }
+}
+
+/// Bytes reserved in [`BytesInFlight`], given back when this drops.
+struct BytesReservation<'a> {
+    bytes_in_flight: &'a BytesInFlight,
+    bytes: u64,
+}
+
+impl Drop for BytesReservation<'_> {
+    fn drop(&mut self) {
+        self.bytes_in_flight.lock().in_flight -= self.bytes;
+        self.bytes_in_flight.changed.notify_all();
+    }
+}
+
+/// A file, symlink or conflict that a checkout's coordinating thread queues
+/// for a worker thread to read and write.
+struct CheckoutJob {
+    /// The job's slot in [`CheckoutCoordinator::slots`].
+    index: usize,
+    path: RepoPathBuf,
+    disk_path: PathBuf,
+    /// The path's value in the new tree.
+    value: MergedTreeValue,
+    /// Whether the checkout has just removed the old file at the path.
+    old_file_removed: bool,
+}
+
+/// What a worker sends back for each job that it takes.
+struct CheckoutResult {
+    index: usize,
+    /// `None` if the job failed, or did not run because the checkout stopped.
+    outcome: Option<JobOutcome>,
+}
+
+struct JobOutcome {
+    path: RepoPathBuf,
+    outcome: CheckoutOutcome,
+    /// The reason why the smudge filter left the contents as they were, if
+    /// its command failed.
+    unconverted: Option<FilterIgnoreReason>,
+}
+
+/// What a checkout did with one path.
+enum CheckoutOutcome {
+    /// The path was written, and has this state.
+    Written(FileState),
+    /// An entry was already at the path, or its parent is not a directory: the
+    /// path is left as it is, with a placeholder state.
+    Skipped,
+    /// The store refused to read the contents: the path at this disk path is
+    /// treated as removed.
+    AccessDenied(PathBuf),
+}
+
+enum CheckoutSlot {
+    /// Queued for a worker, whose result has not come back.
+    Queued,
+    Done(RepoPathBuf, CheckoutOutcome),
+}
+
+struct CheckoutOutput {
+    stats: CheckoutStats,
+    changed_file_states: Vec<(RepoPathBuf, FileState)>,
+    deleted_files: HashSet<RepoPathBuf>,
+    /// Whether `changed_file_states` is out of path order.
+    sort: bool,
+    measures: CheckoutMeasures,
+}
+
+/// What the threads of one checkout share.
+struct CheckoutContext<'a> {
+    tree_state: &'a TreeState,
+    /// The conflict labels of the new tree.
+    labels: &'a ConflictLabels,
+    git_attributes: &'a GitAttributes,
+    /// The queue of jobs: each worker takes the next one.
+    jobs: Mutex<Receiver<CheckoutJob>>,
+    bytes_in_flight: BytesInFlight,
+    aborted: AtomicBool,
+    first_error: Mutex<Option<CheckoutError>>,
+    /// The workers that wrote at least one path.
+    writers: AtomicUsize,
+}
+
+impl CheckoutContext<'_> {
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Stops the checkout: the coordinating thread queues nothing more, and
+    /// the workers skip the jobs left in the queue.
+    fn abort(&self) {
+        self.aborted.store(true, AtomicOrdering::Relaxed);
+        self.bytes_in_flight.close();
+    }
+
+    /// Keeps `err` if it is the checkout's first error, and stops the checkout.
+    fn fail(&self, err: CheckoutError) {
+        self.first_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(err);
+        self.abort();
+    }
+
+    /// The loop of one worker thread: it takes jobs from the queue until the
+    /// queue closes, and sends a result for each.
+    fn run_worker(&self, results: &Sender<CheckoutResult>) {
+        let mut buf = Vec::new();
+        let mut wrote = false;
+        loop {
+            let job = self
+                .jobs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+            let Ok(job) = job else {
+                break;
+            };
+            let index = job.index;
+            let _panic_guard = ResultOnPanic {
+                context: self,
+                results,
+                index,
+            };
+            let outcome = if self.is_aborted() {
+                None
+            } else {
+                match self.check_out_job(job, &mut buf).block_on() {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.fail(err);
+                        None
+                    }
+                }
+            };
+            wrote |= matches!(
+                outcome,
+                Some(JobOutcome {
+                    outcome: CheckoutOutcome::Written(_),
+                    ..
+                })
+            );
+            results.send(CheckoutResult { index, outcome }).ok();
+        }
+        if wrote {
+            self.writers.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Reads the contents of one queued path from the store and writes them.
+    /// Returns `None` if the checkout stopped while the job waited.
+    async fn check_out_job(
+        &self,
+        job: CheckoutJob,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<JobOutcome>, CheckoutError> {
+        let CheckoutJob {
+            index: _,
+            path,
+            disk_path,
+            value,
+            old_file_removed,
+        } = job;
+        let tree_state = self.tree_state;
+        let store = &tree_state.store;
+        // Reserve the bytes that the read brings into memory before reading. A
+        // backend that cannot tell them reserves the whole bound, so that its
+        // files are read one at a time.
+        let size = contents_size(store, &path, &value).await?;
+        let reserved_bytes = size.unwrap_or(self.bytes_in_flight.limit);
+        let _reservation = if reserved_bytes == 0 {
+            None
+        } else {
+            let Some(reservation) = self.bytes_in_flight.reserve(reserved_bytes) else {
+                return Ok(None);
+            };
+            Some(reservation)
+        };
+        let size_hint = size.unwrap_or(0);
+        // We get the previous executable bit from the file states and not
+        // the tree value because only the file states store the on-disk
+        // executable bit.
+        let get_prev_exec = || tree_state.file_states().get_exec_bit(&path);
+        let (outcome, unconverted) = match materialize_tree_value(store, &path, value, self.labels)
+            .await?
+        {
+            MaterializedTreeValue::AccessDenied(_) => {
+                (CheckoutOutcome::AccessDenied(disk_path), None)
+            }
+            MaterializedTreeValue::File(file) => {
+                let exec_bit =
+                    ExecBit::new_from_repo(file.executable, tree_state.exec_policy, get_prev_exec);
+                self.write_file(
+                    &path,
+                    &disk_path,
+                    file.reader,
+                    exec_bit,
+                    true,
+                    old_file_removed,
+                    size_hint,
+                    buf,
+                )
+                .await?
+            }
+            MaterializedTreeValue::Symlink { id: _, target } => {
+                if tree_state.symlink_support {
+                    (write_symlink(&disk_path, &target, old_file_removed)?, None)
+                } else {
+                    // The fake symlink file shouldn't be executable.
+                    self.write_file(
+                        &path,
+                        &disk_path,
+                        target.as_bytes(),
+                        ExecBit(false),
+                        false,
+                        old_file_removed,
+                        size_hint,
+                        buf,
+                    )
+                    .await?
+                }
+            }
+            MaterializedTreeValue::FileConflict(file) => {
+                let conflict_marker_len = choose_materialized_conflict_marker_len(&file.contents);
+                let options = ConflictMaterializeOptions {
+                    marker_style: tree_state.conflict_marker_style,
+                    marker_len: Some(conflict_marker_len),
+                    merge: store.merge_options().clone(),
+                };
+                let exec_bit = ExecBit::new_from_repo(
+                    file.executable.unwrap_or(false),
+                    tree_state.exec_policy,
+                    get_prev_exec,
+                );
+                let contents =
+                    materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
+                let (mut outcome, unconverted) = self
+                    .write_conflict(
+                        &path,
+                        &disk_path,
+                        &contents,
+                        exec_bit,
+                        old_file_removed,
+                        buf,
+                    )
+                    .await?;
+                if let CheckoutOutcome::Written(file_state) = &mut outcome {
+                    file_state.materialized_conflict_data = Some(MaterializedConflictData {
+                        conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
+                    });
+                }
+                (outcome, unconverted)
+            }
+            MaterializedTreeValue::OtherConflict { id, labels } => {
+                // Unless all terms are regular files, we can't do much
+                // better than trying to describe the merge.
+                let contents = id.describe(&labels);
+                // Since this is a dummy file, it shouldn't be executable.
+                self.write_conflict(
+                    &path,
+                    &disk_path,
+                    contents.as_bytes(),
+                    ExecBit(false),
+                    old_file_removed,
+                    buf,
+                )
+                .await?
+            }
+            MaterializedTreeValue::Absent
+            | MaterializedTreeValue::GitSubmodule(_)
+            | MaterializedTreeValue::Tree(_) => {
+                unreachable!("the coordinating thread checks out {path:?}")
+            }
+        };
+        Ok(Some(JobOutcome {
+            path,
+            outcome,
+            unconverted,
+        }))
+    }
+
+    /// Writes a file that the checkout creates new, with `contents` converted
+    /// for the working copy if `apply_conversion`. `size_hint` is the size
+    /// that the contents are expected to have.
+    #[expect(clippy::too_many_arguments)]
+    async fn write_file(
+        &self,
+        repo_path: &RepoPath,
+        disk_path: &Path,
+        contents: impl AsyncRead + Send + Unpin,
+        exec_bit: ExecBit,
+        apply_conversion: bool,
+        old_file_removed: bool,
+        size_hint: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<(CheckoutOutcome, Option<FilterIgnoreReason>), CheckoutError> {
+        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed)? else {
+            return Ok((CheckoutOutcome::Skipped, None));
+        };
+        let (contents, unconverted) = if apply_conversion {
+            let contents = self
+                .tree_state
+                .target_eol_strategy
+                .convert_eol_for_update(contents)
+                .await
+                .map_err(|err| CheckoutError::Other {
+                    message: "Failed to convert the EOL for the content".to_string(),
+                    err: err.into(),
+                })?;
+            self.convert_to_working_copy(contents, repo_path).await?
+        } else {
+            (
+                Box::new(contents) as Box<dyn AsyncRead + Send + Unpin>,
+                None,
+            )
+        };
+        let size = write_contents(contents, size_hint, buf, &mut file)
+            .await
+            .map_err(|err| CheckoutError::Other {
+                message: format!(
+                    "Failed to write the content to the file {}",
+                    disk_path.display()
+                ),
+                err: err.into(),
+            })?;
+        let file_state = new_file_state(&file, exec_bit, size, disk_path)?;
+        Ok((CheckoutOutcome::Written(file_state), unconverted))
+    }
+
+    /// Writes the file of a conflict that the checkout creates new.
+    async fn write_conflict(
+        &self,
+        repo_path: &RepoPath,
+        disk_path: &Path,
+        contents: &[u8],
+        exec_bit: ExecBit,
+        old_file_removed: bool,
+        buf: &mut Vec<u8>,
+    ) -> Result<(CheckoutOutcome, Option<FilterIgnoreReason>), CheckoutError> {
+        let Some(mut file) = create_new_file(disk_path, exec_bit, old_file_removed)? else {
+            return Ok((CheckoutOutcome::Skipped, None));
+        };
+        let size_hint = contents.len() as u64;
+        let contents = self
+            .tree_state
+            .target_eol_strategy
+            .convert_eol_for_update(contents)
+            .await
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to convert the EOL when writing a merge conflict".to_string(),
+                err: err.into(),
+            })?;
+        let (contents, unconverted) = self.convert_to_working_copy(contents, repo_path).await?;
+        let size = write_contents(contents, size_hint, buf, &mut file)
+            .await
+            .map_err(|err| CheckoutError::Other {
+                message: format!("Failed to write conflict to file {}", disk_path.display()),
+                err: err.into(),
+            })?;
+        let file_state = new_file_state(&file, exec_bit, size, disk_path)?;
+        Ok((CheckoutOutcome::Written(file_state), unconverted))
+    }
+
+    /// Runs the smudge filter that the gitattributes name for `repo_path` on
+    /// `contents`. Returns the reason why the contents are left as they were if
+    /// the filter command failed.
+    async fn convert_to_working_copy<'c>(
+        &self,
+        contents: Box<dyn AsyncRead + Send + Unpin + 'c>,
+        repo_path: &RepoPath,
+    ) -> Result<
+        (
+            Box<dyn AsyncRead + Send + Unpin + 'c>,
+            Option<FilterIgnoreReason>,
+        ),
+        CheckoutError,
+    > {
+        let (contents, ignore_reason) = self
+            .tree_state
+            .filter_strategy
+            .convert_to_working_copy(contents, repo_path, self.git_attributes)
+            .await
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to use the filter to convert the contents.".to_string(),
+                err,
+            })?;
+        let unconverted = ignore_reason
+            .filter(|reason| matches!(reason, FilterIgnoreReason::FilterCommandFailed { .. }));
+        Ok((contents, unconverted))
+    }
+}
+
+/// Sends the result of a worker's job if the worker panics on it, so that the
+/// coordinating thread does not wait for the result forever.
+struct ResultOnPanic<'a> {
+    context: &'a CheckoutContext<'a>,
+    results: &'a Sender<CheckoutResult>,
+    index: usize,
+}
+
+impl Drop for ResultOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.context.abort();
+            let result = CheckoutResult {
+                index: self.index,
+                outcome: None,
+            };
+            self.results.send(result).ok();
+        }
+    }
+}
+
+/// The coordinating thread of one checkout. It walks the diff in path order,
+/// and for each path:
+///
+/// - creates the parent directories, never through a symlink, as
+///   [`create_parent_dirs()`] does;
+/// - removes the old file or submodule directory;
+/// - for a path that the new tree removes, removes the parent directories
+///   that this leaves empty;
+/// - creates the directory of a submodule;
+/// - and queues a file, symlink or conflict for the workers, which read its
+///   contents from the store and write it.
+///
+/// Workers create no directories, and remove nothing but a file they just
+/// created and must refuse. A directory that holds a queued path is never
+/// removed, since it is not empty once the path is written; this thread
+/// removes only directories that it found empty, as the checkout one path at a
+/// time would. So no removal runs under a worker that writes into the same
+/// directory.
+struct CheckoutCoordinator<'scope, 'env> {
+    context: &'scope CheckoutContext<'scope>,
+    scope: &'scope thread::Scope<'scope, 'env>,
+    /// `None` once the queue is closed.
+    jobs: Option<Sender<CheckoutJob>>,
+    /// The sender that each new worker gets a clone of; `None` once the queue
+    /// is closed, so that `results` ends when the last worker does.
+    result_sender: Option<Sender<CheckoutResult>>,
+    results: Receiver<CheckoutResult>,
+    threads: usize,
+    spawned: usize,
+    queued: usize,
+    received: usize,
+    /// What happened to each changed path, in the order of the diff.
+    slots: Vec<CheckoutSlot>,
+    deleted_files: HashSet<RepoPathBuf>,
+    stats: CheckoutStats,
+    sort: bool,
+    /// The parent of the last path whose parent directories were created.
+    prev_created_path: RepoPathBuf,
+    /// The directories that hold a queued path.
+    queued_dirs: HashSet<RepoPathBuf>,
+    /// The path queued last.
+    last_queued: RepoPathBuf,
+}
+
+impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
+    fn new(
+        context: &'scope CheckoutContext<'scope>,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        jobs: Sender<CheckoutJob>,
+        result_sender: Sender<CheckoutResult>,
+        results: Receiver<CheckoutResult>,
+    ) -> Self {
+        Self {
+            context,
+            scope,
+            jobs: Some(jobs),
+            result_sender: Some(result_sender),
+            results,
+            threads: context.tree_state.checkout_threads.get(),
+            spawned: 0,
+            queued: 0,
+            received: 0,
+            slots: Vec::new(),
+            deleted_files: HashSet::new(),
+            // TODO: maybe it's better not include the skipped counts in the "intended"
+            // counts
+            stats: CheckoutStats {
+                updated_files: 0,
+                added_files: 0,
+                removed_files: 0,
+                skipped_files: 0,
+                unconverted_paths: BTreeMap::new(),
+            },
+            sort: false,
+            prev_created_path: RepoPathBuf::root(),
+            queued_dirs: HashSet::new(),
+            last_queued: RepoPathBuf::root(),
+        }
+    }
+
+    /// Walks the diff from `old_tree` to `new_tree`, then the conflicts to
+    /// rematerialize. Stops at the first error, its own or a worker's.
+    fn walk(
+        &mut self,
+        old_tree: &MergedTree,
+        new_tree: &MergedTree,
+        matcher: &dyn Matcher,
+        mut conflicts_to_rematerialize: HashMap<RepoPathBuf, MergedTreeValue>,
+    ) -> Result<(), CheckoutError> {
+        let mut diff_stream = old_tree.diff_stream_for_file_system(new_tree, matcher);
+        while let Some(TreeDiffEntry { path, values }) = diff_stream.next().block_on() {
+            if self.context.is_aborted() {
+                return Ok(());
+            }
+            let diff = values?;
+            conflicts_to_rematerialize.remove(&path);
+            self.check_out_entry(path, diff.before, diff.after)?;
+        }
+        if !conflicts_to_rematerialize.is_empty() {
+            self.sort = true;
+            // These paths come in no order of the diff's: let the workers
+            // finish the diff's paths first.
+            self.wait_for_workers();
+            let conflicts = conflicts_to_rematerialize
+                .into_iter()
+                .sorted_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
+            for (path, conflict) in conflicts {
+                if self.context.is_aborted() {
+                    return Ok(());
+                }
+                self.check_out_entry(path, conflict.clone(), conflict)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks out one path whose value is `before` in the old tree and `after`
+    /// in the new one.
+    fn check_out_entry(
+        &mut self,
+        path: RepoPathBuf,
+        before: MergedTreeValue,
+        after: MergedTreeValue,
+    ) -> Result<(), CheckoutError> {
+        if after.is_absent() {
+            self.stats.removed_files += 1;
+        } else if before.is_absent() {
+            self.stats.added_files += 1;
+        } else {
+            self.stats.updated_files += 1;
+        }
+
+        // Existing Git submodule can be a non-empty directory on disk. We
+        // shouldn't attempt to manage it as a tracked path.
+        //
+        // TODO: It might be better to add general support for paths not
+        // tracked by jj than processing submodules specially. For example,
+        // paths excluded by .gitignore can be marked as such so that
+        // newly-"unignored" paths won't be snapshotted automatically.
+        let before_is_submodule = matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)));
+        if before_is_submodule && matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            eprintln!("ignoring git submodule at {path:?}");
+            // Not updating the file state as if there were no diffs. Leave
+            // the state type as FileType::GitSubmodule if it was before.
+            return Ok(());
+        }
+
+        // A worker may still be writing the path queued last. Before walking
+        // through that path to one below it (which only a conflicted tree
+        // has), wait for the worker, so that the walk finds what the worker
+        // made there, as if the paths were checked out one after the other.
+        if path
+            .strip_prefix(&self.last_queued)
+            .is_some_and(|rest| !rest.is_root())
+        {
+            self.wait_for_workers();
+        }
+
+        let working_copy_path = self.context.tree_state.working_copy_path();
+        // This path and the previous one we did work for may have a common prefix. We
+        // can adjust the "working copy" path to the parent directory which we know
+        // is already created. If there is no common prefix, this will by default use
+        // RepoPath::root() as the common prefix.
+        let (common_prefix, adjusted_diff_file_path) =
+            path.split_common_prefix(&self.prev_created_path);
+
+        let disk_path = if adjusted_diff_file_path.is_root() {
+            // The path being "root" here implies that the entire path has already been
+            // created.
+            //
+            // e.g we may have have already processed a path like: "foo/bar/baz" and this is
+            // our `prev_created_path`.
+            //
+            // and the current path is:
+            // "foo/bar"
+            //
+            // This results in a common prefix of "foo/bar" with empty string for the
+            // remainder since its entire prefix has already been created.
+            // This means that we _dont_ need to create its parent dirs
+            // either.
+
+            path.to_fs_path(working_copy_path)?
+        } else {
+            let adjusted_working_copy_path = common_prefix.to_fs_path(working_copy_path)?;
+
+            // Create parent directories no matter if after.is_present(). This
+            // ensures that the path never traverses symlinks.
+            let Some(disk_path) =
+                create_parent_dirs(&adjusted_working_copy_path, adjusted_diff_file_path)?
+            else {
+                self.slots
+                    .push(CheckoutSlot::Done(path, CheckoutOutcome::Skipped));
+                return Ok(());
+            };
+
+            // Cache this path for the next iteration. This must occur after
+            // `create_parent_dirs` to ensure that the path is only set when
+            // no symlinks are encountered. Otherwise there could be
+            // opportunity for a filesystem write-what-where attack.
+            self.prev_created_path = path
+                .parent()
+                .map(RepoPath::to_owned)
+                .expect("diff path has no parent");
+
+            disk_path
+        };
+
+        // If the path was present, check reserved path first and delete it.
+        // TODO: Check that the file has not changed before overwriting/removing it.
+        let old_file_removed = before.is_present()
+            && if before_is_submodule {
+                remove_old_submodule_dir(&disk_path)?
+            } else {
+                remove_old_file(&disk_path)?
+            };
+
+        if after.is_absent() {
+            self.remove_path(path, &disk_path, old_file_removed, before_is_submodule)
+        } else if matches!(after.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            self.create_submodule_dir(path, &disk_path, old_file_removed)
+        } else if matches!(after.as_normal(), Some(TreeValue::Tree(_))) {
+            panic!("unexpected tree entry in diff at {path:?}");
+        } else {
+            self.queue(CheckoutJob {
+                index: self.slots.len(),
+                path,
+                disk_path,
+                value: after,
+                old_file_removed,
+            })
+        }
+    }
+
+    /// Finishes the removal of a path that the new tree does not have.
+    fn remove_path(
+        &mut self,
+        path: RepoPathBuf,
+        disk_path: &Path,
+        old_file_removed: bool,
+        before_is_submodule: bool,
+    ) -> Result<(), CheckoutError> {
+        if !old_file_removed {
+            match disk_path.symlink_metadata() {
+                Ok(_) => {
+                    reject_reserved_existing_path(disk_path)?;
+                    if !before_is_submodule {
+                        self.slots
+                            .push(CheckoutSlot::Done(path, CheckoutOutcome::Skipped));
+                        return Ok(());
+                    }
+                    // Failing to delete un-tracked submodule directory is not
+                    // an error, as the, possibly untracked, contents would
+                    // otherwise be lost. Go on in case there are parents to be
+                    // deleted.
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(CheckoutError::Other {
+                        message: format!("Failed to stat {}", disk_path.display()),
+                        err: err.into(),
+                    });
+                }
+            }
+        }
+        // Reset the previous path to avoid scenarios where this path is deleted,
+        // then on the next iteration recreation is skipped because of this
+        // optimization.
+        self.prev_created_path = RepoPathBuf::root();
+        remove_empty_parent_dirs(&path, disk_path, &self.queued_dirs);
+        self.deleted_files.insert(path);
+        Ok(())
+    }
+
+    /// Creates the directory of a submodule that the new tree has. Git
+    /// behavior: Create the submodule directory but don't populate/overwrite
+    /// the contents.
+    fn create_submodule_dir(
+        &mut self,
+        path: RepoPathBuf,
+        disk_path: &Path,
+        old_file_removed: bool,
+    ) -> Result<(), CheckoutError> {
+        if !old_file_removed {
+            match fs::create_dir(disk_path) {
+                Ok(()) => reject_reserved_existing_path(disk_path).inspect_err(|_| {
+                    fs::remove_dir(disk_path).ok();
+                })?,
+                Err(err) => {
+                    reject_existing_entry(disk_path, err)?;
+                    // Failing to materialize submodule, over a directory which
+                    // is presumably the submodule before it was added in a
+                    // commit, is not an error.
+                    if !disk_path.is_dir() {
+                        self.slots
+                            .push(CheckoutSlot::Done(path, CheckoutOutcome::Skipped));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        eprintln!("ignoring git submodule at {path:?}");
+        if old_file_removed {
+            match fs::create_dir(disk_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    eprintln!("warning: failed to create submodule directory {path:?}: {err}");
+                }
+            }
+        }
+        let file_state = FileState::for_gitsubmodule();
+        self.slots.push(CheckoutSlot::Done(
+            path,
+            CheckoutOutcome::Written(file_state),
+        ));
+        Ok(())
+    }
+
+    /// Queues a file, symlink or conflict for a worker.
+    fn queue(&mut self, job: CheckoutJob) -> Result<(), CheckoutError> {
+        for dir in job.path.ancestors().skip(1) {
+            if self.queued_dirs.contains(dir) {
+                break;
+            }
+            self.queued_dirs.insert(dir.to_owned());
+        }
+        let path: &RepoPath = &job.path;
+        path.clone_into(&mut self.last_queued);
+        if self.spawned < self.threads {
+            self.spawn_worker()?;
+        }
+        while self.queued - self.received >= self.threads * QUEUED_JOBS_PER_THREAD
+            && self.receive_result()
+        {}
+        self.slots.push(CheckoutSlot::Queued);
+        self.jobs
+            .as_ref()
+            .expect("the queue is open while the diff is walked")
+            .send(job)
+            .expect("the queue's receiver lives as long as the checkout");
+        self.queued += 1;
+        Ok(())
+    }
+
+    fn spawn_worker(&mut self) -> Result<(), CheckoutError> {
+        let context = self.context;
+        let results = self
+            .result_sender
+            .clone()
+            .expect("the queue is open while the diff is walked");
+        thread::Builder::new()
+            .name("jj checkout".to_owned())
+            .spawn_scoped(self.scope, move || context.run_worker(&results))
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to start a checkout thread".to_owned(),
+                err: err.into(),
+            })?;
+        self.spawned += 1;
+        Ok(())
+    }
+
+    /// Waits for the result of one queued job and records it. Returns false if
+    /// no worker is left to send one.
+    fn receive_result(&mut self) -> bool {
+        let Ok(CheckoutResult { index, outcome }) = self.results.recv() else {
+            return false;
+        };
+        self.received += 1;
+        if let Some(JobOutcome {
+            path,
+            outcome,
+            unconverted,
+        }) = outcome
+        {
+            if let Some(reason) = unconverted {
+                self.stats.unconverted_paths.insert(path.clone(), reason);
+            }
+            self.slots[index] = CheckoutSlot::Done(path, outcome);
+        }
+        true
+    }
+
+    /// Waits until the workers have finished every queued job.
+    fn wait_for_workers(&mut self) {
+        while self.received < self.queued && self.receive_result() {}
+    }
+
+    /// Closes the queue, waits for the workers to end, and returns what the
+    /// checkout did, or its first error.
+    fn finish(
+        mut self,
+        walked: Result<(), CheckoutError>,
+    ) -> Result<CheckoutOutput, CheckoutError> {
+        if let Err(err) = walked {
+            self.context.fail(err);
+        }
+        // Each worker ends once the queue is closed and empty, and `results`
+        // ends when the last worker does.
+        self.jobs = None;
+        self.result_sender = None;
+        while self.receive_result() {}
+        if let Some(err) = self
+            .context
+            .first_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(err);
+        }
+        if self.context.is_aborted() {
+            // Only a worker that panics stops the checkout without an error.
+            // The scope passes the panic on.
+            return Err(CheckoutError::Other {
+                message: "A checkout thread panicked".to_owned(),
+                err: "panic".into(),
+            });
+        }
+
+        // The workers are done, so every directory that is empty now stays so.
+        self.queued_dirs.clear();
+        let mut changed_file_states = Vec::with_capacity(self.slots.len());
+        for slot in mem::take(&mut self.slots) {
+            let CheckoutSlot::Done(path, outcome) = slot else {
+                unreachable!("every queued job sent its result");
+            };
+            match outcome {
+                CheckoutOutcome::Written(file_state) => {
+                    changed_file_states.push((path, file_state));
+                }
+                CheckoutOutcome::Skipped => {
+                    changed_file_states.push((path, FileState::placeholder()));
+                    self.stats.skipped_files += 1;
+                }
+                CheckoutOutcome::AccessDenied(disk_path) => {
+                    remove_empty_parent_dirs(&path, &disk_path, &self.queued_dirs);
+                    self.deleted_files.insert(path);
+                }
+            }
+        }
+        let measures = CheckoutMeasures {
+            threads: self.spawned,
+            writers: self.context.writers.load(AtomicOrdering::Relaxed),
+            peak_bytes_in_flight: self.context.bytes_in_flight.peak(),
+        };
+        Ok(CheckoutOutput {
+            stats: self.stats,
+            changed_file_states,
+            deleted_files: self.deleted_files,
+            sort: self.sort,
+            measures,
+        })
+    }
+}
+
+/// Removes the directories above `path`, at `disk_path`, that its removal
+/// left empty, from the deepest one up to the first one that is not empty,
+/// stopping before the working copy root. A directory in `queued_dirs` holds a
+/// path that a worker is to write, so it is not removed.
+fn remove_empty_parent_dirs(path: &RepoPath, disk_path: &Path, queued_dirs: &HashSet<RepoPathBuf>) {
+    let mut dir = path.parent();
+    let mut disk_dir = disk_path.parent().unwrap();
+    while let Some(repo_dir) = dir {
+        if repo_dir.is_root() || queued_dirs.contains(repo_dir) || fs::remove_dir(disk_dir).is_err()
+        {
+            break;
+        }
+        disk_dir = disk_dir.parent().unwrap();
+        dir = repo_dir.parent();
+    }
+}
+
+/// The bytes that reading `value`'s contents from the store brings into
+/// memory, or `None` if the backend cannot tell them without reading. A value
+/// that reads no file contents brings 0 (a symlink's target is not counted).
+async fn contents_size(
+    store: &Store,
+    path: &RepoPath,
+    value: &MergedTreeValue,
+) -> BackendResult<Option<u64>> {
+    if let Some(value) = value.as_resolved() {
+        return match value {
+            Some(TreeValue::File { id, .. }) => file_size(store, path, id).await,
+            _ => Ok(Some(0)),
+        };
+    }
+    // A conflict whose terms are not all files is described, not read.
+    let Some(ids) = value.to_file_merge() else {
+        return Ok(Some(0));
+    };
+    let mut total: u64 = 0;
+    for id in ids.iter().flatten() {
+        let Some(size) = file_size(store, path, id).await? else {
+            return Ok(None);
+        };
+        total = total.saturating_add(size);
+    }
+    Ok(Some(total))
+}
+
+async fn file_size(store: &Store, path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+    match store.file_size(path, id).await {
+        // The read reports the denial, as `MaterializedTreeValue::AccessDenied`.
+        Err(BackendError::ReadAccessDenied { .. }) => Ok(None),
+        result => result,
+    }
+}
+
+/// Writes all of `contents` to `writer`, through `buf`: contents of up to
+/// [`MAX_CONTENTS_WRITE`] bytes go in with one `write` call, and larger ones
+/// with one call for each piece of that size. `size_hint` is the size that
+/// the contents are expected to have, to size `buf` before the first read.
+/// Returns the size of the contents.
+async fn write_contents<W: Write + ?Sized>(
+    contents: impl AsyncRead,
+    size_hint: u64,
+    buf: &mut Vec<u8>,
+    writer: &mut W,
+) -> io::Result<u64> {
+    let mut contents = std::pin::pin!(contents);
+    let wanted = usize::try_from(size_hint)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_CONTENTS_BUF, MAX_CONTENTS_WRITE);
+    if buf.len() < wanted {
+        buf.resize(wanted, 0);
+    }
+    let mut written: u64 = 0;
+    let mut filled = 0;
+    loop {
+        if filled == buf.len() {
+            if buf.len() < MAX_CONTENTS_WRITE {
+                // The contents are larger than expected: read more of them
+                // before writing.
+                buf.resize((buf.len() * 2).min(MAX_CONTENTS_WRITE), 0);
+            } else {
+                writer.write_all(&buf[..filled])?;
+                written += filled as u64;
+                filled = 0;
+            }
+        }
+        let read = contents.read(&mut buf[filled..]).await?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    if filled > 0 {
+        writer.write_all(&buf[..filled])?;
+        written += filled as u64;
+    }
+    Ok(written)
+}
+
+/// Reads the state of a file that the checkout has just written from its
+/// handle. That way, we know that the file exists and is of the expected type,
+/// and the stat information is most likely accurate, except for other
+/// processes modifying the file concurrently (The mtime is set at write time
+/// and won't change when we close the file.)
+fn new_file_state(
+    file: &File,
+    exec_bit: ExecBit,
+    size: u64,
+    disk_path: &Path,
+) -> Result<FileState, CheckoutError> {
+    let metadata = file
+        .metadata()
+        .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    FileState::for_file(exec_bit, size, &metadata)
+        .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
+}
+
+/// Creates the symlink `disk_path` to `target` for a checkout. The path is
+/// skipped if an entry is already there, unless the checkout has just removed
+/// the old file there: then it is an error.
+fn write_symlink(
+    disk_path: &Path,
+    target: &str,
+    old_file_removed: bool,
+) -> Result<CheckoutOutcome, CheckoutError> {
+    let target = symlink_target_convert_to_disk(target);
+
+    if cfg!(windows) {
+        // On Windows, "/" can't be part of valid file name, and "/" is also not a valid
+        // separator for the symlink target. See an example of this issue in
+        // https://github.com/jj-vcs/jj/issues/6934.
+        //
+        // We use debug_assert_* instead of assert_* because we want to avoid panic in
+        // release build, and we are sure that we shouldn't create invalid symlinks in
+        // tests.
+        debug_assert_ne!(
+            target.as_os_str().to_str().map(|path| path.contains('/')),
+            Some(true),
+            r#"Expect the symlink target doesn't contain "/", but got invalid symlink target: {}."#,
+            target.display()
+        );
+    }
+
+    // On Windows, this will create a nonfunctional link for directories,
+    // but at the moment we don't have enough information in the tree to
+    // determine whether the symlink target is a file or a directory.
+    match symlink_file(&target, disk_path) {
+        Ok(()) => {}
+        Err(err) if !old_file_removed => {
+            reject_existing_entry(disk_path, err)?;
+            return Ok(CheckoutOutcome::Skipped);
+        }
+        Err(err) => {
+            return Err(CheckoutError::Other {
+                message: format!(
+                    "Failed to create symlink from {} to {}",
+                    disk_path.display(),
+                    target.display()
+                ),
+                err: err.into(),
+            });
+        }
+    }
+    // If the new symlink were the entry that the name ".git" or ".jj" of its
+    // directory points to, git/jj CLI could be tricked to load configuration
+    // from an attacker-controlled location.
+    reject_reserved_existing_path(disk_path).inspect_err(|_| {
+        fs::remove_file(disk_path).ok();
+    })?;
+    let metadata = disk_path
+        .symlink_metadata()
+        .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+    let file_state = FileState::for_symlink(&metadata)
+        .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))?;
+    Ok(CheckoutOutcome::Written(file_state))
 }
 
 fn checkout_error_for_stat_error(err: io::Error, path: &Path) -> CheckoutError {
@@ -3428,6 +4255,55 @@ mod tests {
         if let Some(time) = epoch.checked_sub(Duration::from_millis(i64::MAX as u64 + 1)) {
             // i64::MIN could be returned, but we don't care such old timestamp
             assert_eq!(system_time_to_millis(time), None);
+        }
+    }
+
+    #[test]
+    fn test_new_file_content_goes_in_one_write() {
+        struct CountingWriter {
+            writes: usize,
+            data: Vec<u8>,
+        }
+
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.data.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Within `MAX_CONTENTS_WRITE`, each size goes in with one write call
+        // (0 for an empty file), whether the size hint matches or is 0.
+        let mut buf = Vec::new();
+        for &(size, expected_writes) in &[
+            (0, 0),
+            (1, 1),
+            (32 << 10, 1),
+            (128 << 10, 1),
+            (MAX_CONTENTS_WRITE, 1),
+            (MAX_CONTENTS_WRITE + 1, 2),
+        ] {
+            let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            for size_hint in [size as u64, 0] {
+                let mut writer = CountingWriter {
+                    writes: 0,
+                    data: Vec::new(),
+                };
+                let written = write_contents(content.as_slice(), size_hint, &mut buf, &mut writer)
+                    .block_on()
+                    .unwrap();
+                assert_eq!(written, size as u64);
+                assert_eq!(writer.data, content);
+                assert_eq!(
+                    writer.writes, expected_writes,
+                    "size={size}, size_hint={size_hint}"
+                );
+            }
         }
     }
 }

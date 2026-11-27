@@ -45,6 +45,7 @@ use jj_lib::local_working_copy::FilterSettings;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateError;
 use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::default_checkout_threads;
 use jj_lib::lock::FileLock;
 use jj_lib::lock::FileLockError;
 use jj_lib::matchers::EverythingMatcher;
@@ -124,6 +125,7 @@ fn default_tree_state_settings() -> TreeStateSettings {
             enabled: false,
             drivers: HashMap::new(),
         },
+        checkout_threads: default_checkout_threads(),
     }
 }
 

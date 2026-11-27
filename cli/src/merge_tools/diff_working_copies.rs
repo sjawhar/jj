@@ -16,6 +16,7 @@ use jj_lib::local_working_copy::FilterSettings;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateError;
 use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::default_checkout_threads;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
@@ -175,6 +176,7 @@ pub(crate) async fn check_out_trees(
                 enabled: false,
                 drivers: HashMap::new(),
             },
+            checkout_threads: default_checkout_threads(),
         };
         let mut state = TreeState::init(store.clone(), wc_path, state_dir, &tree_state_settings)?;
         state.set_sparse_patterns(changed_files.clone())?;

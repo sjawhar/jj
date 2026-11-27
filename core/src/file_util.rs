@@ -292,8 +292,7 @@ impl FileIdentity {
     }
 
     /// Queries file identity of the given `file`.
-    // TODO: do not consume file object
-    pub fn from_file(file: File) -> io::Result<Self> {
+    pub fn from_file(file: &File) -> io::Result<Self> {
         platform::file_identity_from_file(file).map(Self)
     }
 }
@@ -400,7 +399,7 @@ mod platform {
         path.symlink_metadata().map(FileIdentity::from_metadata)
     }
 
-    pub fn file_identity_from_file(file: File) -> io::Result<FileIdentity> {
+    pub fn file_identity_from_file(file: &File) -> io::Result<FileIdentity> {
         file.metadata().map(FileIdentity::from_metadata)
     }
 }
@@ -455,8 +454,9 @@ mod platform {
         same_file::Handle::from_file(file)
     }
 
-    pub fn file_identity_from_file(file: File) -> io::Result<FileIdentity> {
-        same_file::Handle::from_file(file)
+    pub fn file_identity_from_file(file: &File) -> io::Result<FileIdentity> {
+        // `same_file::Handle` keeps the handle it compares by open.
+        same_file::Handle::from_file(file.try_clone()?)
     }
 }
 
@@ -682,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             FileIdentity::from_symlink_path(&file_path)?,
-            FileIdentity::from_file(File::open(&link_path)?)?
+            FileIdentity::from_file(&File::open(&link_path)?)?
         );
         Ok(())
     }
@@ -708,11 +708,11 @@ mod tests {
         // File::open() follows symlinks
         assert_eq!(
             FileIdentity::from_symlink_path(&dir_path)?,
-            FileIdentity::from_file(File::open(&symlink_path)?)?
+            FileIdentity::from_file(&File::open(&symlink_path)?)?
         );
         assert_ne!(
             FileIdentity::from_symlink_path(&symlink_path)?,
-            FileIdentity::from_file(File::open(&symlink_path)?)?
+            FileIdentity::from_file(&File::open(&symlink_path)?)?
         );
         Ok(())
     }
@@ -741,11 +741,11 @@ mod tests {
         // File::open() follows symlinks
         assert_eq!(
             FileIdentity::from_symlink_path(&file_path)?,
-            FileIdentity::from_file(File::open(&symlink_path)?)?
+            FileIdentity::from_file(&File::open(&symlink_path)?)?
         );
         assert_ne!(
             FileIdentity::from_symlink_path(&symlink_path)?,
-            FileIdentity::from_file(File::open(&symlink_path)?)?
+            FileIdentity::from_file(&File::open(&symlink_path)?)?
         );
         Ok(())
     }

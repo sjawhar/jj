@@ -16,6 +16,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New features
 
+* Checking out files to the local working copy now reads blobs and writes files
+  in parallel across multiple threads (configurable with
+  `working-copy.checkout-threads`, defaulting to the number of CPUs available to
+  the process), creating each new file once with its mode and writing its
+  contents in fewer system calls.
+
 ### Fixed bugs
 
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
