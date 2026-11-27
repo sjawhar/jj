@@ -66,6 +66,7 @@ shlex = { workspace = true }
 smallvec = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+thread_local = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
@@ -100,7 +101,7 @@ nix = { workspace = true, features = [ "inotify" ] }
 
 [features]
 default = ["git"]
-git = ["dep:gix"]
+git = ["dep:gix", "dep:thread_local"]
 watchman = ["dep:watchman_client", "dep:tokio"]
 testing = ["git"]
 test-fakes = ["testing", "dep:clap"]

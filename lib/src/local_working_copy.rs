@@ -833,14 +833,17 @@ fn create_new_file(
     Ok(Some(file))
 }
 
-/// The directory that a checkout thread created its last new file in, kept
+/// The directory that a checkout thread last created a new file in, kept
 /// open so that the next file in it is created relative to it (`openat()`),
 /// which looks up one name instead of every component of the path.
 ///
 /// The directories were created by the coordinating thread, never through a
-/// symlink. A directory that holds a file the checkout created is never
-/// removed during the checkout, so the kept directory is still the one at its
-/// path.
+/// symlink. A directory is kept only after a file was created in it, but it
+/// may still be removed and made again while it is kept (when a removed path
+/// is the same entry on a case-insensitive file system, say). So a create
+/// that fails drops the kept directory, and a create in the kept directory
+/// that finds it gone (`ENOENT`) opens the directory again by its path and
+/// is tried once more.
 #[derive(Default)]
 struct DirCache {
     #[cfg(unix)]
@@ -849,34 +852,52 @@ struct DirCache {
 
 impl DirCache {
     /// Creates `disk_path` new (`O_CREAT | O_EXCL`, which does not follow a
-    /// symlink there) for writing, with the mode of `exec_bit`.
+    /// symlink there) for writing, with the mode of `exec_bit`. If the
+    /// directory can't be opened, the file is created by its path.
     #[cfg_attr(windows, expect(unused_variables))]
     fn create_new(&mut self, disk_path: &Path, exec_bit: ExecBit) -> io::Result<File> {
         #[cfg(unix)]
         if let (Some(parent), Some(name)) = (disk_path.parent(), disk_path.file_name()) {
             use rustix::fs::Mode;
             use rustix::fs::OFlags;
-            if self.dir.as_ref().is_none_or(|(path, _)| path != parent) {
-                let dir = rustix::fs::open(
-                    parent,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?;
-                self.dir = Some((parent.to_owned(), dir));
-            }
-            let (_, dir) = self.dir.as_ref().expect("the directory was just opened");
+            use rustix::io::Errno;
             let mode = if exec_bit.0 {
                 Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
             } else {
                 Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
             };
-            let file = rustix::fs::openat(
-                dir,
-                name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                mode,
-            )?;
-            return Ok(File::from(file));
+            loop {
+                let reused = self.dir.as_ref().is_some_and(|(path, _)| path == parent);
+                if !reused {
+                    self.dir = None;
+                    match rustix::fs::open(
+                        parent,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(dir) => self.dir = Some((parent.to_owned(), dir)),
+                        // A directory with write and search permission but
+                        // no read permission (mode 0o300, say) can't be
+                        // opened, but a file can be created in it by path.
+                        Err(_) => break,
+                    }
+                }
+                let (_, dir) = self.dir.as_ref().expect("the directory is open");
+                match rustix::fs::openat(
+                    dir,
+                    name,
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                    mode,
+                ) {
+                    Ok(file) => return Ok(File::from(file)),
+                    Err(err) => {
+                        self.dir = None;
+                        if !(reused && err == Errno::NOENT) {
+                            return Err(err.into());
+                        }
+                    }
+                }
+            }
         }
         let mut options = OpenOptions::new();
         // Don't overwrite un-ignored file. Don't follow symlink.
@@ -3517,21 +3538,16 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         // then on the next iteration recreation is skipped because of this
         // optimization.
         self.prev_created_path = RepoPathBuf::root();
-        // A directory above this path is removed only if it is empty. One that
-        // holds a queued path has that path's file in it, unless a worker is
-        // still to create it; and a directory with only such files in it is
-        // the directory of the path queued last, since the paths come in
-        // order and every other queued path's directory lies in a directory
-        // that this thread created below it. So wait for the workers if that
-        // directory is one of those above this path.
-        if self.has_in_flight()
-            && self
-                .last_queued
-                .parent()
-                .is_some_and(|dir| path.starts_with(dir))
-        {
-            self.wait_for_workers();
-        }
+        // A directory above this path is removed only if it is empty, and a
+        // directory that a queued file is still to be created in may look
+        // empty. On a case-insensitive file system, or one that takes two
+        // Unicode spellings of a name for one entry, that directory can be
+        // spelled otherwise in the queued path than in this one, so no
+        // comparison of the paths tells which directories those are. So wait
+        // for the workers to finish every queued job before any directory is
+        // removed. A checkout that removes no path, as into an empty working
+        // copy, never waits here.
+        self.wait_for_workers();
         remove_empty_parent_dirs(&path, disk_path);
         self.deleted_files.insert(path);
         Ok(())
@@ -4699,5 +4715,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_cache_survives_removed_and_remade_dir() {
+        let temp_dir = crate::tests::new_temp_dir();
+        let dir = temp_dir.path().join("dir");
+        let remake_dir = |file: &str| {
+            fs::remove_file(dir.join(file)).unwrap();
+            fs::remove_dir(&dir).unwrap();
+            fs::create_dir(&dir).unwrap();
+        };
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("old"), "").unwrap();
+        let mut dir_cache = DirCache::default();
+
+        // A create that fails because the file exists keeps no directory, so
+        // the next create in the directory, which was removed (as when the
+        // removal of the old file left it empty) and made again in between,
+        // goes in the new directory.
+        let err = dir_cache
+            .create_new(&dir.join("old"), ExecBit(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        remake_dir("old");
+        dir_cache
+            .create_new(&dir.join("new"), ExecBit(false))
+            .unwrap();
+        assert!(dir.join("new").is_file());
+
+        // A directory kept after a create is opened again if it was removed
+        // and made again since.
+        remake_dir("new");
+        dir_cache
+            .create_new(&dir.join("newer"), ExecBit(false))
+            .unwrap();
+        assert!(dir.join("newer").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_cache_creates_in_dir_without_read_permission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp_dir = crate::tests::new_temp_dir();
+        let dir = temp_dir.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        // Write and search permission, but no read permission.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = fs::read_dir(&dir).is_ok();
+        let created = DirCache::default().create_new(&dir.join("file"), ExecBit(false));
+        // Let the temporary directory be removed whatever happened.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!readable, "the directory should not be readable");
+        created.unwrap();
+        assert!(dir.join("file").is_file());
     }
 }
