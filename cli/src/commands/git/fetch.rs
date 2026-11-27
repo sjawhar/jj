@@ -173,6 +173,7 @@ pub async fn cmd_git_fetch(
     }
 
     let mut tx = workspace_command.start_transaction();
+    tx.mark_import_from_git();
     let remote_settings = tx.settings().remote_settings()?;
 
     let is_specific = args.branches.is_some() || args.tags.is_some();

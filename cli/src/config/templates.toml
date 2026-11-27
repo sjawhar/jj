@@ -348,6 +348,11 @@ time_range.end().ago() ++ label("time", ", lasted ") ++ time_range.duration()
 'format_timestamp(timestamp)' = 'timestamp.local().format("%Y-%m-%d %H:%M:%S")'
 
 'format_commit_summary_with_refs(commit, refs)' = '''
+format_commit_summary_with_refs_and_emptiness(commit, refs, commit.empty())
+'''
+
+# The summary of `commit`, which is marked as empty where `is_empty` is true.
+'format_commit_summary_with_refs_and_emptiness(commit, refs, is_empty)' = '''
 label(if(commit.current_working_copy(), "working_copy"),
   separate(" ",
     format_short_change_id_with_change_offset(commit),
@@ -356,14 +361,26 @@ label(if(commit.current_working_copy(), "working_copy"),
       refs,
       separate(" ",
         format_commit_labels(commit),
-        if(commit.empty(), empty_commit_marker),
+        if(is_empty, empty_commit_marker),
         if(commit.description(),
           commit.description().first_line(),
-          label(if(commit.empty(), "empty"), description_placeholder),
+          label(if(is_empty, "empty"), description_placeholder),
         ),
       ),
     ),
   ),
+)
+'''
+
+# The summary that the report of an import from Git gives a commit, where
+# `templates.commit_summary` is the default: it does not say whether a merge
+# commit is empty, since only a merge of the commit's parents can tell that,
+# and an import can bring in many merges of many commits.
+'format_commit_summary_of_import(commit)' = '''
+format_commit_summary_with_refs_and_emptiness(
+  commit,
+  format_commit_ref_names(commit.bookmarks()),
+  if(commit.parents().len() > 1, false, commit.empty()),
 )
 '''
 
