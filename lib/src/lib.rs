@@ -70,6 +70,7 @@ pub mod local_working_copy;
 pub mod lock;
 pub use jj_core::matchers;
 pub use jj_core::merge;
+mod merge_fold;
 pub mod merge_rule;
 pub mod merged_tree;
 pub mod merged_tree_builder;

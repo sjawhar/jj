@@ -404,6 +404,19 @@ async fn try_resolve_file_values<T: Borrow<TreeValue>>(
     }
 }
 
+/// Merges the files of `simplified`, terms that are already simplified, as
+/// [`merge_trees`] merges a path whose terms do not resolve trivially and are
+/// not all trees: the merged file, or none where the files do not merge or the
+/// terms are not all files. The merge of many commits one at a time
+/// ([`crate::merge_fold`]) merges a path with it.
+pub(crate) async fn merge_simplified_file_values(
+    store: &Store,
+    path: &RepoPath,
+    simplified: &MergedTreeValue,
+) -> BackendResult<Option<TreeValue>> {
+    try_resolve_file_conflict(store, path, &simplified.map(|value| value.as_ref())).await
+}
+
 /// Resolves file-level conflict by merging content hunks.
 ///
 /// The input `conflict` is supposed to be simplified. It shouldn't contain

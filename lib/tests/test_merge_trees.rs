@@ -12,11 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter;
+use std::sync::Arc;
+
+use itertools::Itertools as _;
+use jj_lib::backend::CopyId;
 use jj_lib::backend::TreeValue;
+use jj_lib::commit::Commit;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::merge_commit_trees;
+use jj_lib::rewrite::merge_commit_trees_no_resolve;
 use jj_lib::rewrite::rebase_commit;
 use pollster::FutureExt as _;
 use test_case::test_case;
@@ -26,7 +38,9 @@ use testutils::TestResult;
 use testutils::assert_tree_eq;
 use testutils::create_tree;
 use testutils::repo_path;
+use testutils::repo_path_buf;
 use testutils::settings_with_same_change;
+use testutils::test_backend::TestBackend;
 
 #[test]
 fn test_simplify_conflict_after_resolving_parent() -> TestResult {
@@ -458,5 +472,294 @@ fn test_merge_of_two_resolutions_does_not_revert_to_the_base() -> TestResult {
         .collect();
     assert_eq!(adds, [b"A\n".to_vec(), b"B\n".to_vec()]);
 
+    Ok(())
+}
+
+/// Runs `merge` and returns its result with the number of files it read from
+/// the test backend of `repo`, from caches cleared first.
+fn with_file_reads<T>(repo: &Arc<ReadonlyRepo>, merge: impl FnOnce() -> T) -> (T, usize) {
+    let store = repo.store();
+    store.clear_caches();
+    let backend = store.backend_impl::<TestBackend>().unwrap();
+    let before = backend.file_reads();
+    let result = merge();
+    (result, backend.file_reads() - before)
+}
+
+/// The value of `commit`'s tree at `path`, which is resolved.
+fn resolved_value(commit: &Commit, path: &RepoPath) -> TestResult<Option<TreeValue>> {
+    let value = commit.tree().path_value(path).block_on()?;
+    Ok(value.into_resolved().expect("a resolved value"))
+}
+
+/// A tree that holds `base_text` at each of `files`, with `changes` written
+/// over it.
+fn tree_with(
+    repo: &Arc<ReadonlyRepo>,
+    files: &[RepoPathBuf],
+    base_text: &str,
+    changes: &[(&RepoPath, &str)],
+) -> MergedTree {
+    let mut contents = files
+        .iter()
+        .map(|path| (path.as_ref(), base_text))
+        .collect_vec();
+    for &(path, text) in changes {
+        match contents.iter_mut().find(|(file, _)| *file == path) {
+            Some(entry) => entry.1 = text,
+            None => contents.push((path, text)),
+        }
+    }
+    create_tree(repo, &contents)
+}
+
+/// A merge of many commits where two of them conflict at each of four files
+/// and every other commit adds a file of its own, as the merge of the branches
+/// of a fork can: each conflict is merged, and its sides read, once, when the
+/// second commit that changes its file comes in. A merge that resolved again,
+/// at each later commit, everything the commits before it left read every
+/// conflict's sides again at each step, so the merge of n commits did work in
+/// n squared, and an import of such merges, which merges each one's parents to
+/// report its new conflicts, did not finish.
+#[test]
+fn test_merge_of_many_commits_merges_each_conflict_once() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let conflicted = (0..4)
+        .map(|i| repo_path_buf(format!("dir/conflicted{i}")))
+        .collect_vec();
+    let base_text = "base\n2\n3\n";
+
+    let mut tx = repo.start_transaction();
+    let base = tx
+        .repo_mut()
+        .new_commit(
+            vec![repo.store().root_commit_id().clone()],
+            tree_with(repo, &conflicted, base_text, &[]),
+        )
+        .write_unwrap();
+    let mut sides = vec![];
+    let mut parents = vec![];
+    for path in &conflicted {
+        let [a, b] = ["a\n2\n3\n", "b\n2\n3\n"].map(|text| {
+            tx.repo_mut()
+                .new_commit(
+                    vec![base.id().clone()],
+                    tree_with(repo, &conflicted, base_text, &[(path.as_ref(), text)]),
+                )
+                .write_unwrap()
+        });
+        sides.push((a.clone(), b.clone()));
+        parents.extend([a, b]);
+    }
+    let own = (0..40)
+        .map(|i| repo_path_buf(format!("own/{i}")))
+        .collect_vec();
+    for path in &own {
+        let text = format!("{}\n", path.as_internal_file_string());
+        let commit = tx
+            .repo_mut()
+            .new_commit(
+                vec![base.id().clone()],
+                tree_with(
+                    repo,
+                    &conflicted,
+                    base_text,
+                    &[(path.as_ref(), text.as_str())],
+                ),
+            )
+            .write_unwrap();
+        parents.push(commit);
+    }
+    let repo = tx.commit("test").block_on()?;
+
+    // A merge of three files reads each of them once. A debug build merges a
+    // resolved tree again to check it, and the store keeps what a merge of
+    // files gave, so that check reads none.
+    let bound = 3 * conflicted.len();
+    let (unresolved, reads) = with_file_reads(&repo, || {
+        merge_commit_trees_no_resolve(repo.as_ref(), &parents).block_on()
+    });
+    let unresolved = unresolved?;
+    assert!(
+        reads <= bound,
+        "the merge of {} commits read {reads} files, more than {bound}",
+        parents.len()
+    );
+    let (resolved, reads) = with_file_reads(&repo, || {
+        merge_commit_trees(repo.as_ref(), &parents).block_on()
+    });
+    let resolved = resolved?;
+    assert!(
+        reads <= bound,
+        "the resolved merge of {} commits read {reads} files, more than {bound}",
+        parents.len()
+    );
+
+    for tree in [&unresolved, &resolved] {
+        for (path, (a, b)) in iter::zip(&conflicted, &sides) {
+            let expected = Merge::from_vec(vec![
+                resolved_value(a, path)?,
+                resolved_value(&base, path)?,
+                resolved_value(b, path)?,
+            ]);
+            let value = tree.path_value(path).block_on()?;
+            assert!(
+                value.same_terms_as(&expected),
+                "expected {path:?} to be the conflict of its two sides, got: {value:#?}"
+            );
+        }
+        for (path, commit) in iter::zip(&own, &parents[2 * conflicted.len()..]) {
+            let value = tree.path_value(path).block_on()?;
+            assert_eq!(value, Merge::resolved(resolved_value(commit, path)?));
+        }
+    }
+    Ok(())
+}
+
+/// A merge of many commits that descend from a commit with a conflict, as the
+/// commits that an import makes visible can: the conflict is every commit's
+/// and the merge base's, so after the first two commits no commit changes it,
+/// and the merge reads its sides only for the first merge.
+#[test]
+fn test_merge_of_commits_above_a_conflict_reads_it_once() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let path = repo_path("dir/conflicted");
+
+    let mut tx = repo.start_transaction();
+    let base = tx
+        .repo_mut()
+        .new_commit(
+            vec![repo.store().root_commit_id().clone()],
+            create_tree(repo, &[(path, "base\n2\n3\n")]),
+        )
+        .write_unwrap();
+    let [a, b] = ["a\n2\n3\n", "b\n2\n3\n"].map(|content| {
+        tx.repo_mut()
+            .new_commit(
+                vec![base.id().clone()],
+                create_tree(repo, &[(path, content)]),
+            )
+            .write_unwrap()
+    });
+    let conflict_tree = merge_commit_trees(tx.repo(), &[a.clone(), b.clone()]).block_on()?;
+    assert!(
+        !conflict_tree.path_value(path).block_on()?.is_resolved(),
+        "the test setup requires the merge of a and b to conflict"
+    );
+    let conflict = tx
+        .repo_mut()
+        .new_commit(vec![a.id().clone(), b.id().clone()], conflict_tree.clone())
+        .write_unwrap();
+    let mut children = vec![];
+    for i in 0..40 {
+        let own = repo_path_buf(format!("own/{i}"));
+        let file = TreeValue::File {
+            id: testutils::write_file(repo.store(), &own, &format!("{i}\n")),
+            executable: false,
+            copy_id: CopyId::placeholder(),
+        };
+        let mut builder = MergedTreeBuilder::new(conflict_tree.clone());
+        builder.set_or_remove(own, Merge::normal(file));
+        let tree = builder.write_tree().block_on()?;
+        let child = tx
+            .repo_mut()
+            .new_commit(vec![conflict.id().clone()], tree)
+            .write_unwrap();
+        children.push(child);
+    }
+    let repo = tx.commit("test").block_on()?;
+
+    let bound = 3;
+    let (merged, reads) = with_file_reads(&repo, || {
+        merge_commit_trees_no_resolve(repo.as_ref(), &children).block_on()
+    });
+    let merged = merged?;
+    assert!(
+        reads <= bound,
+        "the merge of {} commits read {reads} files, more than {bound}",
+        children.len()
+    );
+    let value = merged.path_value(path).block_on()?;
+    let expected = conflict_tree.path_value(path).block_on()?;
+    assert!(
+        value.same_terms_as(&expected),
+        "expected the merge base's conflict, got: {value:#?}"
+    );
+    Ok(())
+}
+
+/// A merge of many commits where four of them change one file differently, so
+/// that the file's conflict has seven terms, and every other commit writes a
+/// file of its own. Each later commit leaves the conflict as it is, so its
+/// value takes a base and a side that are equal, which cancel; the terms that
+/// are left are the terms the conflict had, which the merge can give in
+/// another order. A merge that read the file's terms again whenever their
+/// order moved merged them again at most of the commits, where the order
+/// decides nothing: the terms are the same.
+#[test]
+fn test_merge_of_many_commits_merges_a_conflict_of_four_sides_once() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let path = repo_path("dir/conflicted");
+    let files = [path.to_owned()];
+    let base_text = "base\n2\n3\n";
+
+    let mut tx = repo.start_transaction();
+    let base = tx
+        .repo_mut()
+        .new_commit(
+            vec![repo.store().root_commit_id().clone()],
+            tree_with(repo, &files, base_text, &[]),
+        )
+        .write_unwrap();
+    let mut parents = ["a", "b", "c", "d"]
+        .iter()
+        .map(|side| {
+            let text = format!("{side}\n2\n3\n");
+            tx.repo_mut()
+                .new_commit(
+                    vec![base.id().clone()],
+                    tree_with(repo, &files, base_text, &[(path, text.as_str())]),
+                )
+                .write_unwrap()
+        })
+        .collect_vec();
+    for i in 0..40 {
+        let own = repo_path_buf(format!("own/{i}"));
+        let text = format!("{i}\n");
+        let commit = tx
+            .repo_mut()
+            .new_commit(
+                vec![base.id().clone()],
+                tree_with(repo, &files, base_text, &[(own.as_ref(), text.as_str())]),
+            )
+            .write_unwrap();
+        parents.push(commit);
+    }
+    let repo = tx.commit("test").block_on()?;
+
+    // Each of the three commits that find the file already changed merges it
+    // against the merge of the commits before it, which is what a merge of
+    // many commits does: 3, then 5, then 7 terms, each read once. No later
+    // commit reads any of them again, where a merge that read them whenever
+    // their order moved read them at most of the commits.
+    let bound = 15;
+    let (merged, reads) = with_file_reads(&repo, || {
+        merge_commit_trees(repo.as_ref(), &parents).block_on()
+    });
+    let merged = merged?;
+    assert!(
+        reads <= bound,
+        "the merge of {} commits read {reads} files, more than {bound}",
+        parents.len()
+    );
+    let value = merged.path_value(path).block_on()?;
+    assert_eq!(
+        value.num_sides(),
+        4,
+        "expected the conflict of the four sides, got: {value:#?}"
+    );
     Ok(())
 }

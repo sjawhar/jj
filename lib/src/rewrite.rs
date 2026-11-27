@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter;
@@ -50,6 +51,7 @@ use crate::matchers::Matcher;
 use crate::matchers::Visit;
 use crate::merge::Diff;
 use crate::merge::Merge;
+use crate::merge_fold::FoldedMerge;
 use crate::merge_rule;
 use crate::merged_tree::MergedTree;
 use crate::merged_tree_builder::MergedTreeBuilder;
@@ -445,12 +447,19 @@ trait CommitFold {
     /// The merge of some commits.
     type Merged: Clone;
 
+    /// The merge of some commits, as the fold carries it from one commit of a
+    /// list to the next.
+    type Folding;
+
     /// Whether V merges the merge bases in the order of their commit ids,
     /// rather than in the order the index returns them.
     const SORTS_BASES: bool;
 
     /// The merge of the one commit `id`.
     async fn commit(&self, store: &Arc<Store>, id: &CommitId) -> BackendResult<Self::Merged>;
+
+    /// `merged`, the merge that a list of commits starts from.
+    fn start(&self, merged: Self::Merged) -> Self::Folding;
 
     /// Merges the commit `next_id` into `merged`, the merge of the commits
     /// `merged_ids`, against `base`, V, with the merge bases V merged, in the
@@ -459,12 +468,15 @@ trait CommitFold {
     async fn merge_next(
         &self,
         store: &Arc<Store>,
-        merged: Self::Merged,
+        merged: Self::Folding,
         merged_ids: &[CommitId],
         next_id: &CommitId,
         base: (Self::Merged, &[CommitId]),
         resolve: bool,
-    ) -> BackendResult<Self::Merged>;
+    ) -> BackendResult<Self::Folding>;
+
+    /// `merged`, the merge of a whole list of commits.
+    async fn finish(&self, merged: Self::Folding) -> BackendResult<Self::Merged>;
 }
 
 /// Merges `commit_ids` one at a time, in the given order, as `fold` merges
@@ -504,7 +516,7 @@ async fn fold_commits<F: CommitFold>(
     let Some(first_id) = commit_ids.first() else {
         return fold.commit(store, store.root_commit_id()).await;
     };
-    let merged = fold.commit(store, first_id).await?;
+    let merged = fold.start(fold.commit(store, first_id).await?);
     let mut item = WorkItem {
         commit_ids,
         pos: 1,
@@ -512,7 +524,7 @@ async fn fold_commits<F: CommitFold>(
     };
     // The work items below `item`, the last of which waits for the merge that
     // `item` builds.
-    let mut waiting: Vec<Waiting<F::Merged>> = vec![];
+    let mut waiting: Vec<Waiting<F::Folding>> = vec![];
     // V of each set of two or more merge bases merged so far, by their ids in
     // the order the fold merges them in.
     let mut merged_bases: HashMap<Vec<CommitId>, F::Merged> = HashMap::new();
@@ -535,7 +547,7 @@ async fn fold_commits<F: CommitFold>(
                 if let Some(base) = merged_bases.get(&fold_ids) {
                     (base.clone(), base_ids)
                 } else {
-                    let merged = fold.commit(store, &fold_ids[0]).await?;
+                    let merged = fold.start(fold.commit(store, &fold_ids[0]).await?);
                     let bases = WorkItem {
                         commit_ids: fold_ids,
                         pos: 1,
@@ -550,10 +562,11 @@ async fn fold_commits<F: CommitFold>(
             }
         } else if let Some(below) = waiting.pop() {
             let bases = mem::replace(&mut item, below.item);
-            merged_bases.insert(bases.commit_ids, bases.merged.clone());
-            (bases.merged, below.base_ids)
+            let merged = fold.finish(bases.merged).await?;
+            merged_bases.insert(bases.commit_ids, merged.clone());
+            (merged, below.base_ids)
         } else {
-            return Ok(item.merged);
+            return fold.finish(item.merged).await;
         };
         let resolve = resolve || item.pos + 1 < item.commit_ids.len() || !waiting.is_empty();
         let (merged_ids, next_ids) = item.commit_ids.split_at(item.pos);
@@ -575,10 +588,39 @@ async fn fold_commits<F: CommitFold>(
 /// [`merge_rule`]: where V does not resolve, [`merge_rule::merge_parent_values`]
 /// gives the value at that path, so that V's terms cannot cancel content that
 /// the merged trees hold (<https://github.com/jj-vcs/jj/issues/6369>).
+///
+/// A merge that resolves is carried to the next commit as a [`FoldedMerge`],
+/// whose trees are not written, where the step is one it carries; its trees
+/// are written when the list's merge is done, or when a step it does not carry
+/// needs them.
 struct TreeFold;
+
+/// The number of steps of merges of many commits that wrote the trees of the
+/// merge they start from, because that merge could not be carried to the next
+/// commit unwritten, on this thread since it started. A merge runs on the
+/// thread that asks for it, so a test reads here what its own merges did,
+/// whatever the tests beside it do; nothing else reads it.
+pub fn steps_writing_trees() -> usize {
+    STEPS_WRITING_TREES.get()
+}
+
+thread_local! {
+    static STEPS_WRITING_TREES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The merge of the commits so far, as [`TreeFold`] carries it.
+enum TreeFolding {
+    /// A merge whose trees are written. `merged` says that it is what
+    /// [`MergedTree::resolve`] gave, its terms not simplified after the merge
+    /// of its trees (see [`FoldedMerge::from_tree`]).
+    Tree { tree: MergedTree, merged: bool },
+    /// A merge whose trees are not written.
+    Folded(FoldedMerge),
+}
 
 impl CommitFold for TreeFold {
     type Merged = MergedTree;
+    type Folding = TreeFolding;
 
     /// V merges the merge bases in the order of their commit ids, so that V
     /// does not depend on the order they were made in.
@@ -588,28 +630,80 @@ impl CommitFold for TreeFold {
         Ok(store.get_commit_async(id).await?.tree())
     }
 
+    fn start(&self, tree: MergedTree) -> TreeFolding {
+        TreeFolding::Tree {
+            tree,
+            merged: false,
+        }
+    }
+
     /// V's label lists the merge bases in the order the index returns them.
     async fn merge_next(
         &self,
         store: &Arc<Store>,
-        merged: MergedTree,
+        merged: TreeFolding,
         merged_ids: &[CommitId],
         next_id: &CommitId,
         (base, base_ids): (MergedTree, &[CommitId]),
         resolve: bool,
-    ) -> BackendResult<MergedTree> {
+    ) -> BackendResult<TreeFolding> {
         let merged_commits = try_join_all(merged_ids.iter().map(|id| store.get_commit_async(id)));
         let base_commits = try_join_all(base_ids.iter().map(|id| store.get_commit_async(id)));
         let next = store.get_commit_async(next_id);
         let (merged_commits, base_commits, next) = try_join!(merged_commits, base_commits, next)?;
-        merge_rule::merge_parent_trees(
+        let label = conflict_label_for_commits(&merged_commits);
+        let base_label = conflict_label_for_commits(&base_commits);
+        let (next_tree, next_label) = (next.tree(), next.conflict_label());
+        if resolve {
+            let seeded;
+            let folded = match &merged {
+                TreeFolding::Folded(folded) => Some(folded),
+                TreeFolding::Tree { tree, merged } => {
+                    seeded = FoldedMerge::from_tree(tree, *merged).await?;
+                    seeded.as_ref()
+                }
+            };
+            if let Some(folded) = folded {
+                let step = folded.merge_next(
+                    &label,
+                    (&base, base_label.as_str()),
+                    (&next_tree, next_label.as_str()),
+                );
+                if let Some(folded) = Box::pin(step).await? {
+                    return Ok(TreeFolding::Folded(folded));
+                }
+            }
+        }
+        STEPS_WRITING_TREES.set(STEPS_WRITING_TREES.get() + 1);
+        let tree = match merged {
+            TreeFolding::Tree { tree, .. } => tree,
+            TreeFolding::Folded(folded) => folded.into_tree().await?,
+        };
+        let num_terms: usize = [&tree, &base, &next_tree]
+            .iter()
+            .map(|tree| tree.tree_ids().as_slice().len())
+            .sum();
+        let (tree, replaced) = merge_rule::merge_parent_trees(
             store,
-            (merged, conflict_label_for_commits(&merged_commits)),
-            (base, conflict_label_for_commits(&base_commits)),
-            (next.tree(), next.conflict_label()),
+            (tree, label),
+            (base, base_label),
+            (next_tree, next_label),
             resolve,
         )
-        .await
+        .await?;
+        // The merge resolved its terms as they were, unless it simplified them
+        // or replaced a virtual merge base, either of which changes the number
+        // of terms or replaces some.
+        let merged =
+            resolve && replaced.is_empty() && tree.tree_ids().as_slice().len() == num_terms;
+        Ok(TreeFolding::Tree { tree, merged })
+    }
+
+    async fn finish(&self, merged: TreeFolding) -> BackendResult<MergedTree> {
+        match merged {
+            TreeFolding::Tree { tree, .. } => Ok(tree),
+            TreeFolding::Folded(folded) => folded.into_tree().await,
+        }
     }
 }
 
@@ -636,11 +730,16 @@ struct CommitIdFold;
 
 impl CommitFold for CommitIdFold {
     type Merged = Merge<CommitId>;
+    type Folding = Merge<CommitId>;
 
     const SORTS_BASES: bool = false;
 
     async fn commit(&self, _store: &Arc<Store>, id: &CommitId) -> BackendResult<Merge<CommitId>> {
         Ok(Merge::resolved(id.clone()))
+    }
+
+    fn start(&self, merged: Merge<CommitId>) -> Merge<CommitId> {
+        merged
     }
 
     async fn merge_next(
@@ -654,6 +753,10 @@ impl CommitFold for CommitIdFold {
     ) -> BackendResult<Merge<CommitId>> {
         let next = Merge::resolved(next_id.clone());
         Ok(Merge::from_vec(vec![merged, base, next]).flatten())
+    }
+
+    async fn finish(&self, merged: Merge<CommitId>) -> BackendResult<Merge<CommitId>> {
+        Ok(merged)
     }
 }
 

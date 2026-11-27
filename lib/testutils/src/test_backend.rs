@@ -22,6 +22,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use futures::AsyncRead;
@@ -123,6 +125,7 @@ pub struct TestBackend {
     empty_tree_id: TreeId,
     data: Arc<Mutex<TestBackendData>>,
     runtime: Runtime,
+    file_reads: AtomicUsize,
 }
 
 impl TestBackend {
@@ -138,7 +141,14 @@ impl TestBackend {
             empty_tree_id,
             data,
             runtime,
+            file_reads: AtomicUsize::new(0),
         }
+    }
+
+    /// The number of files read from this backend so far, each read counted,
+    /// so that a test can bound the work an operation does.
+    pub fn file_reads(&self) -> usize {
+        self.file_reads.load(Ordering::Relaxed)
     }
 
     fn locked_data(&self) -> MutexGuard<'_, TestBackendData> {
@@ -203,6 +213,7 @@ impl Backend for TestBackend {
         path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
+        self.file_reads.fetch_add(1, Ordering::Relaxed);
         let path = path.to_owned();
         let id = id.clone();
         self.run_async(move |data| {
