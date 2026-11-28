@@ -144,6 +144,19 @@ fn check_normalization_insensitive_fs(dir: &Path) -> bool {
     dir.join(nfd_name).try_exists().unwrap()
 }
 
+/// Returns true if the directory takes a name with `suffix` appended for the
+/// name itself, as Windows does with a trailing dot or space.
+fn check_ignores_name_suffix(dir: &Path, suffix: &str) -> bool {
+    let test_file = tempfile::Builder::new()
+        .prefix("suffix-")
+        .tempfile_in(dir)
+        .unwrap();
+    let orig_name = test_file.path().file_name().unwrap().to_str().unwrap();
+    dir.join(format!("{orig_name}{suffix}"))
+        .try_exists()
+        .unwrap()
+}
+
 /// The entries below `root`, by their paths relative to it: each directory
 /// with `None`, and each file with its contents.
 fn disk_entries(root: &Path) -> TestResult<BTreeMap<PathBuf, Option<Vec<u8>>>> {
@@ -4147,6 +4160,143 @@ fn test_checkout_threads_unicode_normalization_same_result() -> TestResult {
             assert_eq!(entries1.get(&nfd_path), Some(&Some(b"new nfd\n".to_vec())));
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_checkout_threads_windows_aliasing_names_same_result() -> TestResult {
+    // In each of a few directories, the new tree has a few files that keep the
+    // workers busy, then pairs of names that Windows takes for one entry:
+    // "ABCDEFGHIJ" and its 8.3 short name "ABCDEF~1" (on a file system that
+    // makes short names), and "bar" and "bar ", "dir/b" and "dir./a", and
+    // "foo" and "foo." (Windows strips a trailing dot or space from a name).
+    // A file system that takes the two names of a pair of files for one entry
+    // writes the first one and skips the second one, and writes "dir./a" in
+    // "dir": with 4 threads as with 1. Any other file system writes every
+    // file at its own path.
+    let dirs: u32 = 4;
+    let busy: u32 = 8;
+    let filler = "f".repeat(64 << 10);
+    // Each pair, with the name that comes first in the diff first.
+    let pairs = [
+        ("ABCDEFGHIJ", "ABCDEF~1"),
+        ("bar", "bar "),
+        ("dir/b", "dir./a"),
+        ("foo", "foo."),
+    ];
+    let check_out_with = |threads: usize| -> TestResult<(
+        TestRepo,
+        PathBuf,
+        jj_lib::working_copy::CheckoutStats,
+        BTreeMap<RepoPathBuf, FileState>,
+    )> {
+        let settings = checkout_threads_settings(Some(threads), "");
+        let tree_settings = TreeStateSettings::try_from_user_settings(&settings)?;
+        let test_repo = TestRepo::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+        let repo = &test_repo.repo;
+        let wc_root = test_repo.env.root().join("wc");
+        let state_dir = test_repo.env.root().join("state");
+        std::fs::create_dir(&wc_root)?;
+        std::fs::create_dir(&state_dir)?;
+        let mut tree_state = TreeState::init(
+            repo.store().clone(),
+            wc_root.clone(),
+            state_dir,
+            &tree_settings,
+        )?;
+        let tree = create_tree_with(repo, |builder| {
+            for i in 0..dirs {
+                for j in 0..busy {
+                    builder.file(&repo_path_buf(format!("n{i}/{j}")), &filler);
+                }
+                for (first, second) in pairs {
+                    for name in [first, second] {
+                        let path = format!("n{i}/{name}");
+                        let contents = format!("{path}\n");
+                        builder.file(&repo_path_buf(path), contents);
+                    }
+                }
+            }
+        });
+        let stats = tree_state.check_out(&tree)?;
+        let file_states = tree_state
+            .file_states()
+            .iter()
+            .map(|(path, state)| (path.to_owned(), state))
+            .collect();
+        Ok((test_repo, wc_root, stats, file_states))
+    };
+
+    let (_repo1, root1, stats1, states1) = check_out_with(1)?;
+    let (_repo4, root4, stats4, states4) = check_out_with(4)?;
+    let dot_ignored = check_ignores_name_suffix(&root1, ".");
+    // The second name of each pair of files, with whether the file system
+    // takes it for the first name.
+    let seconds = [
+        ("ABCDEF~1", check_vfat(&root1)),
+        ("bar ", check_ignores_name_suffix(&root1, " ")),
+        ("foo.", dot_ignored),
+    ];
+
+    let mut expected = BTreeMap::new();
+    let mut expected_skipped = 0;
+    for i in 0..dirs {
+        let dir = PathBuf::from(format!("n{i}"));
+        let contents = |name: &str| Some(format!("n{i}/{name}\n").into_bytes());
+        // A skipped path has a placeholder state, with no mtime.
+        let skipped = |name: &str| {
+            let path = repo_path_buf(format!("n{i}/{name}"));
+            states1[&path].mtime.0 == 0
+        };
+        expected.insert(dir.clone(), None);
+        for j in 0..busy {
+            expected.insert(dir.join(j.to_string()), Some(filler.as_bytes().to_vec()));
+        }
+        for (first, _) in pairs {
+            assert!(!skipped(first), "n{i}/{first}");
+            expected.insert(dir.join(first), contents(first));
+        }
+        for (name, aliased) in seconds {
+            assert_eq!(skipped(name), aliased, "n{i}/{name}");
+            if aliased {
+                expected_skipped += 1;
+            } else {
+                expected.insert(dir.join(name), contents(name));
+            }
+        }
+        // "dir./a" is written, in "dir" if the file system takes "dir." for
+        // "dir".
+        assert!(!skipped("dir./a"), "n{i}/dir./a");
+        expected.insert(dir.join("dir"), None);
+        if dot_ignored {
+            expected.insert(dir.join("dir/a"), contents("dir./a"));
+        } else {
+            expected.insert(dir.join("dir."), None);
+            expected.insert(dir.join("dir./a"), contents("dir./a"));
+        }
+    }
+
+    // The busy files and the 8 names of the pairs, in each directory.
+    assert_eq!(stats1.added_files, dirs * (busy + 8));
+    assert_eq!(stats1.updated_files, 0);
+    assert_eq!(stats1.removed_files, 0);
+    assert_eq!(stats1.skipped_files, expected_skipped);
+    assert_eq!(stats4.added_files, stats1.added_files);
+    assert_eq!(stats4.updated_files, stats1.updated_files);
+    assert_eq!(stats4.removed_files, stats1.removed_files);
+    assert_eq!(stats4.skipped_files, stats1.skipped_files);
+
+    assert_eq!(states1.keys().collect_vec(), states4.keys().collect_vec());
+    for (path, s1) in &states1 {
+        let s4 = &states4[path];
+        assert_eq!(s1.file_type, s4.file_type, "file_type for {path:?}");
+        assert_eq!(s1.size, s4.size, "size for {path:?}");
+        assert_eq!(s1.mtime.0 == 0, s4.mtime.0 == 0, "placeholder for {path:?}");
+    }
+
+    let entries1 = disk_entries(&root1)?;
+    assert_eq!(entries1, expected);
+    assert_eq!(disk_entries(&root4)?, entries1);
     Ok(())
 }
 

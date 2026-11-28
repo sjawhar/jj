@@ -881,12 +881,6 @@ impl DirCache {
         }
     }
 
-    /// Number of directory descriptors currently kept open by this cache.
-    #[cfg(all(unix, test))]
-    fn open_fd_count(&self) -> usize {
-        usize::from(self.root.is_some()) + usize::from(self.dir.is_some())
-    }
-
     /// Creates `disk_path`, which is in the working copy, new (`O_CREAT |
     /// O_EXCL`, which does not follow a symlink there) for writing, with the
     /// mode of `exec_bit`.
@@ -1046,25 +1040,18 @@ fn reject_existing_entry(
     err: io::Error,
     message: impl FnOnce() -> String,
 ) -> Result<(), CheckoutError> {
-    if err.kind() != io::ErrorKind::AlreadyExists {
-        // Workaround for "Access is denied. (os error 5)" error on Windows.
-        match disk_path.symlink_metadata() {
-            Ok(_) => {}
-            Err(stat_err) if stat_err.kind() == io::ErrorKind::NotFound => {
-                return Err(CheckoutError::Other {
-                    message: message(),
-                    err: err.into(),
-                });
-            }
-            Err(stat_err) => {
-                return Err(CheckoutError::Other {
-                    message: format!("Failed to stat {}", disk_path.display()),
-                    err: stat_err.into(),
-                });
-            }
-        }
+    // Workaround for "Access is denied. (os error 5)" error on Windows, which
+    // an entry that is already there may cause instead of `AlreadyExists`.
+    if err.kind() == io::ErrorKind::AlreadyExists {
+        reject_reserved_existing_path(disk_path)
+    } else if has_existing_entry(disk_path)? {
+        Ok(())
+    } else {
+        Err(CheckoutError::Other {
+            message: message(),
+            err: err.into(),
+        })
     }
-    reject_reserved_existing_path(disk_path)
 }
 
 /// Whether an entry is at `disk_path`, which the checkout then leaves as it
@@ -1086,22 +1073,29 @@ fn has_existing_entry(disk_path: &Path) -> Result<bool, CheckoutError> {
 /// Whether the entry name `name` could point to the ".git" or ".jj" entry of
 /// its directory on some file system, as git's own name rules see it: a name
 /// that is ".git" or ".jj" in any ASCII case and with trailing dots or spaces
-/// (Windows), any name that holds `~` (8.3 short names), `:` (NTFS streams)
-/// or `\`, and any name that is not ASCII (HFS+ ignores some code points, and
-/// case-insensitive file systems fold more than ASCII). Any other name never
-/// does, so the checks of the entry's identity against ".git" and ".jj" are
-/// run only for these names.
+/// (Windows), and any name that [`has_special_alias_char()`] is true for. Any
+/// other name never does, so the checks of the entry's identity against ".git"
+/// and ".jj" are run only for these names.
 fn could_alias_reserved_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return true;
     };
-    if !name.is_ascii() || name.contains(['~', ':', '\\']) {
+    if has_special_alias_char(name) {
         return true;
     }
     let trimmed = name.trim_end_matches(['.', ' ']);
     RESERVED_DIR_NAMES
         .iter()
         .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
+}
+
+/// Whether the entry name `name` holds a character by which some file system
+/// may take it for an entry of another name: `~` (8.3 short names), `:` (NTFS
+/// streams), `\`, or any character that is not ASCII (HFS+ ignores some code
+/// points, case-insensitive file systems fold more than ASCII, and some file
+/// systems take two Unicode normalizations of a name for one entry).
+fn has_special_alias_char(name: &str) -> bool {
+    !name.is_ascii() || name.contains(['~', ':', '\\'])
 }
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
@@ -3415,10 +3409,13 @@ struct WorkerQueue {
 /// - before it removes the directory of an old submodule, in which a queued
 ///   path may be about to be created by a name that differs by case;
 /// - before a path whose name, or the name of a directory to create for it,
-///   differs from a queued path's by case only, which a case-insensitive file
-///   system takes for the same entry;
-/// - before and after a path that is not ASCII, which a file system may take
-///   for a path that differs by more than ASCII case;
+///   differs from a queued path's by ASCII case only, which a case-insensitive
+///   file system takes for the same entry;
+/// - before and after a path that a file system may take for a path that
+///   differs from it by more than ASCII case ([`path_must_check_out_alone()`]):
+///   one with a name that is not ASCII (by Unicode case folding or
+///   normalization), that ends with a dot or a space (which Windows strips),
+///   or that holds `~` (an 8.3 short name), `:` or `\`;
 /// - before a path below the path queued last, which only a conflicted tree
 ///   has.
 struct CheckoutCoordinator<'scope, 'env> {
@@ -3581,13 +3578,16 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             path.split_common_prefix(&self.prev_created_path);
 
         let mut name_key = 0;
-        // A file system may take a path that is not ASCII for one that differs
-        // from it by more than ASCII case, which `folded_name_key()` does not
-        // tell: by Unicode case folding, or by Unicode normalization (as APFS
-        // takes the NFC "é" and the NFD "e\u{301}" for one name). So such a
-        // path is checked out alone: once the workers have finished every
-        // queued path, and before the next path.
-        let alone = self.inline_worker.is_none() && !path.as_internal_file_string().is_ascii();
+        // A file system may take a path for one that differs from it by more
+        // than ASCII case, which `folded_name_key()` does not tell: a path that
+        // is not ASCII, by Unicode case folding or by Unicode normalization (as
+        // APFS takes the NFC "é" and the NFD "e\u{301}" for one name), and on
+        // Windows, a name with a trailing dot or space for the name without it
+        // ("foo." for "foo"), and an 8.3 short name ("PROGRA~1") for its long
+        // name. So a path that may be such (`path_must_check_out_alone()`) is
+        // checked out alone: once the workers have finished every queued path,
+        // and before the next path.
+        let alone = self.inline_worker.is_none() && path_must_check_out_alone(&path);
         if self.inline_worker.is_none() {
             name_key = folded_name_key(&path);
             if self.has_in_flight() {
@@ -3726,7 +3726,7 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         // removed. A checkout that removes no path, as into an empty working
         // copy, never waits here.
         self.wait_for_workers();
-        remove_empty_parent_dirs(&path, disk_path);
+        remove_empty_parent_dirs(self.context.tree_state.working_copy_path(), disk_path);
         self.deleted_files.insert(path);
         Ok(())
     }
@@ -3962,7 +3962,8 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
                 CheckoutOutcome::AccessDenied(disk_path) => {
                     // The workers are done, so every directory that is empty
                     // now stays so.
-                    remove_empty_parent_dirs(&path, &disk_path);
+                    let working_copy_path = self.context.tree_state.working_copy_path();
+                    remove_empty_parent_dirs(working_copy_path, &disk_path);
                     self.deleted_files.insert(path);
                 }
             }
@@ -3990,34 +3991,74 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
     }
 }
 
-/// A key of `path` that is the same for two paths that differ by case only,
-/// which a case-insensitive file system takes for one entry. (Two paths that
-/// differ otherwise have the same key only by chance.) A file system may take
-/// two paths that are not ASCII for one entry although their keys differ (by
-/// Unicode normalization, say), so the coordinating thread checks out a path
-/// that is not ASCII alone, whatever its key.
+/// A key of `path` that is the same for two paths that differ by ASCII case
+/// only, which a case-insensitive file system takes for one entry. (Two paths
+/// that differ otherwise have the same key only by chance.) A file system may
+/// also take two paths for one entry that differ by more than ASCII case,
+/// although their keys differ, so the coordinating thread checks out such a
+/// path alone, whatever its key ([`path_must_check_out_alone()`]).
 fn folded_name_key(path: &RepoPath) -> u64 {
-    // FNV-1a over the lower-case characters.
+    // FNV-1a over the ASCII lower-case bytes.
     let mut key: u64 = 0xcbf2_9ce4_8422_2325;
-    let chars = path.as_internal_file_string().chars();
-    for c in chars.flat_map(char::to_lowercase) {
-        key = (key ^ u64::from(u32::from(c))).wrapping_mul(0x0000_0100_0000_01b3);
+    for byte in path.as_internal_file_string().bytes() {
+        let folded = u64::from(byte.to_ascii_lowercase());
+        key = (key ^ folded).wrapping_mul(0x0000_0100_0000_01b3);
     }
     key
 }
 
-/// Removes the directories above `path`, at `disk_path`, that its removal
-/// left empty, from the deepest one up to the first one that is not empty,
-/// stopping before the working copy root.
-fn remove_empty_parent_dirs(path: &RepoPath, disk_path: &Path) {
-    let mut dir = path.parent();
-    let mut disk_dir = disk_path.parent().unwrap();
-    while let Some(repo_dir) = dir {
-        if repo_dir.is_root() || fs::remove_dir(disk_dir).is_err() {
+/// Whether a file system may take the entry name `name` for a name that
+/// differs from it by more than ASCII case: one that
+/// [`has_special_alias_char()`] is true for, or one that ends with a dot or a
+/// space, which Windows strips ("foo." and "foo " are "foo").
+fn component_may_alias_beyond_ascii_case(name: &str) -> bool {
+    has_special_alias_char(name) || name.ends_with(['.', ' '])
+}
+
+/// Whether the coordinating thread checks out `path` alone: if a file system
+/// may take the name of the path, or of a directory above it, for a name that
+/// differs from it by more than ASCII case, which [`folded_name_key()`] does
+/// not tell.
+fn path_must_check_out_alone(path: &RepoPath) -> bool {
+    path.components()
+        .map(RepoPathComponent::as_internal_str)
+        .any(component_may_alias_beyond_ascii_case)
+}
+
+/// Removes the directories above `disk_path`, a path below the working copy
+/// root `working_copy_path`, that its removal left empty, from the deepest one
+/// up to the first one that is not empty, stopping before the root.
+///
+/// No directory is removed through a symlink: each entry from the root down
+/// is checked to be a directory and not a symlink (as one that the checkout
+/// walked through may have been replaced by a symlink since), and only the
+/// directories above the first entry that is not one are removed. The root
+/// itself may be a symlink.
+fn remove_empty_parent_dirs(working_copy_path: &Path, disk_path: &Path) {
+    let Some(dir) = disk_path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(working_copy_path).ok())
+    else {
+        return;
+    };
+    // Walk down from the root while each entry is a directory, which
+    // `symlink_metadata()` does not take a symlink to a directory for:
+    // `dir_path` ends as the deepest of these `depth` directories.
+    let mut dir_path = working_copy_path.to_owned();
+    let mut depth = 0;
+    for name in dir {
+        dir_path.push(name);
+        if !fs::symlink_metadata(&dir_path).is_ok_and(|metadata| metadata.is_dir()) {
+            dir_path.pop();
             break;
         }
-        disk_dir = disk_dir.parent().unwrap();
-        dir = repo_dir.parent();
+        depth += 1;
+    }
+    for _ in 0..depth {
+        if fs::remove_dir(&dir_path).is_err() {
+            break;
+        }
+        dir_path.pop();
     }
 }
 
@@ -5008,9 +5049,19 @@ mod tests {
         assert!(working_copy_path.join("dir/file").is_file());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_dir_cache_bounds_open_fds() {
+        // How many descriptors of this process are open on `dir` or on an
+        // entry below it, which no other test opens.
+        fn open_fds_under(dir: &Path) -> usize {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.starts_with(dir))
+                .count()
+        }
+
         let temp_dir = crate::tests::new_temp_dir();
         let working_copy_path = temp_dir.path().join("wc");
         let mut deep_dir = working_copy_path.clone();
@@ -5020,17 +5071,63 @@ mod tests {
         fs::create_dir_all(&deep_dir).unwrap();
         let sibling_dir = deep_dir.parent().unwrap().join("sibling");
         fs::create_dir(&sibling_dir).unwrap();
+        // The links in "/proc/self/fd" point to canonical paths.
+        let canonical_wc = working_copy_path.canonicalize().unwrap();
+        assert_eq!(open_fds_under(&canonical_wc), 0);
 
+        // However deep the directory of the file created last, the cache
+        // keeps at most the root and that directory open.
         let mut dir_cache = DirCache::new(&working_copy_path);
         dir_cache
             .create_new(&deep_dir.join("file.txt"), ExecBit(false))
             .unwrap();
-        assert!(dir_cache.open_fd_count() <= 2);
+        let open_fds = open_fds_under(&canonical_wc);
+        assert!((1..=2).contains(&open_fds), "open_fds={open_fds}");
         dir_cache
             .create_new(&sibling_dir.join("other.txt"), ExecBit(false))
             .unwrap();
-        assert!(dir_cache.open_fd_count() <= 2);
+        let open_fds = open_fds_under(&canonical_wc);
+        assert!((1..=2).contains(&open_fds), "open_fds={open_fds}");
         assert!(deep_dir.join("file.txt").is_file());
         assert!(sibling_dir.join("other.txt").is_file());
+
+        drop(dir_cache);
+        assert_eq!(open_fds_under(&canonical_wc), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_empty_parent_dirs_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = crate::tests::new_temp_dir();
+        let wc = temp_dir.path().join("wc");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir(&wc).unwrap();
+        fs::create_dir_all(outside.join("b")).unwrap();
+        symlink(&outside, wc.join("a")).unwrap();
+
+        // An empty directory is not removed through a symlink in the working
+        // copy, nor is the symlink.
+        remove_empty_parent_dirs(&wc, &wc.join("a/b/x"));
+        assert!(outside.join("b").is_dir());
+        assert!(wc.join("a").symlink_metadata().unwrap().is_symlink());
+
+        // Empty directories are removed from the deepest one up, and the
+        // working copy root is kept.
+        fs::remove_file(wc.join("a")).unwrap();
+        fs::create_dir_all(wc.join("real/sub")).unwrap();
+        remove_empty_parent_dirs(&wc, &wc.join("real/sub/x"));
+        assert!(!wc.join("real").exists());
+        assert!(wc.is_dir());
+        assert_eq!(fs::read_dir(&wc).unwrap().count(), 0);
+
+        // The working copy root itself may be a symlink.
+        let root_link = temp_dir.path().join("root-link");
+        symlink(&wc, &root_link).unwrap();
+        fs::create_dir_all(wc.join("real/sub")).unwrap();
+        remove_empty_parent_dirs(&root_link, &root_link.join("real/sub/x"));
+        assert!(!wc.join("real").exists());
+        assert!(root_link.symlink_metadata().unwrap().is_symlink());
     }
 }
