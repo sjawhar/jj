@@ -54,6 +54,7 @@ use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::local_working_copy::MaterializedConflictData;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::checkout_threads_from_settings;
 use jj_lib::local_working_copy::default_checkout_threads;
 use jj_lib::matchers::FilesMatcher;
 use jj_lib::merge::Merge;
@@ -128,6 +129,39 @@ fn check_vfat(dir: &Path) -> bool {
         .unwrap();
     let short_name = "VFATTE~1";
     dir.join(short_name).try_exists().unwrap()
+}
+
+/// Returns true if the directory takes the NFC and the NFD spelling of a name
+/// for one entry, as APFS does.
+fn check_normalization_insensitive_fs(dir: &Path) -> bool {
+    let test_file = tempfile::Builder::new()
+        .prefix("normalization-\u{e9}-")
+        .tempfile_in(dir)
+        .unwrap();
+    let orig_name = test_file.path().file_name().unwrap().to_str().unwrap();
+    let nfd_name = orig_name.replace('\u{e9}', "e\u{301}");
+    assert_ne!(orig_name, nfd_name);
+    dir.join(nfd_name).try_exists().unwrap()
+}
+
+/// The entries below `root`, by their paths relative to it: each directory
+/// with `None`, and each file with its contents.
+fn disk_entries(root: &Path) -> TestResult<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    let mut entries = BTreeMap::new();
+    let mut dirs = vec![root.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let relative = path.strip_prefix(root)?.to_owned();
+            if path.symlink_metadata()?.is_dir() {
+                entries.insert(relative, None);
+                dirs.push(path);
+            } else {
+                entries.insert(relative, Some(std::fs::read(&path)?));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn to_owned_path_vec(paths: &[&RepoPath]) -> Vec<RepoPathBuf> {
@@ -3828,6 +3862,7 @@ fn test_checkout_threads_setting() -> TestResult {
     let one_settings = checkout_threads_settings(Some(1), "");
     let one_tree_settings = TreeStateSettings::try_from_user_settings(&one_settings)?;
     assert_eq!(one_tree_settings.checkout_threads.get(), 1);
+    assert_eq!(checkout_threads_from_settings(&one_settings)?.get(), 1);
 
     let test_repo = TestRepo::init_with_backend_and_settings(TestRepoBackend::Git, &one_settings);
     let repo = &test_repo.repo;
@@ -3940,5 +3975,243 @@ fn test_checkout_threads_bounds_bytes_in_flight(threads: usize) -> TestResult {
         "expected peak <= {expected_cap}, got {peak2}"
     );
     assert_eq!(std::fs::read(wc_root.join("mix/big.dat"))?.len(), big_size);
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_never_writes_through_symlink_over_submodule(threads: usize) -> TestResult {
+    // The old commit has submodules at "d0".."d7", whose directories are empty
+    // on disk. The new commit has a file at "D0/x".."D7/x", and a symlink at
+    // "d0".."d7" to a directory outside the working copy. On a
+    // case-insensitive file system, "D0/x" goes in the submodule directory
+    // "d0", which then is not empty, so it is not removed and the symlink is
+    // skipped. A file is never written through the symlink, with any number
+    // of threads.
+    if !check_symlink_support()? {
+        eprintln!("Skipping test because symlink isn't supported");
+        return Ok(());
+    }
+    let settings = checkout_threads_settings(Some(threads), "");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = test_workspace.repo.clone();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    let is_icase_fs = check_icase_fs(&workspace_root);
+    let outside = test_workspace.env.root().join("outside");
+    std::fs::create_dir(&outside)?;
+
+    let mut tx = repo.start_transaction();
+    let submodule_id = write_random_commit(tx.repo_mut()).id().clone();
+    tx.commit("submodule").block_on()?;
+    let pairs: u32 = 8;
+    let tree1 = create_tree_with(&repo, |builder| {
+        for i in 0..pairs {
+            builder.submodule(&repo_path_buf(format!("d{i}")), submodule_id.clone());
+        }
+    });
+    // Large enough that a worker takes a while to read and write each file.
+    let contents = "x".repeat(256 << 10);
+    let tree2 = create_tree_with(&repo, |builder| {
+        for i in 0..pairs {
+            builder.file(&repo_path_buf(format!("D{i}/x")), &contents);
+            builder.symlink(&repo_path_buf(format!("d{i}")), "../outside");
+        }
+    });
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(
+        repo.op_id().clone(),
+        None,
+        &commit_with_tree(repo.store(), tree1),
+    )
+    .block_on()?;
+    for i in 0..pairs {
+        assert!(workspace_root.join(format!("d{i}")).is_dir());
+    }
+    let stats = ws
+        .check_out(
+            repo.op_id().clone(),
+            None,
+            &commit_with_tree(repo.store(), tree2),
+        )
+        .block_on()?;
+
+    assert_eq!(
+        disk_entries(&outside)?,
+        BTreeMap::new(),
+        "threads={threads}"
+    );
+    for i in 0..pairs {
+        assert_eq!(
+            std::fs::read(workspace_root.join(format!("D{i}/x")))?,
+            contents.as_bytes()
+        );
+        let link_meta = workspace_root.join(format!("d{i}")).symlink_metadata()?;
+        if is_icase_fs {
+            assert!(link_meta.is_dir(), "d{i}, threads={threads}");
+        } else {
+            assert!(link_meta.is_symlink(), "d{i}, threads={threads}");
+        }
+    }
+    assert_eq!(stats.skipped_files, if is_icase_fs { pairs } else { 0 });
+    Ok(())
+}
+
+#[test]
+fn test_checkout_threads_unicode_normalization_same_result() -> TestResult {
+    // The old tree has the NFC name "\u{e9}" in each of a few directories. The
+    // new tree changes it, and adds the NFD name "e\u{301}" after a few files
+    // that keep the workers busy. A file system that takes both names for one
+    // entry (APFS) skips the NFD name, which comes first, and then replaces
+    // the NFC file: with 4 threads as with 1.
+    let nfc = "\u{e9}";
+    let nfd = "e\u{301}";
+    let dirs: u32 = 8;
+    let check_out_with = |threads: usize| -> TestResult<(
+        TestRepo,
+        PathBuf,
+        jj_lib::working_copy::CheckoutStats,
+        BTreeMap<RepoPathBuf, FileState>,
+    )> {
+        let settings = checkout_threads_settings(Some(threads), "");
+        let tree_settings = TreeStateSettings::try_from_user_settings(&settings)?;
+        let test_repo = TestRepo::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+        let repo = &test_repo.repo;
+        let wc_root = test_repo.env.root().join("wc");
+        let state_dir = test_repo.env.root().join("state");
+        std::fs::create_dir(&wc_root)?;
+        std::fs::create_dir(&state_dir)?;
+        let mut tree_state = TreeState::init(
+            repo.store().clone(),
+            wc_root.clone(),
+            state_dir,
+            &tree_settings,
+        )?;
+        let tree1 = create_tree_with(repo, |builder| {
+            for i in 0..dirs {
+                builder.file(&repo_path_buf(format!("n{i}/{nfc}")), "old nfc\n");
+            }
+        });
+        tree_state.check_out(&tree1)?;
+        let filler = "f".repeat(64 << 10);
+        let tree2 = create_tree_with(repo, |builder| {
+            for i in 0..dirs {
+                for j in 0..8 {
+                    builder.file(&repo_path_buf(format!("n{i}/a{j}")), &filler);
+                }
+                builder.file(&repo_path_buf(format!("n{i}/{nfd}")), "new nfd\n");
+                builder.file(&repo_path_buf(format!("n{i}/{nfc}")), "new nfc\n");
+            }
+        });
+        let stats = tree_state.check_out(&tree2)?;
+        let file_states = tree_state
+            .file_states()
+            .iter()
+            .map(|(path, state)| (path.to_owned(), state))
+            .collect();
+        Ok((test_repo, wc_root, stats, file_states))
+    };
+
+    let (_repo1, root1, stats1, states1) = check_out_with(1)?;
+    let (_repo4, root4, stats4, states4) = check_out_with(4)?;
+    let normalization_insensitive = check_normalization_insensitive_fs(&root1);
+
+    assert_eq!(stats1.added_files, dirs * 9);
+    assert_eq!(stats1.updated_files, dirs);
+    assert_eq!(stats1.removed_files, 0);
+    let expected_skipped = if normalization_insensitive { dirs } else { 0 };
+    assert_eq!(stats1.skipped_files, expected_skipped);
+    assert_eq!(stats4.added_files, stats1.added_files);
+    assert_eq!(stats4.updated_files, stats1.updated_files);
+    assert_eq!(stats4.removed_files, stats1.removed_files);
+    assert_eq!(stats4.skipped_files, stats1.skipped_files);
+
+    assert_eq!(states1.keys().collect_vec(), states4.keys().collect_vec());
+    for (path, s1) in &states1 {
+        let s4 = &states4[path];
+        assert_eq!(s1.file_type, s4.file_type, "file_type for {path:?}");
+        assert_eq!(s1.size, s4.size, "size for {path:?}");
+        // A skipped path has a placeholder state, with no mtime.
+        assert_eq!(s1.mtime.0 == 0, s4.mtime.0 == 0, "placeholder for {path:?}");
+    }
+
+    let entries1 = disk_entries(&root1)?;
+    assert_eq!(entries1, disk_entries(&root4)?);
+    for i in 0..dirs {
+        let nfc_path = PathBuf::from(format!("n{i}/{nfc}"));
+        let nfd_path = PathBuf::from(format!("n{i}/{nfd}"));
+        assert_eq!(entries1.get(&nfc_path), Some(&Some(b"new nfc\n".to_vec())));
+        if normalization_insensitive {
+            assert!(!entries1.contains_key(&nfd_path));
+        } else {
+            assert_eq!(entries1.get(&nfd_path), Some(&Some(b"new nfd\n".to_vec())));
+        }
+    }
+    Ok(())
+}
+
+#[test_case(1 ; "1 thread")]
+#[test_case(4 ; "4 threads")]
+fn test_checkout_threads_access_denied_over_file_on_disk(threads: usize) -> TestResult {
+    // The secret backend refuses to read files with "secret" in their path.
+    // Such a file is skipped if an untracked file is in its place on disk, as
+    // any file of the checkout is, and is treated as removed otherwise.
+    let settings = checkout_threads_settings(Some(threads), "");
+    let test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let repo = &test_workspace.repo;
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    let denied_on_disk_path = repo_path("secret/on-disk");
+    let denied_path = repo_path("secret/not-on-disk");
+    let public_path = repo_path("public");
+    let tree = create_tree(
+        repo,
+        &[
+            (denied_on_disk_path, "from repo"),
+            (denied_path, "from repo"),
+            (public_path, "public"),
+        ],
+    );
+    let commit = commit_with_tree(repo.store(), tree);
+    SecretBackend::adopt_git_repo(&workspace_root);
+    let mut ws = Workspace::load(
+        &settings,
+        &workspace_root,
+        &test_workspace.env.default_backend_factories(),
+        &default_working_copy_factories(),
+    )?;
+    let repo = ws.repo_loader().load_at(repo.operation()).block_on()?;
+    let commit = repo.store().get_commit(commit.id())?;
+
+    testutils::write_working_copy_file(&workspace_root, denied_on_disk_path, "untracked");
+    let stats = ws
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+
+    assert_eq!(stats.added_files, 3);
+    assert_eq!(stats.skipped_files, 1);
+    assert_eq!(
+        std::fs::read(denied_on_disk_path.to_fs_path_unchecked(&workspace_root))?,
+        b"untracked"
+    );
+    assert!(
+        !denied_path
+            .to_fs_path_unchecked(&workspace_root)
+            .try_exists()?
+    );
+    assert_eq!(
+        std::fs::read(public_path.to_fs_path_unchecked(&workspace_root))?,
+        b"public"
+    );
+    let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
+    let file_states = wc.file_states()?;
+    // The skipped file has a placeholder state, so that the next snapshot
+    // looks at it.
+    let on_disk_state = file_states.get(denied_on_disk_path).unwrap();
+    assert_eq!(on_disk_state.size, 0);
+    assert_eq!(on_disk_state.mtime.0, 0);
+    assert_eq!(file_states.get(denied_path), None);
+    assert_eq!(file_states.get(public_path).unwrap().size, 6);
     Ok(())
 }

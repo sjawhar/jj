@@ -150,6 +150,10 @@ impl Backend for JitBackend {
         self.inner.read_file(path, id).await
     }
 
+    async fn file_size(&self, path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+        self.inner.file_size(path, id).await
+    }
+
     async fn write_file(
         &self,
         path: &RepoPath,
