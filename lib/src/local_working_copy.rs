@@ -837,32 +837,35 @@ fn create_new_file(
 
 /// What a checkout thread keeps open to create new files relative to a
 /// directory (`openat()`), which looks up one name instead of every component
-/// of the path: the working copy root, and each directory below it down to
-/// the one that the thread last created a file in.
+/// of the path: the working copy root, and the deepest directory below it that
+/// the thread last created a file in (at most two open descriptors at rest,
+/// and at most three while walking down).
 ///
 /// The directories below the root are opened one name at a time from the root
-/// down, and none through a symlink: each is opened with `O_NOFOLLOW` (and not
-/// with `O_DIRECTORY`, with which some systems follow a symlink to a directory
-/// despite `O_NOFOLLOW`), and checked to be a directory with `fstat()`. So a
-/// file is never created through a symlink below the root, even if one of its
-/// directories, which the coordinating thread created, was replaced by a
-/// symlink since. The root itself may be a symlink.
+/// down (or from the kept directory when descending into it), and none through
+/// a symlink: each is opened with `O_NOFOLLOW` (and not with `O_DIRECTORY`,
+/// with which some systems follow a symlink to a directory despite
+/// `O_NOFOLLOW`), checked to be a directory with `fstat()`, and each parent is
+/// dropped as soon as its child is open. So regular files are never created
+/// through a symlink below the root (except under an unreadable directory,
+/// where every component is checked with `symlink_metadata()` first), even if
+/// a directory the coordinating thread created was replaced by a symlink
+/// since. The root itself may be a symlink.
 ///
 /// A directory may still be removed and made again while it is kept (when a
 /// removed path is the same entry on a case-insensitive file system, say). So
-/// a create that fails drops the kept directories, and a create that finds a
-/// kept directory gone (`ENOENT`) opens the directories again from the root
-/// and is tried once more.
+/// a create that fails drops the kept directory, and a create that finds a
+/// kept directory gone (`ENOENT`) walks again from the root, once.
 struct DirCache {
     #[cfg(unix)]
     working_copy_path: PathBuf,
     /// The working copy root, once a file was created.
     #[cfg(unix)]
     root: Option<rustix::fd::OwnedFd>,
-    /// The directories below the root that are kept, each with its name, from
-    /// the root's entry down.
+    /// The deepest directory below the root that is kept, with its path
+    /// relative to the root.
     #[cfg(unix)]
-    dirs: Vec<(OsString, rustix::fd::OwnedFd)>,
+    dir: Option<(PathBuf, rustix::fd::OwnedFd)>,
 }
 
 impl DirCache {
@@ -874,8 +877,14 @@ impl DirCache {
             #[cfg(unix)]
             root: None,
             #[cfg(unix)]
-            dirs: Vec::new(),
+            dir: None,
         }
+    }
+
+    /// Number of directory descriptors currently kept open by this cache.
+    #[cfg(all(unix, test))]
+    fn open_fd_count(&self) -> usize {
+        usize::from(self.root.is_some()) + usize::from(self.dir.is_some())
     }
 
     /// Creates `disk_path`, which is in the working copy, new (`O_CREAT |
@@ -907,14 +916,11 @@ impl DirCache {
         };
         let mode = Mode::from_raw_mode(exec_bit.new_file_mode() as RawMode);
         loop {
-            let kept = self
-                .dirs
-                .iter()
-                .zip(dir)
-                .take_while(|((kept_name, _), name)| kept_name.as_os_str() == *name)
-                .count();
-            self.dirs.truncate(kept);
-            let created = match self.open_dirs(dir, kept) {
+            let reused = self
+                .dir
+                .as_ref()
+                .is_some_and(|(kept_path, _)| dir.starts_with(kept_path));
+            let created = match self.open_dir(dir) {
                 Ok(dir_fd) => rustix::fs::openat(
                     dir_fd,
                     name,
@@ -925,7 +931,7 @@ impl DirCache {
                 // permission (mode 0o300, say) can't be opened, but a file can
                 // be created in it by path.
                 Err(Errno::ACCESS) => {
-                    self.dirs.clear();
+                    self.dir = None;
                     return self.create_new_in_unreadable_dir(disk_path, dir, exec_bit);
                 }
                 Err(err) => Err(err),
@@ -933,10 +939,10 @@ impl DirCache {
             match created {
                 Ok(file) => return Ok(File::from(file)),
                 Err(err) => {
-                    self.dirs.clear();
-                    // A kept directory is gone if it was removed since: the
-                    // directories are opened again from the root, once.
-                    if !(kept > 0 && err == Errno::NOENT) {
+                    self.dir = None;
+                    // A kept directory is gone if it was removed since: walk
+                    // again from the root, once.
+                    if !(reused && err == Errno::NOENT) {
                         return Err(err.into());
                     }
                 }
@@ -944,12 +950,12 @@ impl DirCache {
         }
     }
 
-    /// Opens the working copy root if it is not open, and the directories of
-    /// `dir`, a path relative to the root, below the first `kept` ones, which
-    /// are kept open already: each relative to the directory above it, and
-    /// none through a symlink. Returns the directory `dir`.
+    /// Opens the working copy root if it is not open, and walks to `dir`, a
+    /// path relative to the root, one component at a time without following a
+    /// symlink. Drops each intermediate descriptor as soon as its child is
+    /// open, keeping at most the root and `dir`.
     #[cfg(unix)]
-    fn open_dirs(&mut self, dir: &Path, kept: usize) -> rustix::io::Result<&rustix::fd::OwnedFd> {
+    fn open_dir(&mut self, dir: &Path) -> rustix::io::Result<&rustix::fd::OwnedFd> {
         use rustix::fs::FileType;
         use rustix::fs::Mode;
         use rustix::fs::OFlags;
@@ -961,8 +967,25 @@ impl DirCache {
                 Mode::empty(),
             )?);
         }
-        for name in dir.iter().skip(kept) {
-            let parent = self.last_dir();
+        if dir.as_os_str().is_empty() {
+            self.dir = None;
+            return Ok(self.root.as_ref().unwrap());
+        }
+        if let Some((kept_path, _)) = &self.dir
+            && kept_path == dir
+        {
+            return Ok(&self.dir.as_ref().unwrap().1);
+        }
+        let (mut cur, tail) = match self.dir.take() {
+            Some((kept_path, kept_fd)) => match dir.strip_prefix(&kept_path) {
+                Ok(tail) => (Some(kept_fd), tail),
+                Err(_) => (None, dir),
+            },
+            None => (None, dir),
+        };
+        let root = self.root.as_ref().unwrap();
+        for name in tail {
+            let parent = cur.as_ref().unwrap_or(root);
             // `O_NONBLOCK`, so that the open of a FIFO there does not wait for
             // a writer before the check of the entry's type refuses it.
             let fd = rustix::fs::openat(
@@ -974,19 +997,10 @@ impl DirCache {
             if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::Directory {
                 return Err(Errno::NOTDIR);
             }
-            self.dirs.push((name.to_owned(), fd));
+            cur = Some(fd);
         }
-        Ok(self.last_dir())
-    }
-
-    /// The deepest directory that is open.
-    #[cfg(unix)]
-    fn last_dir(&self) -> &rustix::fd::OwnedFd {
-        self.dirs
-            .last()
-            .map(|(_, fd)| fd)
-            .or(self.root.as_ref())
-            .expect("the working copy root is open")
+        let fd = cur.expect("non-empty relative directory has at least one component");
+        Ok(&self.dir.insert((dir.to_owned(), fd)).1)
     }
 
     /// Creates `disk_path` new by its path, in the directory `dir` (relative
@@ -4992,5 +5006,31 @@ mod tests {
             .create_new(&root_link.join("dir/file"), ExecBit(false))
             .unwrap();
         assert!(working_copy_path.join("dir/file").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_cache_bounds_open_fds() {
+        let temp_dir = crate::tests::new_temp_dir();
+        let working_copy_path = temp_dir.path().join("wc");
+        let mut deep_dir = working_copy_path.clone();
+        for i in 0..20 {
+            deep_dir.push(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep_dir).unwrap();
+        let sibling_dir = deep_dir.parent().unwrap().join("sibling");
+        fs::create_dir(&sibling_dir).unwrap();
+
+        let mut dir_cache = DirCache::new(&working_copy_path);
+        dir_cache
+            .create_new(&deep_dir.join("file.txt"), ExecBit(false))
+            .unwrap();
+        assert!(dir_cache.open_fd_count() <= 2);
+        dir_cache
+            .create_new(&sibling_dir.join("other.txt"), ExecBit(false))
+            .unwrap();
+        assert!(dir_cache.open_fd_count() <= 2);
+        assert!(deep_dir.join("file.txt").is_file());
+        assert!(sibling_dir.join("other.txt").is_file());
     }
 }
