@@ -81,6 +81,21 @@ impl SecretBackend {
     }
 }
 
+/// Refuses to read the object with the id `hex` at `path` if the path has the
+/// word "secret" in it, or the object's contents are "secret" or "secret\n".
+fn check_access(path: &RepoPath, object_type: &str, hex: String) -> BackendResult<()> {
+    if path.as_internal_file_string().contains("secret")
+        || SECRET_CONTENTS_HEX.contains(&hex.as_str())
+    {
+        return Err(BackendError::ReadAccessDenied {
+            object_type: object_type.to_string(),
+            hash: hex,
+            source: "No access".into(),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Backend for SecretBackend {
     fn name(&self) -> &str {
@@ -116,16 +131,14 @@ impl Backend for SecretBackend {
         path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
-        if path.as_internal_file_string().contains("secret")
-            || SECRET_CONTENTS_HEX.contains(&id.hex().as_ref())
-        {
-            return Err(BackendError::ReadAccessDenied {
-                object_type: "file".to_string(),
-                hash: id.hex(),
-                source: "No access".into(),
-            });
-        }
+        check_access(path, "file", id.hex())?;
         self.inner.read_file(path, id).await
+    }
+
+    async fn file_size(&self, path: &RepoPath, id: &FileId) -> BackendResult<Option<u64>> {
+        // The size of a file that can't be read is not told either.
+        check_access(path, "file", id.hex())?;
+        self.inner.file_size(path, id).await
     }
 
     async fn write_file(
@@ -137,15 +150,7 @@ impl Backend for SecretBackend {
     }
 
     async fn read_symlink(&self, path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        if path.as_internal_file_string().contains("secret")
-            || SECRET_CONTENTS_HEX.contains(&id.hex().as_ref())
-        {
-            return Err(BackendError::ReadAccessDenied {
-                object_type: "symlink".to_string(),
-                hash: id.hex(),
-                source: "No access".into(),
-            });
-        }
+        check_access(path, "symlink", id.hex())?;
         self.inner.read_symlink(path, id).await
     }
 

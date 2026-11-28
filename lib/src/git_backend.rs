@@ -180,14 +180,20 @@ pub enum GitGcError {
 }
 
 pub struct GitBackend {
-    // While gix::Repository can be created from gix::ThreadSafeRepository, it's
-    // cheaper to cache the thread-local instance behind a mutex than creating
-    // one for each backend method call. Our GitBackend is most likely to be
-    // used in a single-threaded context.
     base_repo: gix::ThreadSafeRepository,
+    // The handle that object writes (`write_file()`, `write_symlink()`,
+    // `write_tree()`, `write_commit()`), tree and commit reads, imports of Git
+    // commits and gc go through. While gix::Repository can be created from
+    // gix::ThreadSafeRepository, it's cheaper to cache the thread-local
+    // instance behind a mutex than creating one for each backend method call.
+    // These methods are mostly called from one thread at a time.
     repo: Mutex<gix::Repository>,
-    /// The repository handle that each thread reads file and symlink
-    /// contents through ([`Self::read_repo()`]).
+    /// The repository handle that each thread reads file and symlink contents
+    /// through ([`Self::read_repo()`]): `read_file()` and `read_symlink()`
+    /// (which read through `read_blob_sync()`), and `file_size()`. A checkout
+    /// calls these on several threads at once, which would otherwise wait
+    /// for each other on the lock of `repo`, and each handle keeps a pack
+    /// cache of its own.
     read_repos: ThreadLocal<gix::Repository>,
     /// How many handles `read_repos` has opened.
     read_repos_opened: AtomicUsize,

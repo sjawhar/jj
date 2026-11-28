@@ -18,7 +18,6 @@ use std::io::Write as _;
 use clap_complete::ArgValueCompleter;
 use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
-use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::file_util::IoResultExt as _;
 use jj_lib::fsmonitor::FsmonitorSettings;
 use jj_lib::gitignore::GitIgnoreFile;
@@ -27,7 +26,7 @@ use jj_lib::local_working_copy::ExecChangeSetting;
 use jj_lib::local_working_copy::FilterSettings;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
-use jj_lib::local_working_copy::default_checkout_threads;
+use jj_lib::local_working_copy::checkout_threads_from_settings;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::repo::Repo as _;
@@ -120,11 +119,7 @@ pub(crate) async fn cmd_file_edit(
     let state_dir = temp_dir.path().join("state");
     std::fs::create_dir(&wc_path).context(&wc_path)?;
     std::fs::create_dir(&state_dir).context(&state_dir)?;
-    let checkout_threads = workspace_command
-        .settings()
-        .get("working-copy.checkout-threads")
-        .optional()?
-        .unwrap_or_else(default_checkout_threads);
+    let checkout_threads = checkout_threads_from_settings(workspace_command.settings())?;
     let tree_state_settings = TreeStateSettings {
         conflict_marker_style,
         eol_conversion_mode: EolConversionMode::None,

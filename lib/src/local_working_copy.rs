@@ -290,6 +290,8 @@ impl ExecBit {
     /// The mode that a checkout creates a new file with on Unix: executable
     /// (0o755) or not (0o644), as far as the process's umask allows. Every
     /// file is written by creating it new, so this is the file's whole mode.
+    /// It is also the mode that the checkout sets on an executable file that
+    /// the umask left with no executable bit.
     #[cfg(unix)]
     fn new_file_mode(self) -> u32 {
         if self.0 { 0o755 } else { 0o644 }
@@ -833,79 +835,191 @@ fn create_new_file(
     Ok(Some(file))
 }
 
-/// The directory that a checkout thread last created a new file in, kept
-/// open so that the next file in it is created relative to it (`openat()`),
-/// which looks up one name instead of every component of the path.
+/// What a checkout thread keeps open to create new files relative to a
+/// directory (`openat()`), which looks up one name instead of every component
+/// of the path: the working copy root, and each directory below it down to
+/// the one that the thread last created a file in.
 ///
-/// The directories were created by the coordinating thread, never through a
-/// symlink. A directory is kept only after a file was created in it, but it
-/// may still be removed and made again while it is kept (when a removed path
-/// is the same entry on a case-insensitive file system, say). So a create
-/// that fails drops the kept directory, and a create in the kept directory
-/// that finds it gone (`ENOENT`) opens the directory again by its path and
-/// is tried once more.
-#[derive(Default)]
+/// The directories below the root are opened one name at a time from the root
+/// down, and none through a symlink: each is opened with `O_NOFOLLOW` (and not
+/// with `O_DIRECTORY`, with which some systems follow a symlink to a directory
+/// despite `O_NOFOLLOW`), and checked to be a directory with `fstat()`. So a
+/// file is never created through a symlink below the root, even if one of its
+/// directories, which the coordinating thread created, was replaced by a
+/// symlink since. The root itself may be a symlink.
+///
+/// A directory may still be removed and made again while it is kept (when a
+/// removed path is the same entry on a case-insensitive file system, say). So
+/// a create that fails drops the kept directories, and a create that finds a
+/// kept directory gone (`ENOENT`) opens the directories again from the root
+/// and is tried once more.
 struct DirCache {
     #[cfg(unix)]
-    dir: Option<(PathBuf, rustix::fd::OwnedFd)>,
+    working_copy_path: PathBuf,
+    /// The working copy root, once a file was created.
+    #[cfg(unix)]
+    root: Option<rustix::fd::OwnedFd>,
+    /// The directories below the root that are kept, each with its name, from
+    /// the root's entry down.
+    #[cfg(unix)]
+    dirs: Vec<(OsString, rustix::fd::OwnedFd)>,
 }
 
 impl DirCache {
-    /// Creates `disk_path` new (`O_CREAT | O_EXCL`, which does not follow a
-    /// symlink there) for writing, with the mode of `exec_bit`. If the
-    /// directory can't be opened, the file is created by its path.
     #[cfg_attr(windows, expect(unused_variables))]
+    fn new(working_copy_path: &Path) -> Self {
+        Self {
+            #[cfg(unix)]
+            working_copy_path: working_copy_path.to_owned(),
+            #[cfg(unix)]
+            root: None,
+            #[cfg(unix)]
+            dirs: Vec::new(),
+        }
+    }
+
+    /// Creates `disk_path`, which is in the working copy, new (`O_CREAT |
+    /// O_EXCL`, which does not follow a symlink there) for writing, with the
+    /// mode of `exec_bit`.
     fn create_new(&mut self, disk_path: &Path, exec_bit: ExecBit) -> io::Result<File> {
         #[cfg(unix)]
-        if let (Some(parent), Some(name)) = (disk_path.parent(), disk_path.file_name()) {
-            use rustix::fs::Mode;
-            use rustix::fs::OFlags;
-            use rustix::io::Errno;
-            let mode = if exec_bit.0 {
-                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
-            } else {
-                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
-            };
-            loop {
-                let reused = self.dir.as_ref().is_some_and(|(path, _)| path == parent);
-                if !reused {
-                    self.dir = None;
-                    match rustix::fs::open(
-                        parent,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    ) {
-                        Ok(dir) => self.dir = Some((parent.to_owned(), dir)),
-                        // A directory with write and search permission but
-                        // no read permission (mode 0o300, say) can't be
-                        // opened, but a file can be created in it by path.
-                        Err(_) => break,
-                    }
-                }
-                let (_, dir) = self.dir.as_ref().expect("the directory is open");
-                match rustix::fs::openat(
-                    dir,
+        return self.create_new_in_dir(disk_path, exec_bit);
+        #[cfg(windows)]
+        return create_new_by_path(disk_path, exec_bit);
+    }
+
+    #[cfg(unix)]
+    fn create_new_in_dir(&mut self, disk_path: &Path, exec_bit: ExecBit) -> io::Result<File> {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+        use rustix::fs::RawMode;
+        use rustix::io::Errno;
+        let (Some(name), Some(dir)) = (
+            disk_path.file_name(),
+            disk_path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(&self.working_copy_path).ok()),
+        ) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not in the working copy", disk_path.display()),
+            ));
+        };
+        let mode = Mode::from_raw_mode(exec_bit.new_file_mode() as RawMode);
+        loop {
+            let kept = self
+                .dirs
+                .iter()
+                .zip(dir)
+                .take_while(|((kept_name, _), name)| kept_name.as_os_str() == *name)
+                .count();
+            self.dirs.truncate(kept);
+            let created = match self.open_dirs(dir, kept) {
+                Ok(dir_fd) => rustix::fs::openat(
+                    dir_fd,
                     name,
                     OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
                     mode,
-                ) {
-                    Ok(file) => return Ok(File::from(file)),
-                    Err(err) => {
-                        self.dir = None;
-                        if !(reused && err == Errno::NOENT) {
-                            return Err(err.into());
-                        }
+                ),
+                // A directory with write and search permission but no read
+                // permission (mode 0o300, say) can't be opened, but a file can
+                // be created in it by path.
+                Err(Errno::ACCESS) => {
+                    self.dirs.clear();
+                    return self.create_new_in_unreadable_dir(disk_path, dir, exec_bit);
+                }
+                Err(err) => Err(err),
+            };
+            match created {
+                Ok(file) => return Ok(File::from(file)),
+                Err(err) => {
+                    self.dirs.clear();
+                    // A kept directory is gone if it was removed since: the
+                    // directories are opened again from the root, once.
+                    if !(kept > 0 && err == Errno::NOENT) {
+                        return Err(err.into());
                     }
                 }
             }
         }
-        let mut options = OpenOptions::new();
-        // Don't overwrite un-ignored file. Don't follow symlink.
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(exec_bit.new_file_mode());
-        options.open(disk_path)
     }
+
+    /// Opens the working copy root if it is not open, and the directories of
+    /// `dir`, a path relative to the root, below the first `kept` ones, which
+    /// are kept open already: each relative to the directory above it, and
+    /// none through a symlink. Returns the directory `dir`.
+    #[cfg(unix)]
+    fn open_dirs(&mut self, dir: &Path, kept: usize) -> rustix::io::Result<&rustix::fd::OwnedFd> {
+        use rustix::fs::FileType;
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+        use rustix::io::Errno;
+        if self.root.is_none() {
+            self.root = Some(rustix::fs::open(
+                self.working_copy_path.as_path(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+        }
+        for name in dir.iter().skip(kept) {
+            let parent = self.last_dir();
+            // `O_NONBLOCK`, so that the open of a FIFO there does not wait for
+            // a writer before the check of the entry's type refuses it.
+            let fd = rustix::fs::openat(
+                parent,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::Directory {
+                return Err(Errno::NOTDIR);
+            }
+            self.dirs.push((name.to_owned(), fd));
+        }
+        Ok(self.last_dir())
+    }
+
+    /// The deepest directory that is open.
+    #[cfg(unix)]
+    fn last_dir(&self) -> &rustix::fd::OwnedFd {
+        self.dirs
+            .last()
+            .map(|(_, fd)| fd)
+            .or(self.root.as_ref())
+            .expect("the working copy root is open")
+    }
+
+    /// Creates `disk_path` new by its path, in the directory `dir` (relative
+    /// to the working copy root) that can't be opened: only if each directory
+    /// from the root down to it is a directory and not a symlink.
+    #[cfg(unix)]
+    fn create_new_in_unreadable_dir(
+        &self,
+        disk_path: &Path,
+        dir: &Path,
+        exec_bit: ExecBit,
+    ) -> io::Result<File> {
+        let mut dir_path = self.working_copy_path.clone();
+        for name in dir {
+            dir_path.push(name);
+            if !dir_path.symlink_metadata()?.is_dir() {
+                return Err(rustix::io::Errno::NOTDIR.into());
+            }
+        }
+        create_new_by_path(disk_path, exec_bit)
+    }
+}
+
+/// Creates `disk_path` new by its path, without following a symlink there,
+/// with the mode of `exec_bit` on Unix.
+#[cfg_attr(windows, expect(unused_variables))]
+fn create_new_by_path(disk_path: &Path, exec_bit: ExecBit) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    // Don't overwrite un-ignored file. Don't follow symlink.
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(exec_bit.new_file_mode());
+    options.open(disk_path)
 }
 
 /// Handles the error `err` of a checkout's create of a new entry at
@@ -937,6 +1051,22 @@ fn reject_existing_entry(
         }
     }
     reject_reserved_existing_path(disk_path)
+}
+
+/// Whether an entry is at `disk_path`, which the checkout then leaves as it
+/// is. Returns an error if the entry may point to a ".git" or ".jj" entry.
+fn has_existing_entry(disk_path: &Path) -> Result<bool, CheckoutError> {
+    match disk_path.symlink_metadata() {
+        Ok(_) => {
+            reject_reserved_existing_path(disk_path)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(CheckoutError::Other {
+            message: format!("Failed to stat {}", disk_path.display()),
+            err: err.into(),
+        }),
+    }
 }
 
 /// Whether the entry name `name` could point to the ".git" or ".jj" entry of
@@ -1132,12 +1262,21 @@ impl TreeStateSettings {
             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
             filter_settings: FilterSettings::try_from_settings(user_settings)?,
-            checkout_threads: user_settings
-                .get("working-copy.checkout-threads")
-                .optional()?
-                .unwrap_or_else(default_checkout_threads),
+            checkout_threads: checkout_threads_from_settings(user_settings)?,
         })
     }
+}
+
+/// The number of threads that a checkout reads and writes files on, as
+/// `working-copy.checkout-threads` sets it, or [`default_checkout_threads()`]
+/// if it is unset.
+pub fn checkout_threads_from_settings(
+    user_settings: &UserSettings,
+) -> Result<NonZeroUsize, ConfigGetError> {
+    Ok(user_settings
+        .get("working-copy.checkout-threads")
+        .optional()?
+        .unwrap_or_else(default_checkout_threads))
 }
 
 /// The number of threads that a checkout reads and writes files on when
@@ -2813,8 +2952,8 @@ enum CheckoutOutcome {
     /// An entry was already at the path, or its parent is not a directory: the
     /// path is left as it is, with a placeholder state.
     Skipped,
-    /// The store refused to read the contents: the path at this disk path is
-    /// treated as removed.
+    /// The store refused to read the contents, and no entry was at the path:
+    /// the path at this disk path is treated as removed.
     AccessDenied(PathBuf),
 }
 
@@ -2835,11 +2974,19 @@ struct CheckoutOutput {
 
 /// What one thread that reads and writes a checkout's files keeps from one
 /// file to the next.
-#[derive(Default)]
 struct CheckoutWorker {
     /// The buffer that file contents go through.
     buf: Vec<u8>,
     dir_cache: DirCache,
+}
+
+impl CheckoutWorker {
+    fn new(working_copy_path: &Path) -> Self {
+        Self {
+            buf: Vec::new(),
+            dir_cache: DirCache::new(working_copy_path),
+        }
+    }
 }
 
 /// The results of one batch of jobs, with the index of the worker that sends
@@ -2890,7 +3037,7 @@ impl CheckoutContext<'_> {
         jobs: Receiver<Vec<CheckoutJob>>,
         results: &Sender<BatchResults>,
     ) {
-        let mut worker = CheckoutWorker::default();
+        let mut worker = CheckoutWorker::new(self.tree_state.working_copy_path());
         let mut wrote = false;
         for batch in jobs {
             let mut batch_results = Vec::with_capacity(batch.len());
@@ -2913,7 +3060,7 @@ impl CheckoutContext<'_> {
                                 message: "A checkout thread panicked".to_owned(),
                                 err: panic_message(payload.as_ref()).into(),
                             });
-                            worker = CheckoutWorker::default();
+                            worker = CheckoutWorker::new(self.tree_state.working_copy_path());
                             None
                         }
                     }
@@ -2979,7 +3126,13 @@ impl CheckoutContext<'_> {
             .await?
         {
             MaterializedTreeValue::AccessDenied(_) => {
-                (CheckoutOutcome::AccessDenied(disk_path), None)
+                // As for a path that the checkout writes, an entry that is
+                // already at the path is left as it is.
+                if !old_file_removed && has_existing_entry(&disk_path)? {
+                    (CheckoutOutcome::Skipped, None)
+                } else {
+                    (CheckoutOutcome::AccessDenied(disk_path), None)
+                }
             }
             MaterializedTreeValue::File(file) => {
                 let exec_bit =
@@ -3245,9 +3398,13 @@ struct WorkerQueue {
 ///
 /// - before it removes the directories that a removed path leaves empty, if a
 ///   queued path may be about to be created in one of them;
+/// - before it removes the directory of an old submodule, in which a queued
+///   path may be about to be created by a name that differs by case;
 /// - before a path whose name, or the name of a directory to create for it,
 ///   differs from a queued path's by case only, which a case-insensitive file
 ///   system takes for the same entry;
+/// - before and after a path that is not ASCII, which a file system may take
+///   for a path that differs by more than ASCII case;
 /// - before a path below the path queued last, which only a conflicted tree
 ///   has.
 struct CheckoutCoordinator<'scope, 'env> {
@@ -3304,7 +3461,8 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             result_sender: Some(result_sender),
             results,
             threads,
-            inline_worker: (threads == 1).then(CheckoutWorker::default),
+            inline_worker: (threads == 1)
+                .then(|| CheckoutWorker::new(context.tree_state.working_copy_path())),
             inline_wrote: false,
             spawned: 0,
             pending: Vec::new(),
@@ -3409,6 +3567,13 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
             path.split_common_prefix(&self.prev_created_path);
 
         let mut name_key = 0;
+        // A file system may take a path that is not ASCII for one that differs
+        // from it by more than ASCII case, which `folded_name_key()` does not
+        // tell: by Unicode case folding, or by Unicode normalization (as APFS
+        // takes the NFC "é" and the NFD "e\u{301}" for one name). So such a
+        // path is checked out alone: once the workers have finished every
+        // queued path, and before the next path.
+        let alone = self.inline_worker.is_none() && !path.as_internal_file_string().is_ascii();
         if self.inline_worker.is_none() {
             name_key = folded_name_key(&path);
             if self.has_in_flight() {
@@ -3424,9 +3589,10 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
                 // case-insensitive file system takes for a queued one, wait
                 // for the workers, so that this path finds what they made
                 // there, as if the paths were checked out one after the other.
-                if path
-                    .strip_prefix(&self.last_queued)
-                    .is_some_and(|rest| !rest.is_root())
+                if alone
+                    || path
+                        .strip_prefix(&self.last_queued)
+                        .is_some_and(|rest| !rest.is_root())
                     || self.in_flight_names.contains_key(&name_key)
                     || new_dirs.any(|dir| self.in_flight_names.contains_key(&folded_name_key(dir)))
                 {
@@ -3480,6 +3646,14 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         // TODO: Check that the file has not changed before overwriting/removing it.
         let old_file_removed = before.is_present()
             && if before_is_submodule {
+                // A queued path may be about to be created in the submodule
+                // directory, by a name that differs by case (on a
+                // case-insensitive file system). If the directory were removed
+                // before that, the worker could create the path through what
+                // takes the directory's place, such as a symlink that this
+                // path is. So wait for the workers first, as `remove_path()`
+                // does before it removes a directory.
+                self.wait_for_workers();
                 remove_old_submodule_dir(&disk_path)?
             } else {
                 remove_old_file(&disk_path)?
@@ -3499,7 +3673,11 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
                 disk_path,
                 value: after,
                 old_file_removed,
-            })
+            })?;
+            if alone {
+                self.wait_for_workers();
+            }
+            Ok(())
         }
     }
 
@@ -3511,28 +3689,14 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         old_file_removed: bool,
         before_is_submodule: bool,
     ) -> Result<(), CheckoutError> {
-        if !old_file_removed {
-            match disk_path.symlink_metadata() {
-                Ok(_) => {
-                    reject_reserved_existing_path(disk_path)?;
-                    if !before_is_submodule {
-                        self.slots
-                            .push(CheckoutSlot::Done(path, CheckoutOutcome::Skipped));
-                        return Ok(());
-                    }
-                    // Failing to delete un-tracked submodule directory is not
-                    // an error, as the, possibly untracked, contents would
-                    // otherwise be lost. Go on in case there are parents to be
-                    // deleted.
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(CheckoutError::Other {
-                        message: format!("Failed to stat {}", disk_path.display()),
-                        err: err.into(),
-                    });
-                }
-            }
+        // An entry left on disk is skipped. Failing to delete un-tracked
+        // submodule directory is not an error, as the, possibly untracked,
+        // contents would otherwise be lost: go on in case there are parents to
+        // be deleted.
+        if !old_file_removed && has_existing_entry(disk_path)? && !before_is_submodule {
+            self.slots
+                .push(CheckoutSlot::Done(path, CheckoutOutcome::Skipped));
+            return Ok(());
         }
         // Reset the previous path to avoid scenarios where this path is deleted,
         // then on the next iteration recreation is skipped because of this
@@ -3767,14 +3931,6 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
         {
             return Err(err);
         }
-        if self.context.is_aborted() {
-            // Only a worker that panics stops the checkout without an error.
-            // The scope passes the panic on.
-            return Err(CheckoutError::Other {
-                message: "A checkout thread panicked".to_owned(),
-                err: "panic".into(),
-            });
-        }
 
         let mut changed_file_states = Vec::with_capacity(self.slots.len());
         for slot in mem::take(&mut self.slots) {
@@ -3822,7 +3978,10 @@ impl<'scope, 'env> CheckoutCoordinator<'scope, 'env> {
 
 /// A key of `path` that is the same for two paths that differ by case only,
 /// which a case-insensitive file system takes for one entry. (Two paths that
-/// differ otherwise have the same key only by chance.)
+/// differ otherwise have the same key only by chance.) A file system may take
+/// two paths that are not ASCII for one entry although their keys differ (by
+/// Unicode normalization, say), so the coordinating thread checks out a path
+/// that is not ASCII alone, whatever its key.
 fn folded_name_key(path: &RepoPath) -> u64 {
     // FNV-1a over the lower-case characters.
     let mut key: u64 = 0xcbf2_9ce4_8422_2325;
@@ -3950,7 +4109,7 @@ fn new_file_state(
         // that the file was created with, so the next snapshot would read the
         // file as not executable. Set the mode on the handle, as the checkout
         // did for every file before it created files with their mode.
-        file.set_permissions(fs::Permissions::from_mode(0o755))
+        file.set_permissions(fs::Permissions::from_mode(exec_bit.new_file_mode()))
             .map_err(|err| CheckoutError::Other {
                 message: format!("Failed to set the mode of file {}", disk_path.display()),
                 err: err.into(),
@@ -4729,7 +4888,7 @@ mod tests {
         };
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("old"), "").unwrap();
-        let mut dir_cache = DirCache::default();
+        let mut dir_cache = DirCache::new(temp_dir.path());
 
         // A create that fails because the file exists keeps no directory, so
         // the next create in the directory, which was removed (as when the
@@ -4765,11 +4924,73 @@ mod tests {
         // Write and search permission, but no read permission.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
         let readable = fs::read_dir(&dir).is_ok();
-        let created = DirCache::default().create_new(&dir.join("file"), ExecBit(false));
+        let created = DirCache::new(temp_dir.path()).create_new(&dir.join("file"), ExecBit(false));
         // Let the temporary directory be removed whatever happened.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(!readable, "the directory should not be readable");
         created.unwrap();
         assert!(dir.join("file").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dir_cache_refuses_symlinked_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = crate::tests::new_temp_dir();
+        let working_copy_path = temp_dir.path().join("wc");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir(&working_copy_path).unwrap();
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        for dir in ["dir", "swap", "locked"] {
+            fs::create_dir(working_copy_path.join(dir)).unwrap();
+        }
+        for link in ["link", "dir/link", "locked/link"] {
+            symlink(&outside, working_copy_path.join(link)).unwrap();
+        }
+        let mut dir_cache = DirCache::new(&working_copy_path);
+        let mut create =
+            |path: &str| dir_cache.create_new(&working_copy_path.join(path), ExecBit(false));
+
+        // A symlink as the file's directory, or as a directory above it, is
+        // not followed, from the root or from a directory that is kept open.
+        for path in ["link/file", "link/sub/file"] {
+            assert!(create(path).is_err(), "{path}");
+        }
+        for path in ["dir/link/file", "dir/link/sub/file"] {
+            create("dir/kept").unwrap();
+            fs::remove_file(working_copy_path.join("dir/kept")).unwrap();
+            assert!(create(path).is_err(), "{path}");
+        }
+
+        // A kept directory that is replaced by a symlink is not followed.
+        create("swap/file").unwrap();
+        fs::remove_file(working_copy_path.join("swap/file")).unwrap();
+        fs::remove_dir(working_copy_path.join("swap")).unwrap();
+        symlink(&outside, working_copy_path.join("swap")).unwrap();
+        assert!(create("swap/file").is_err());
+
+        // Nor is a symlink below a directory that can't be opened.
+        let locked = working_copy_path.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o300)).unwrap();
+        let created = create("locked/link/file");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(created.is_err());
+
+        let outside_entries = fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect_vec();
+        assert_eq!(outside_entries, ["sub"]);
+        assert_eq!(fs::read_dir(outside.join("sub")).unwrap().count(), 0);
+
+        // The working copy root itself may be a symlink.
+        let root_link = temp_dir.path().join("root-link");
+        symlink(&working_copy_path, &root_link).unwrap();
+        DirCache::new(&root_link)
+            .create_new(&root_link.join("dir/file"), ExecBit(false))
+            .unwrap();
+        assert!(working_copy_path.join("dir/file").is_file());
     }
 }
