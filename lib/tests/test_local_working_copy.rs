@@ -152,7 +152,9 @@ fn check_ignores_name_suffix(dir: &Path, suffix: &str) -> bool {
         .tempfile_in(dir)
         .unwrap();
     let orig_name = test_file.path().file_name().unwrap().to_str().unwrap();
-    dir.join(format!("{orig_name}{suffix}")).try_exists().unwrap()
+    dir.join(format!("{orig_name}{suffix}"))
+        .try_exists()
+        .unwrap()
 }
 
 /// The entries below `root`, by their paths relative to it: each directory
